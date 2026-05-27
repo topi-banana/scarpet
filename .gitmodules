@@ -1,27 +1,27 @@
 [submodule "tests/51mayday/ScarpetScripts"]
-	path = tests/51mayday/ScarpetScripts
+	path = example/51mayday/ScarpetScripts
 	url = https://github.com/51mayday/ScarpetScripts
 [submodule "tests/CommandLeo/scarpet"]
-	path = tests/CommandLeo/scarpet
+	path = example/CommandLeo/scarpet
 	url = https://github.com/CommandLeo/scarpet
 [submodule "tests/Firigion/scarpets"]
-	path = tests/Firigion/scarpets
+	path = example/Firigion/scarpets
 	url = https://github.com/Firigion/scarpets
 [submodule "tests/Ghoulboy78/Scarpet-edit"]
-	path = tests/Ghoulboy78/Scarpet-edit
+	path = example/Ghoulboy78/Scarpet-edit
 	url = https://github.com/Ghoulboy78/Scarpet-edit
 [submodule "tests/MultiCoreNetwork/carpet-redcraft-addons"]
-	path = tests/MultiCoreNetwork/carpet-redcraft-addons
+	path = example/MultiCoreNetwork/carpet-redcraft-addons
 	url = https://github.com/MultiCoreNetwork/carpet-redcraft-addons
 [submodule "tests/RS-256/scriptCollection"]
-	path = tests/RS-256/scriptCollection
+	path = example/RS-256/scriptCollection
 	url = https://github.com/RS-256/scriptCollection
 [submodule "tests/gnembon/fabric-carpet"]
-	path = tests/gnembon/fabric-carpet
+	path = example/gnembon/fabric-carpet
 	url = https://github.com/gnembon/fabric-carpet
 [submodule "tests/gnembon/scarpet"]
-	path = tests/gnembon/scarpet
+	path = example/gnembon/scarpet
 	url = https://github.com/gnembon/scarpet
 [submodule "tests/mc-cloud-town/scarpet"]
-	path = tests/mc-cloud-town/scarpet
+	path = example/mc-cloud-town/scarpet
 	url = https://github.com/mc-cloud-town/scarpet
