@@ -1,0 +1,134 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  quality:
+    name: Quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete,taplo-cli
+
+      - name: cargo fmt --check
+        id: fmt
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+      - name: taplo fmt --check
+        id: taplo
+        continue-on-error: true
+        run: taplo fmt --check --diff
+
+      - name: cargo clippy
+        id: clippy
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo check
+        id: check
+        continue-on-error: true
+        run: cargo check --workspace --all-targets
+
+      - name: cargo machete
+        id: machete
+        continue-on-error: true
+        run: cargo machete
+
+      - name: cargo test
+        id: test
+        continue-on-error: true
+        run: cargo test --workspace --all-targets
+
+      - name: Write summary
+        if: always()
+        run: |
+          status() {
+            case "$1" in
+              success) echo "✅ pass" ;;
+              failure) echo "❌ fail" ;;
+              skipped) echo "⏭️ skipped" ;;
+              *)       echo "⚠️ $1" ;;
+            esac
+          }
+          {
+            echo "## Quality results"
+            echo ""
+            echo "| Step | Result |"
+            echo "| --- | --- |"
+            echo "| cargo fmt --check | $(status '${{ steps.fmt.outcome }}') |"
+            echo "| taplo fmt --check | $(status '${{ steps.taplo.outcome }}') |"
+            echo "| cargo clippy | $(status '${{ steps.clippy.outcome }}') |"
+            echo "| cargo check | $(status '${{ steps.check.outcome }}') |"
+            echo "| cargo machete | $(status '${{ steps.machete.outcome }}') |"
+            echo "| cargo test | $(status '${{ steps.test.outcome }}') |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail job if any step failed
+        if: >-
+          steps.fmt.outcome != 'success' ||
+          steps.taplo.outcome != 'success' ||
+          steps.clippy.outcome != 'success' ||
+          steps.check.outcome != 'success' ||
+          steps.machete.outcome != 'success' ||
+          steps.test.outcome != 'success'
+        run: exit 1
+
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            args: --workspace --all-targets
+          - name: wasm
+            target: wasm32-unknown-unknown
+            args: -p scarpet-syntax --lib
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: cargo build
+        id: build
+        run: cargo build --target ${{ matrix.target }} ${{ matrix.args }}
+
+      - name: Write summary
+        if: always()
+        run: |
+          {
+            echo "## Build: ${{ matrix.name }} (\`${{ matrix.target }}\`)"
+            echo ""
+            echo "- Command: \`cargo build --target ${{ matrix.target }} ${{ matrix.args }}\`"
+            echo "- Result: **${{ steps.build.outcome }}**"
+          } >> "$GITHUB_STEP_SUMMARY"
