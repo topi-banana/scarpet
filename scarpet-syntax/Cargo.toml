@@ -1,0 +1,8 @@
+[package]
+name = "scarpet-syntax"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+logos.workspace = true
+nom.workspace = true
