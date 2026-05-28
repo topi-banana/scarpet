@@ -1,17 +1,48 @@
 use crate::lexer::{Token, TokenKind};
 use chumsky::{extra, prelude::*, recursive::Recursive};
-use logosky::{Lexed, Tokenizer, utils::Span};
+use logosky::{Lexed, utils::Span};
 
 type TokenStream<'s> = logosky::TokenStream<'s, Token<'s>>;
 type Extra<'s> = extra::Err<Rich<'s, Lexed<'s, Token<'s>>, Span>>;
 type BoxedP<'s, O> = Boxed<'s, 's, TokenStream<'s>, O, Extra<'s>>;
 
 // ====================================================================
-// CST (concrete syntax tree, AST-shaped) definition
+// CST (concrete syntax tree) — preserves comments and breaks as
+// `leading` trivia attached to each node.
 // ====================================================================
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Cst<'s> {
+pub struct Cst<'s> {
+    pub leading: Vec<Trivia<'s>>,
+    pub kind: CstKind<'s>,
+}
+
+impl<'s> Cst<'s> {
+    pub fn bare(kind: CstKind<'s>) -> Self {
+        Self {
+            leading: Vec::new(),
+            kind,
+        }
+    }
+
+    pub fn with_leading(mut self, mut leading: Vec<Trivia<'s>>) -> Self {
+        if leading.is_empty() {
+            return self;
+        }
+        leading.extend(self.leading);
+        self.leading = leading;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Trivia<'s> {
+    Comment(&'s str),
+    Break,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CstKind<'s> {
     Number(&'s str),
     Str(&'s str),
     Ident(&'s str),
@@ -129,7 +160,7 @@ pub fn parse_source(src: &str) -> Result<Cst<'_>, ParseError> {
 // chumsky-based parser
 // ====================================================================
 //
-// Precedence ladder (low → high), straight from docs/scarpet/language/Operators.md:
+// Precedence ladder (low → high):
 //
 //   program     = top
 //   top         = comma_chain
@@ -148,13 +179,22 @@ pub fn parse_source(src: &str) -> Result<Cst<'_>, ParseError> {
 //   get         = primary ((`~` | `:`) primary)*
 //   primary     = atom | `(` top `)` | `[` arg_list `]` | `{` arg_list `}` | ident `(` arg_list `)`
 //
-// Trivia (Break / Comment) is skipped between every token via the
-// `kind` / `tok_matching` helpers, which prefix-trim with logosky's
-// `skip_trivias()`.
+// Trivia (Break / Comment) is collected at every token consumer via
+// `leading_trivia()`. Leaf and compound nodes alike carry their leading
+// trivia in `Cst::leading`. Trivia that sits immediately before an
+// operator token is treated as belonging to the operator's RHS — it is
+// prepended to the RHS node's leading.
 
 fn program_parser<'s>() -> impl Parser<'s, TokenStream<'s>, Cst<'s>, Extra<'s>> {
-    let trim = TokenStream::skip_trivias::<Extra<'s>>();
-    top_parser().then_ignore(trim).then_ignore(end())
+    top_parser()
+        .then(leading_trivia())
+        .map(|(mut cst, trailing)| {
+            // Anchor any pure-trailing trivia (e.g. a comment after the final
+            // expression) onto the root so it isn't silently dropped.
+            cst.leading.extend(trailing);
+            cst
+        })
+        .then_ignore(end())
 }
 
 fn top_parser<'s>() -> BoxedP<'s, Cst<'s>> {
@@ -166,26 +206,21 @@ fn top_parser<'s>() -> BoxedP<'s, Cst<'s>> {
     let arg_list = arg_list_parser(seq_chain.clone().boxed()).boxed();
 
     let primary = {
-        let number = tok_matching(|t| {
-            if let Token::Number(s) = t {
-                Some(Cst::Number(s))
-            } else {
-                None
-            }
-        });
-        let string = tok_matching(|t| {
-            if let Token::String(s) = t {
-                Some(Cst::Str(s))
-            } else {
-                None
-            }
-        });
-        let ident_only = tok_matching(|t| {
-            if let Token::Ident(s) = t {
-                Some(s)
-            } else {
-                None
-            }
+        let number = tok_matching(|t| match t {
+            Token::Number(s) => Some(CstKind::Number(s)),
+            _ => None,
+        })
+        .map(|(leading, kind)| Cst { leading, kind });
+
+        let string = tok_matching(|t| match t {
+            Token::String(s) => Some(CstKind::Str(s)),
+            _ => None,
+        })
+        .map(|(leading, kind)| Cst { leading, kind });
+
+        let ident_only = tok_matching(|t| match t {
+            Token::Ident(s) => Some(s),
+            _ => None,
         });
 
         let ident_or_call = ident_only
@@ -195,28 +230,43 @@ fn top_parser<'s>() -> BoxedP<'s, Cst<'s>> {
                     .delimited_by(kind(TokenKind::OpenParen), kind(TokenKind::CloseParen))
                     .or_not(),
             )
-            .map(|(name, args)| match args {
-                Some(args) => Cst::Call {
-                    callee: Box::new(Cst::Ident(name)),
-                    args,
+            .map(|((leading, name), args)| match args {
+                Some(args) => Cst {
+                    leading,
+                    kind: CstKind::Call {
+                        callee: Box::new(Cst::bare(CstKind::Ident(name))),
+                        args,
+                    },
                 },
-                None => Cst::Ident(name),
+                None => Cst {
+                    leading,
+                    kind: CstKind::Ident(name),
+                },
             });
 
-        let paren = top
-            .clone()
-            .delimited_by(kind(TokenKind::OpenParen), kind(TokenKind::CloseParen))
-            .map(|inner| Cst::Paren(Box::new(inner)));
+        let paren = kind(TokenKind::OpenParen)
+            .then(top.clone())
+            .then_ignore(kind(TokenKind::CloseParen))
+            .map(|(leading, inner)| Cst {
+                leading,
+                kind: CstKind::Paren(Box::new(inner)),
+            });
 
-        let list = arg_list
-            .clone()
-            .delimited_by(kind(TokenKind::OpenBrack), kind(TokenKind::CloseBrack))
-            .map(Cst::List);
+        let list = kind(TokenKind::OpenBrack)
+            .then(arg_list.clone())
+            .then_ignore(kind(TokenKind::CloseBrack))
+            .map(|(leading, args)| Cst {
+                leading,
+                kind: CstKind::List(args),
+            });
 
-        let map = arg_list
-            .clone()
-            .delimited_by(kind(TokenKind::OpenBrace), kind(TokenKind::CloseBrace))
-            .map(Cst::Map);
+        let map = kind(TokenKind::OpenBrace)
+            .then(arg_list.clone())
+            .then_ignore(kind(TokenKind::CloseBrace))
+            .map(|(leading, args)| Cst {
+                leading,
+                kind: CstKind::Map(args),
+            });
 
         choice((number, string, ident_or_call, paren, list, map)).boxed()
     };
@@ -225,49 +275,67 @@ fn top_parser<'s>() -> BoxedP<'s, Cst<'s>> {
         .clone()
         .foldl(
             choice((
-                kind(TokenKind::Tilde).to(BinOp::Match),
-                kind(TokenKind::Colon).to(BinOp::Get),
+                kind(TokenKind::Tilde).map(|l| (l, BinOp::Match)),
+                kind(TokenKind::Colon).map(|l| (l, BinOp::Get)),
             ))
             .then(primary.clone())
             .repeated(),
-            |lhs, (op, rhs)| bin(op, lhs, rhs),
+            |lhs, ((op_leading, op), rhs)| bin(op, lhs, rhs.with_leading(op_leading)),
         )
         .boxed();
 
     let unary_prefix = choice((
-        kind(TokenKind::Sub).to(UnaryOp::Neg),
-        kind(TokenKind::Add).to(UnaryOp::Pos),
-        kind(TokenKind::Bang).to(UnaryOp::Not),
-        kind(TokenKind::Ellipsis).to(UnaryOp::Unpack),
+        kind(TokenKind::Sub).map(|l| (l, UnaryOp::Neg)),
+        kind(TokenKind::Add).map(|l| (l, UnaryOp::Pos)),
+        kind(TokenKind::Bang).map(|l| (l, UnaryOp::Not)),
+        kind(TokenKind::Ellipsis).map(|l| (l, UnaryOp::Unpack)),
     ));
     let unary = unary_prefix
         .repeated()
         .collect::<Vec<_>>()
         .then(get)
         .map(|(prefixes, operand)| {
+            // Innermost prefix wraps the operand; each outer prefix wraps
+            // the result. Each prefix takes its own leading trivia.
             prefixes
                 .into_iter()
                 .rev()
-                .fold(operand, |acc, op| un(op, acc))
+                .fold(operand, |acc, (l, op)| Cst {
+                    leading: l,
+                    kind: CstKind::Unary {
+                        op,
+                        operand: Box::new(acc),
+                    },
+                })
         })
         .boxed();
 
-    // power is right-associative: collect `unary` separated by `^`, fold right.
+    // power is right-associative.
     let power = unary
         .clone()
         .then(
             kind(TokenKind::Pow)
-                .ignore_then(unary)
+                .then(unary)
                 .repeated()
                 .collect::<Vec<_>>(),
         )
         .map(|(first, rest)| {
-            let mut all = vec![first];
-            all.extend(rest);
-            all.into_iter()
-                .rev()
-                .reduce(|rhs, lhs| bin(BinOp::Pow, lhs, rhs))
-                .unwrap()
+            if rest.is_empty() {
+                return first;
+            }
+            let mut operands = Vec::with_capacity(rest.len() + 1);
+            let mut op_leadings = Vec::with_capacity(rest.len());
+            operands.push(first);
+            for (op_leading, rhs) in rest {
+                op_leadings.push(op_leading);
+                operands.push(rhs);
+            }
+            let mut acc = operands.pop().unwrap();
+            while let Some(lhs) = operands.pop() {
+                let op_leading = op_leadings.pop().unwrap();
+                acc = bin(BinOp::Pow, lhs, acc.with_leading(op_leading));
+            }
+            acc
         })
         .boxed();
 
@@ -275,13 +343,13 @@ fn top_parser<'s>() -> BoxedP<'s, Cst<'s>> {
         .clone()
         .foldl(
             choice((
-                kind(TokenKind::Mul).to(BinOp::Mul),
-                kind(TokenKind::Div).to(BinOp::Div),
-                kind(TokenKind::Rem).to(BinOp::Rem),
+                kind(TokenKind::Mul).map(|l| (l, BinOp::Mul)),
+                kind(TokenKind::Div).map(|l| (l, BinOp::Div)),
+                kind(TokenKind::Rem).map(|l| (l, BinOp::Rem)),
             ))
             .then(power)
             .repeated(),
-            |lhs, (op, rhs)| bin(op, lhs, rhs),
+            |lhs, ((op_leading, op), rhs)| bin(op, lhs, rhs.with_leading(op_leading)),
         )
         .boxed();
 
@@ -289,12 +357,12 @@ fn top_parser<'s>() -> BoxedP<'s, Cst<'s>> {
         .clone()
         .foldl(
             choice((
-                kind(TokenKind::Add).to(BinOp::Add),
-                kind(TokenKind::Sub).to(BinOp::Sub),
+                kind(TokenKind::Add).map(|l| (l, BinOp::Add)),
+                kind(TokenKind::Sub).map(|l| (l, BinOp::Sub)),
             ))
             .then(multiplicative)
             .repeated(),
-            |lhs, (op, rhs)| bin(op, lhs, rhs),
+            |lhs, ((op_leading, op), rhs)| bin(op, lhs, rhs.with_leading(op_leading)),
         )
         .boxed();
 
@@ -302,14 +370,14 @@ fn top_parser<'s>() -> BoxedP<'s, Cst<'s>> {
         .clone()
         .foldl(
             choice((
-                kind(TokenKind::LtEq).to(BinOp::LtEq),
-                kind(TokenKind::GtEq).to(BinOp::GtEq),
-                kind(TokenKind::Lt).to(BinOp::Lt),
-                kind(TokenKind::Gt).to(BinOp::Gt),
+                kind(TokenKind::LtEq).map(|l| (l, BinOp::LtEq)),
+                kind(TokenKind::GtEq).map(|l| (l, BinOp::GtEq)),
+                kind(TokenKind::Lt).map(|l| (l, BinOp::Lt)),
+                kind(TokenKind::Gt).map(|l| (l, BinOp::Gt)),
             ))
             .then(additive)
             .repeated(),
-            |lhs, (op, rhs)| bin(op, lhs, rhs),
+            |lhs, ((op_leading, op), rhs)| bin(op, lhs, rhs.with_leading(op_leading)),
         )
         .boxed();
 
@@ -317,37 +385,36 @@ fn top_parser<'s>() -> BoxedP<'s, Cst<'s>> {
         .clone()
         .foldl(
             choice((
-                kind(TokenKind::EqEq).to(BinOp::Eq),
-                kind(TokenKind::BangEq).to(BinOp::NotEq),
+                kind(TokenKind::EqEq).map(|l| (l, BinOp::Eq)),
+                kind(TokenKind::BangEq).map(|l| (l, BinOp::NotEq)),
             ))
             .then(compare)
             .repeated(),
-            |lhs, (op, rhs)| bin(op, lhs, rhs),
+            |lhs, ((op_leading, op), rhs)| bin(op, lhs, rhs.with_leading(op_leading)),
         )
         .boxed();
 
     let land = equality
         .clone()
         .foldl(
-            kind(TokenKind::And).ignore_then(equality).repeated(),
-            |lhs, rhs| bin(BinOp::And, lhs, rhs),
+            kind(TokenKind::And).then(equality).repeated(),
+            |lhs, (op_leading, rhs)| bin(BinOp::And, lhs, rhs.with_leading(op_leading)),
         )
         .boxed();
 
     let lor = land
         .clone()
         .foldl(
-            kind(TokenKind::Or).ignore_then(land).repeated(),
-            |lhs, rhs| bin(BinOp::Or, lhs, rhs),
+            kind(TokenKind::Or).then(land).repeated(),
+            |lhs, (op_leading, rhs)| bin(BinOp::Or, lhs, rhs.with_leading(op_leading)),
         )
         .boxed();
 
-    // assign is right-associative: collect `lor` separated by an assign-op,
-    // then fold right preserving the chosen op at each link.
+    // assign is right-associative; per-link op may differ.
     let assign_op = choice((
-        kind(TokenKind::Assign).to(BinOp::Assign),
-        kind(TokenKind::AddAssign).to(BinOp::AddAssign),
-        kind(TokenKind::Swap).to(BinOp::Swap),
+        kind(TokenKind::Assign).map(|l| (l, BinOp::Assign)),
+        kind(TokenKind::AddAssign).map(|l| (l, BinOp::AddAssign)),
+        kind(TokenKind::Swap).map(|l| (l, BinOp::Swap)),
     ));
     let assign = lor
         .clone()
@@ -356,40 +423,47 @@ fn top_parser<'s>() -> BoxedP<'s, Cst<'s>> {
             if rest.is_empty() {
                 return first;
             }
-            // rest: [(op_0, e_1), (op_1, e_2), ...]. Right-assoc means
-            // e_0 `op_0` (e_1 `op_1` (... `op_{n-1}` e_n)).
             let mut operands: Vec<Cst<'s>> = Vec::with_capacity(rest.len() + 1);
-            let mut ops: Vec<BinOp> = Vec::with_capacity(rest.len());
+            let mut links: Vec<(Vec<Trivia<'s>>, BinOp)> = Vec::with_capacity(rest.len());
             operands.push(first);
-            for (op, rhs) in rest {
-                ops.push(op);
+            for ((op_leading, op), rhs) in rest {
+                links.push((op_leading, op));
                 operands.push(rhs);
             }
             let mut acc = operands.pop().unwrap();
             while let Some(lhs) = operands.pop() {
-                let op = ops.pop().unwrap();
-                acc = bin(op, lhs, acc);
+                let (op_leading, op) = links.pop().unwrap();
+                acc = bin(op, lhs, acc.with_leading(op_leading));
             }
             acc
         })
         .boxed();
 
-    // arrow_chain is right-associative; same trick.
     let arrow_chain = assign
         .clone()
         .then(
             kind(TokenKind::Arrow)
-                .ignore_then(assign)
+                .then(assign)
                 .repeated()
                 .collect::<Vec<_>>(),
         )
         .map(|(first, rest)| {
-            let mut all = vec![first];
-            all.extend(rest);
-            all.into_iter()
-                .rev()
-                .reduce(|rhs, lhs| bin(BinOp::Arrow, lhs, rhs))
-                .unwrap()
+            if rest.is_empty() {
+                return first;
+            }
+            let mut operands = Vec::with_capacity(rest.len() + 1);
+            let mut op_leadings = Vec::with_capacity(rest.len());
+            operands.push(first);
+            for (op_leading, rhs) in rest {
+                op_leadings.push(op_leading);
+                operands.push(rhs);
+            }
+            let mut acc = operands.pop().unwrap();
+            while let Some(lhs) = operands.pop() {
+                let op_leading = op_leadings.pop().unwrap();
+                acc = bin(BinOp::Arrow, lhs, acc.with_leading(op_leading));
+            }
+            acc
         })
         .boxed();
 
@@ -402,29 +476,48 @@ fn top_parser<'s>() -> BoxedP<'s, Cst<'s>> {
 fn seq_chain_inner<'s>(
     arrow_chain: BoxedP<'s, Cst<'s>>,
 ) -> impl Parser<'s, TokenStream<'s>, Cst<'s>, Extra<'s>> + Clone {
-    // Mirrors the nom version: parse one arrow_chain, then while we see `;`
-    // consume any run of them. If we're then at EOF / closer / `,`, the `;`
-    // was a trailing separator and we stop. Otherwise parse another
-    // arrow_chain and continue.
-    let trim = TokenStream::skip_trivias::<Extra<'s>>();
+    let leading = leading_trivia();
     custom(move |inp| {
         let mut acc = inp.parse(arrow_chain.clone())?;
         loop {
-            inp.parse(trim.clone())?;
+            // The leading trivia for the next operator. If we end up at a
+            // closer/EOF/comma, this trivia belongs to no specific child —
+            // it gets handed back to the enclosing parser as the next
+            // peeked-token's leading. Because chumsky doesn't let us
+            // "un-collect" trivia, we have to be careful to NOT consume
+            // it unless we know we're about to commit. Strategy: save a
+            // checkpoint, collect trivia, peek; if the next token is `;`
+            // commit, otherwise rewind and stop.
+            let saved = inp.save();
+            let trivia = inp.parse(leading.clone())?;
             if !peek_is(inp, TokenKind::SemiColon) {
+                inp.rewind(saved);
                 break;
             }
-            // Consume one or more `;`s.
+            // Eat one `;`, then any additional `;`s (Scarpet's preprocessor
+            // strips runs of them). Keep the trivia gathered after the
+            // FINAL `;` so it can attach to the next statement.
+            let _ = inp.next();
+            let mut post_semi_trivia = inp.parse(leading.clone())?;
             while peek_is(inp, TokenKind::SemiColon) {
                 let _ = inp.next();
-                inp.parse(trim.clone())?;
+                post_semi_trivia = inp.parse(leading.clone())?;
             }
-            // Trailing `;` before EOF / closer / `,` is fine — stop.
             if peek_is_closer_or_eof(inp) || peek_is(inp, TokenKind::Comma) {
+                // Trailing `;`. Both the trivia before the first `;` and
+                // any trivia after the final `;` would otherwise be lost —
+                // anchor them onto the accumulator's leading.
+                acc.leading.extend(trivia);
+                acc.leading.extend(post_semi_trivia);
                 break;
             }
             let rhs = inp.parse(arrow_chain.clone())?;
-            acc = bin(BinOp::Semi, acc, rhs);
+            // Trivia before the `;` (visually ends the LHS statement) and
+            // trivia after the final `;` both flow into the next stmt's
+            // leading, in source order.
+            let mut combined = trivia;
+            combined.extend(post_semi_trivia);
+            acc = bin(BinOp::Semi, acc, rhs.with_leading(combined));
         }
         Ok(acc)
     })
@@ -433,23 +526,33 @@ fn seq_chain_inner<'s>(
 fn comma_chain_inner<'s>(
     seq_chain: BoxedP<'s, Cst<'s>>,
 ) -> impl Parser<'s, TokenStream<'s>, Cst<'s>, Extra<'s>> + Clone {
-    // Mirrors the nom version: trailing `,` immediately before EOF / closer
-    // is tolerated (the parenthesised body `(a, b,)` is the canonical case).
-    let trim = TokenStream::skip_trivias::<Extra<'s>>();
+    let leading = leading_trivia();
     custom(move |inp| {
         let mut acc = inp.parse(seq_chain.clone())?;
         loop {
-            inp.parse(trim.clone())?;
+            let saved = inp.save();
+            let trivia = inp.parse(leading.clone())?;
             if !peek_is(inp, TokenKind::Comma) {
+                inp.rewind(saved);
                 break;
             }
             let _ = inp.next();
-            inp.parse(trim.clone())?;
+            let trivia2 = inp.parse(leading.clone())?;
             if peek_is_closer_or_eof(inp) {
+                // Trailing `,`. Trivia between the previous expr and `,` is
+                // attached to acc; trivia after `,` goes to acc too.
+                let mut combined = trivia;
+                combined.extend(trivia2);
+                acc.leading.extend(combined);
                 break;
             }
             let rhs = inp.parse(seq_chain.clone())?;
-            acc = bin(BinOp::Comma, acc, rhs);
+            // trivia (before `,`) attaches to rhs; trivia2 (after `,`) also
+            // attaches to rhs's leading (already does via the seq parse).
+            // Order: trivia, then trivia2, then rhs's own leading.
+            let mut combined = trivia;
+            combined.extend(trivia2);
+            acc = bin(BinOp::Comma, acc, rhs.with_leading(combined));
         }
         Ok(acc)
     })
@@ -457,36 +560,75 @@ fn comma_chain_inner<'s>(
 
 // arg_list (between `(`, `[`, `{`) — comma-separated `seq_chain`s, tolerating:
 //   - empty list right before closer
-//   - omitted entries: `f(a, , b)` → second arg is `Cst::Empty`
+//   - omitted entries: `f(a, , b)` → second arg is `CstKind::Empty`
 //   - trailing comma: `(a, b,)` does NOT insert a phantom trailing Empty
+//
+// Trivia is preserved by attaching to each item's leading. Trivia before a
+// phantom Empty is recorded on the Empty node.
 fn arg_list_parser<'s>(
     seq: BoxedP<'s, Cst<'s>>,
 ) -> impl Parser<'s, TokenStream<'s>, Vec<Cst<'s>>, Extra<'s>> + Clone {
-    let trim = TokenStream::skip_trivias::<Extra<'s>>();
+    let leading = leading_trivia();
     custom(move |inp| {
-        inp.parse(trim.clone())?;
+        let initial = inp.parse(leading.clone())?;
         let mut items: Vec<Cst<'s>> = Vec::new();
         if peek_is_closer_or_eof(inp) {
+            // Trivia inside an empty `(... )`. Promote it onto a phantom-less
+            // tail; we have nowhere natural to attach it, so re-attach to
+            // the caller via the input rewind isn't possible. Stash on a
+            // hidden Empty node so it's not lost.
+            if !initial.is_empty() {
+                items.push(Cst {
+                    leading: initial,
+                    kind: CstKind::Empty,
+                });
+            }
             return Ok(items);
         }
+        let mut pending: Vec<Trivia<'s>> = initial;
         loop {
-            inp.parse(trim.clone())?;
             if peek_is(inp, TokenKind::Comma) {
-                items.push(Cst::Empty);
+                // Omitted entry: synthesise an Empty carrying the pending
+                // trivia (which would otherwise be lost).
+                items.push(Cst {
+                    leading: std::mem::take(&mut pending),
+                    kind: CstKind::Empty,
+                });
             } else if peek_is_closer_or_eof(inp) {
+                if !pending.is_empty() {
+                    items.push(Cst {
+                        leading: std::mem::take(&mut pending),
+                        kind: CstKind::Empty,
+                    });
+                }
                 break;
             } else {
                 let v = inp.parse(seq.clone())?;
-                items.push(v);
+                let leading_before = std::mem::take(&mut pending);
+                items.push(v.with_leading(leading_before));
             }
-            inp.parse(trim.clone())?;
+            let trivia_after = inp.parse(leading.clone())?;
             if peek_is(inp, TokenKind::Comma) {
                 let _ = inp.next();
-                inp.parse(trim.clone())?;
+                let trivia_post_comma = inp.parse(leading.clone())?;
+                // trivia_after sits between the previous item and `,`;
+                // trivia_post_comma sits between `,` and the next item.
+                // Both flow into the next item's leading.
+                pending = trivia_after;
+                pending.extend(trivia_post_comma);
                 if peek_is_closer_or_eof(inp) {
+                    // Trailing comma — flush pending onto last item.
+                    if !pending.is_empty() {
+                        items.last_mut().unwrap().leading.extend(pending);
+                    }
                     break;
                 }
             } else {
+                // No comma, so we're done. Trivia between last item and
+                // closer attaches back onto the last item.
+                if !trivia_after.is_empty() {
+                    items.last_mut().unwrap().leading.extend(trivia_after);
+                }
                 break;
             }
         }
@@ -519,46 +661,70 @@ fn peek_is_closer_or_eof<'s>(
 
 // --- token matching helpers ----------------------------------------
 
-fn kind<'s>(k: TokenKind) -> BoxedP<'s, ()> {
-    let trim = TokenStream::skip_trivias::<Extra<'s>>();
-    trim.ignore_then(
-        any().try_map(move |tok: Lexed<'s, Token<'s>>, span: Span| match tok {
-            Lexed::Token(t) if logosky::Token::kind(&t.data) == k => Ok(()),
-            _ => Err(Rich::custom(span, "unexpected token")),
-        }),
-    )
+/// A parser that collects consecutive trivia tokens (Break / Comment)
+/// from the head of the input without consuming any semantic token.
+fn leading_trivia<'s>() -> BoxedP<'s, Vec<Trivia<'s>>> {
+    custom(|inp| {
+        let mut v = Vec::new();
+        loop {
+            let saved = inp.save();
+            match inp.next() {
+                Some(Lexed::Token(s)) => match s.data {
+                    Token::Comment(c) => v.push(Trivia::Comment(c)),
+                    Token::Break => v.push(Trivia::Break),
+                    _ => {
+                        inp.rewind(saved);
+                        break;
+                    }
+                },
+                _ => {
+                    inp.rewind(saved);
+                    break;
+                }
+            }
+        }
+        Ok(v)
+    })
     .boxed()
 }
 
-fn tok_matching<'s, T: 's, F>(f: F) -> BoxedP<'s, T>
+/// Match a token kind, returning its leading trivia.
+fn kind<'s>(k: TokenKind) -> BoxedP<'s, Vec<Trivia<'s>>> {
+    leading_trivia()
+        .then(
+            any().try_map(move |tok: Lexed<'s, Token<'s>>, span: Span| match tok {
+                Lexed::Token(t) if logosky::Token::kind(&t.data) == k => Ok(()),
+                _ => Err(Rich::custom(span, "unexpected token")),
+            }),
+        )
+        .map(|(leading, _)| leading)
+        .boxed()
+}
+
+/// Match a token and project a value from it, returning the leading trivia
+/// alongside.
+fn tok_matching<'s, T: 's, F>(f: F) -> BoxedP<'s, (Vec<Trivia<'s>>, T)>
 where
     F: Fn(Token<'s>) -> Option<T> + Clone + 's,
 {
-    let trim = TokenStream::skip_trivias::<Extra<'s>>();
-    trim.ignore_then(
-        any().try_map(move |tok: Lexed<'s, Token<'s>>, span: Span| match tok {
-            Lexed::Token(t) => f(t.data).ok_or_else(|| Rich::custom(span, "unexpected token")),
-            _ => Err(Rich::custom(span, "unexpected token")),
-        }),
-    )
-    .boxed()
+    leading_trivia()
+        .then(
+            any().try_map(move |tok: Lexed<'s, Token<'s>>, span: Span| match tok {
+                Lexed::Token(t) => f(t.data).ok_or_else(|| Rich::custom(span, "unexpected token")),
+                _ => Err(Rich::custom(span, "unexpected token")),
+            }),
+        )
+        .boxed()
 }
 
 // --- helpers --------------------------------------------------------
 
 fn bin<'s>(op: BinOp, lhs: Cst<'s>, rhs: Cst<'s>) -> Cst<'s> {
-    Cst::Binary {
+    Cst::bare(CstKind::Binary {
         op,
         lhs: Box::new(lhs),
         rhs: Box::new(rhs),
-    }
-}
-
-fn un<'s>(op: UnaryOp, operand: Cst<'s>) -> Cst<'s> {
-    Cst::Unary {
-        op,
-        operand: Box::new(operand),
-    }
+    })
 }
 
 // ====================================================================
@@ -573,14 +739,43 @@ mod tests {
         parse_source(src).expect("parse error")
     }
 
+    // Constructors with empty leading trivia, for terser assertions.
+    fn num(s: &str) -> Cst<'_> {
+        Cst::bare(CstKind::Number(s))
+    }
+    fn str_(s: &str) -> Cst<'_> {
+        Cst::bare(CstKind::Str(s))
+    }
+    fn id(s: &str) -> Cst<'_> {
+        Cst::bare(CstKind::Ident(s))
+    }
+    fn call<'s>(name: &'s str, args: Vec<Cst<'s>>) -> Cst<'s> {
+        Cst::bare(CstKind::Call {
+            callee: Box::new(id(name)),
+            args,
+        })
+    }
+    fn list(args: Vec<Cst<'_>>) -> Cst<'_> {
+        Cst::bare(CstKind::List(args))
+    }
+    fn map(args: Vec<Cst<'_>>) -> Cst<'_> {
+        Cst::bare(CstKind::Map(args))
+    }
+    fn paren(inner: Cst<'_>) -> Cst<'_> {
+        Cst::bare(CstKind::Paren(Box::new(inner)))
+    }
+    fn un(op: UnaryOp, operand: Cst<'_>) -> Cst<'_> {
+        Cst::bare(CstKind::Unary {
+            op,
+            operand: Box::new(operand),
+        })
+    }
+
     #[test]
     fn hello_world() {
         assert_eq!(
             parse("print('Hello World!')"),
-            Cst::Call {
-                callee: Box::new(Cst::Ident("print")),
-                args: vec![Cst::Str("'Hello World!'")],
-            }
+            call("print", vec![str_("'Hello World!'")])
         );
     }
 
@@ -588,11 +783,7 @@ mod tests {
     fn arithmetic_precedence() {
         assert_eq!(
             parse("2 + 3 * 4"),
-            bin(
-                BinOp::Add,
-                Cst::Number("2"),
-                bin(BinOp::Mul, Cst::Number("3"), Cst::Number("4")),
-            )
+            bin(BinOp::Add, num("2"), bin(BinOp::Mul, num("3"), num("4")))
         );
     }
 
@@ -600,11 +791,7 @@ mod tests {
     fn additive_left_assoc() {
         assert_eq!(
             parse("2 + 3 - 1"),
-            bin(
-                BinOp::Sub,
-                bin(BinOp::Add, Cst::Number("2"), Cst::Number("3")),
-                Cst::Number("1"),
-            )
+            bin(BinOp::Sub, bin(BinOp::Add, num("2"), num("3")), num("1"))
         );
     }
 
@@ -612,11 +799,7 @@ mod tests {
     fn power_right_assoc() {
         assert_eq!(
             parse("2 ^ 3 ^ 2"),
-            bin(
-                BinOp::Pow,
-                Cst::Number("2"),
-                bin(BinOp::Pow, Cst::Number("3"), Cst::Number("2")),
-            )
+            bin(BinOp::Pow, num("2"), bin(BinOp::Pow, num("3"), num("2")))
         );
     }
 
@@ -624,10 +807,7 @@ mod tests {
     fn unary_minus_then_get() {
         assert_eq!(
             parse("-foo:0"),
-            un(
-                UnaryOp::Neg,
-                bin(BinOp::Get, Cst::Ident("foo"), Cst::Number("0")),
-            )
+            un(UnaryOp::Neg, bin(BinOp::Get, id("foo"), num("0")))
         );
     }
 
@@ -635,45 +815,31 @@ mod tests {
     fn match_and_get_chain() {
         assert_eq!(
             parse("a:b:c"),
-            bin(
-                BinOp::Get,
-                bin(BinOp::Get, Cst::Ident("a"), Cst::Ident("b")),
-                Cst::Ident("c"),
-            )
+            bin(BinOp::Get, bin(BinOp::Get, id("a"), id("b")), id("c"))
         );
-        assert_eq!(
-            parse("a~b"),
-            bin(BinOp::Match, Cst::Ident("a"), Cst::Ident("b"))
-        );
+        assert_eq!(parse("a~b"), bin(BinOp::Match, id("a"), id("b")));
     }
 
     #[test]
     fn function_definition() {
-        let cst = parse("foo(a, b) -> a + b");
         assert_eq!(
-            cst,
+            parse("foo(a, b) -> a + b"),
             bin(
                 BinOp::Arrow,
-                Cst::Call {
-                    callee: Box::new(Cst::Ident("foo")),
-                    args: vec![Cst::Ident("a"), Cst::Ident("b")],
-                },
-                bin(BinOp::Add, Cst::Ident("a"), Cst::Ident("b")),
+                call("foo", vec![id("a"), id("b")]),
+                bin(BinOp::Add, id("a"), id("b")),
             )
         );
     }
 
     #[test]
     fn list_and_map_literals() {
-        assert_eq!(
-            parse("[1, 2, 3]"),
-            Cst::List(vec![Cst::Number("1"), Cst::Number("2"), Cst::Number("3")])
-        );
+        assert_eq!(parse("[1, 2, 3]"), list(vec![num("1"), num("2"), num("3")]));
         assert_eq!(
             parse("{'a' -> 1, 'b' -> 2}"),
-            Cst::Map(vec![
-                bin(BinOp::Arrow, Cst::Str("'a'"), Cst::Number("1")),
-                bin(BinOp::Arrow, Cst::Str("'b'"), Cst::Number("2")),
+            map(vec![
+                bin(BinOp::Arrow, str_("'a'"), num("1")),
+                bin(BinOp::Arrow, str_("'b'"), num("2")),
             ])
         );
     }
@@ -684,8 +850,8 @@ mod tests {
             parse("a = b = 5"),
             bin(
                 BinOp::Assign,
-                Cst::Ident("a"),
-                bin(BinOp::Assign, Cst::Ident("b"), Cst::Number("5")),
+                id("a"),
+                bin(BinOp::Assign, id("b"), num("5"))
             )
         );
     }
@@ -694,11 +860,7 @@ mod tests {
     fn semi_and_comma_sequence() {
         assert_eq!(
             parse("a; b; c"),
-            bin(
-                BinOp::Semi,
-                bin(BinOp::Semi, Cst::Ident("a"), Cst::Ident("b")),
-                Cst::Ident("c"),
-            )
+            bin(BinOp::Semi, bin(BinOp::Semi, id("a"), id("b")), id("c"))
         );
     }
 
@@ -706,82 +868,169 @@ mod tests {
     fn unpacking_in_call() {
         assert_eq!(
             parse("f(...xs)"),
-            Cst::Call {
-                callee: Box::new(Cst::Ident("f")),
-                args: vec![un(UnaryOp::Unpack, Cst::Ident("xs"))],
-            }
+            call("f", vec![un(UnaryOp::Unpack, id("xs"))])
         );
     }
 
     #[test]
     fn nested_function_call() {
-        let cst = parse("print(format('f » ', 'g hi'))");
         assert_eq!(
-            cst,
-            Cst::Call {
-                callee: Box::new(Cst::Ident("print")),
-                args: vec![Cst::Call {
-                    callee: Box::new(Cst::Ident("format")),
-                    args: vec![Cst::Str("'f » '"), Cst::Str("'g hi'")],
-                }],
-            }
+            parse("print(format('f » ', 'g hi'))"),
+            call(
+                "print",
+                vec![call("format", vec![str_("'f » '"), str_("'g hi'")])]
+            )
         );
     }
 
     #[test]
-    fn comments_and_newlines_are_skipped() {
-        let cst = parse("// hello\n  a + b\n");
-        assert_eq!(cst, bin(BinOp::Add, Cst::Ident("a"), Cst::Ident("b")));
-    }
-
-    #[test]
     fn lenient_trailing_semicolon() {
-        assert_eq!(parse("a;"), Cst::Ident("a"));
+        assert_eq!(parse("a;"), id("a"));
     }
 
     #[test]
     fn anonymous_function_in_call() {
-        let cst = parse("map([1,2,3], _(x) -> x * x)");
         assert_eq!(
-            cst,
-            Cst::Call {
-                callee: Box::new(Cst::Ident("map")),
-                args: vec![
-                    Cst::List(vec![Cst::Number("1"), Cst::Number("2"), Cst::Number("3")]),
+            parse("map([1,2,3], _(x) -> x * x)"),
+            call(
+                "map",
+                vec![
+                    list(vec![num("1"), num("2"), num("3")]),
                     bin(
                         BinOp::Arrow,
-                        Cst::Call {
-                            callee: Box::new(Cst::Ident("_")),
-                            args: vec![Cst::Ident("x")],
-                        },
-                        bin(BinOp::Mul, Cst::Ident("x"), Cst::Ident("x")),
+                        call("_", vec![id("x")]),
+                        bin(BinOp::Mul, id("x"), id("x")),
                     ),
                 ],
-            }
+            )
         );
     }
 
     #[test]
     fn full_source_from_compdisplay() {
         let src = "toggle() -> (\n    print(player(), 'hi');\n);";
-        let cst = parse(src);
-        let head = bin(
+        let expected = bin(
             BinOp::Arrow,
-            Cst::Call {
-                callee: Box::new(Cst::Ident("toggle")),
-                args: vec![],
-            },
-            Cst::Paren(Box::new(Cst::Call {
-                callee: Box::new(Cst::Ident("print")),
-                args: vec![
-                    Cst::Call {
-                        callee: Box::new(Cst::Ident("player")),
-                        args: vec![],
-                    },
-                    Cst::Str("'hi'"),
-                ],
-            })),
+            call("toggle", vec![]),
+            paren(call("print", vec![call("player", vec![]), str_("'hi'")])),
         );
-        assert_eq!(cst, head);
+        // Trivia is preserved, so equality after stripping leading lets us
+        // verify the structural shape without enumerating every break.
+        assert_eq!(strip_leading(parse(src)), expected);
+    }
+
+    // ----- trivia-preservation tests ------------------------------------
+
+    #[test]
+    fn comments_attach_as_leading_trivia() {
+        let cst = parse("// hello\n  a + b\n");
+        // Top is Binary(Add, lhs=a, rhs=b). The leading trivia from the
+        // comment and the newline lives on lhs (the first token).
+        match &cst.kind {
+            CstKind::Binary {
+                op: BinOp::Add,
+                lhs,
+                rhs,
+            } => {
+                assert_eq!(
+                    lhs.leading,
+                    vec![Trivia::Comment("// hello"), Trivia::Break]
+                );
+                assert_eq!(lhs.kind, CstKind::Ident("a"));
+                // The trailing `\n` after `b` is anchored on the root or
+                // on `b`'s leading via the comma/semi paths; here there's
+                // no operator after `b`, so the trailing Break flows up
+                // to the root's leading.
+                assert!(rhs.leading.is_empty());
+                assert_eq!(rhs.kind, CstKind::Ident("b"));
+            }
+            other => panic!("expected Add(a, b), got {other:?}"),
+        }
+        // Trailing newline anchored at the root.
+        assert!(cst.leading.contains(&Trivia::Break));
+    }
+
+    #[test]
+    fn break_inside_call_args_attaches_to_next_arg() {
+        let cst = parse("f(a,\n b)");
+        match &cst.kind {
+            CstKind::Call { args, .. } => {
+                assert_eq!(args.len(), 2);
+                assert_eq!(args[0].kind, CstKind::Ident("a"));
+                assert!(args[0].leading.is_empty());
+                assert_eq!(args[1].kind, CstKind::Ident("b"));
+                assert_eq!(args[1].leading, vec![Trivia::Break]);
+            }
+            other => panic!("expected Call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn comment_between_operator_and_rhs_attaches_to_rhs() {
+        let cst = parse("a + // mid\n b");
+        match &cst.kind {
+            CstKind::Binary {
+                op: BinOp::Add,
+                lhs,
+                rhs,
+            } => {
+                assert!(lhs.leading.is_empty());
+                assert_eq!(lhs.kind, CstKind::Ident("a"));
+                assert_eq!(rhs.leading, vec![Trivia::Comment("// mid"), Trivia::Break]);
+                assert_eq!(rhs.kind, CstKind::Ident("b"));
+            }
+            other => panic!("expected Add(a, b), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn semicolon_trivia_flows_to_next_statement() {
+        let cst = parse("a;\n// note\n b");
+        // (a ; b) where b carries the inter-statement Break + comment.
+        match &cst.kind {
+            CstKind::Binary {
+                op: BinOp::Semi,
+                lhs,
+                rhs,
+            } => {
+                assert_eq!(lhs.kind, CstKind::Ident("a"));
+                assert_eq!(rhs.kind, CstKind::Ident("b"));
+                assert!(rhs.leading.contains(&Trivia::Comment("// note")));
+                // At least one Break between `;` and the comment.
+                assert!(rhs.leading.contains(&Trivia::Break));
+            }
+            other => panic!("expected Semi(a, b), got {other:?}"),
+        }
+    }
+
+    // Strip leading trivia recursively, for tests that don't care about
+    // trivia placement but still want to compare shape.
+    fn strip_leading<'s>(mut cst: Cst<'s>) -> Cst<'s> {
+        cst.leading.clear();
+        match &mut cst.kind {
+            CstKind::Call { callee, args } => {
+                **callee = strip_leading((**callee).clone());
+                for a in args.iter_mut() {
+                    *a = strip_leading(a.clone());
+                }
+            }
+            CstKind::List(args) | CstKind::Map(args) => {
+                for a in args.iter_mut() {
+                    *a = strip_leading(a.clone());
+                }
+            }
+            CstKind::Paren(inner) => {
+                **inner = strip_leading((**inner).clone());
+            }
+            CstKind::Binary { lhs, rhs, .. } => {
+                **lhs = strip_leading((**lhs).clone());
+                **rhs = strip_leading((**rhs).clone());
+            }
+            CstKind::Unary { operand, .. } => {
+                **operand = strip_leading((**operand).clone());
+            }
+            CstKind::Number(_) | CstKind::Str(_) | CstKind::Ident(_) | CstKind::Empty => {}
+        }
+        cst
     }
 }
