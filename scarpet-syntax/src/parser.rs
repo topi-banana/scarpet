@@ -1003,6 +1003,146 @@ mod tests {
         }
     }
 
+    #[test]
+    fn trailing_comment_anchored_on_root() {
+        // No operator/comma follows `a`, so trivia after the final token
+        // would otherwise be dropped — `program_parser` anchors it on the
+        // root node's leading instead.
+        let cst = parse("a\n// trailing");
+        assert_eq!(cst.kind, CstKind::Ident("a"));
+        assert_eq!(
+            cst.leading,
+            vec![Trivia::Break, Trivia::Comment("// trailing")]
+        );
+    }
+
+    #[test]
+    fn comment_inside_empty_parens_becomes_phantom_empty() {
+        // The arg list is otherwise empty, but the comment needs an anchor.
+        // `arg_list_parser` synthesises a single `Empty` to hold the trivia.
+        let cst = parse("f(// note\n)");
+        match &cst.kind {
+            CstKind::Call { args, .. } => {
+                assert_eq!(args.len(), 1);
+                assert_eq!(args[0].kind, CstKind::Empty);
+                assert_eq!(
+                    args[0].leading,
+                    vec![Trivia::Comment("// note"), Trivia::Break]
+                );
+            }
+            other => panic!("expected Call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn comment_attaches_to_omitted_empty_arg() {
+        // `f(a, , b)` already synthesises an Empty between the commas; a
+        // comment that sits where that Empty would be needs to ride on it.
+        let cst = parse("f(a, // gap\n , b)");
+        match &cst.kind {
+            CstKind::Call { args, .. } => {
+                assert_eq!(args.len(), 3);
+                assert_eq!(args[0].kind, CstKind::Ident("a"));
+                assert!(args[0].leading.is_empty());
+                assert_eq!(args[1].kind, CstKind::Empty);
+                assert_eq!(
+                    args[1].leading,
+                    vec![Trivia::Comment("// gap"), Trivia::Break]
+                );
+                assert_eq!(args[2].kind, CstKind::Ident("b"));
+                assert!(args[2].leading.is_empty());
+            }
+            other => panic!("expected Call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn comment_after_last_arg_in_call_attaches_back() {
+        // No comma follows `a`; the trailing trivia would otherwise be
+        // stranded between the last item and `)`. It re-attaches onto `a`.
+        let cst = parse("f(a // tail\n)");
+        match &cst.kind {
+            CstKind::Call { args, .. } => {
+                assert_eq!(args.len(), 1);
+                assert_eq!(args[0].kind, CstKind::Ident("a"));
+                assert_eq!(
+                    args[0].leading,
+                    vec![Trivia::Comment("// tail"), Trivia::Break]
+                );
+            }
+            other => panic!("expected Call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn comment_around_trailing_comma_in_list_flushes_onto_last() {
+        // The trailing-comma branch must flush both trivia bands (pre- and
+        // post-comma) onto the last item rather than dropping them.
+        let cst = parse("[1, // tail\n]");
+        match &cst.kind {
+            CstKind::List(items) => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].kind, CstKind::Number("1"));
+                assert_eq!(
+                    items[0].leading,
+                    vec![Trivia::Comment("// tail"), Trivia::Break]
+                );
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn comment_inside_paren_attaches_to_inner_first_token() {
+        // `paren` delegates the body to `top`, so trivia immediately after
+        // `(` becomes the leading of the first inner atom.
+        let cst = parse("(// note\n a + b)");
+        match &cst.kind {
+            CstKind::Paren(inner) => {
+                assert!(cst.leading.is_empty());
+                match &inner.kind {
+                    CstKind::Binary {
+                        op: BinOp::Add,
+                        lhs,
+                        rhs,
+                    } => {
+                        assert_eq!(
+                            lhs.leading,
+                            vec![Trivia::Comment("// note"), Trivia::Break]
+                        );
+                        assert_eq!(lhs.kind, CstKind::Ident("a"));
+                        assert!(rhs.leading.is_empty());
+                        assert_eq!(rhs.kind, CstKind::Ident("b"));
+                    }
+                    other => panic!("expected Add(a, b), got {other:?}"),
+                }
+            }
+            other => panic!("expected Paren, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn comment_between_unary_prefix_and_operand() {
+        // The unary prefix consumes its own leading (here empty); trivia
+        // between the prefix and its operand must ride on the operand, not
+        // on the Unary node.
+        let cst = parse("! // note\n x");
+        match &cst.kind {
+            CstKind::Unary {
+                op: UnaryOp::Not,
+                operand,
+            } => {
+                assert!(cst.leading.is_empty());
+                assert_eq!(
+                    operand.leading,
+                    vec![Trivia::Comment("// note"), Trivia::Break]
+                );
+                assert_eq!(operand.kind, CstKind::Ident("x"));
+            }
+            other => panic!("expected Unary(Not, _), got {other:?}"),
+        }
+    }
+
     // Strip leading trivia recursively, for tests that don't care about
     // trivia placement but still want to compare shape.
     fn strip_leading<'s>(mut cst: Cst<'s>) -> Cst<'s> {
