@@ -7,7 +7,7 @@ pub enum Token<'a> {
     #[token("\n")]
     #[token("$")]
     Break,
-    #[regex(r"//[^\n]*", allow_greedy = true)]
+    #[regex(r"//[^\n]*")]
     Comment(&'a str),
 
     // ===== Literals / Atoms =====
@@ -101,6 +101,99 @@ impl<'a> Token<'a> {
     /// the parser typically wants to skip.
     pub fn is_trivia(&self) -> bool {
         matches!(self, Token::Break | Token::Comment(_))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TokenKind {
+    Break,
+    Comment,
+    Number,
+    String,
+    Ident,
+    OpenParen,
+    CloseParen,
+    OpenBrack,
+    CloseBrack,
+    OpenBrace,
+    CloseBrace,
+    EqEq,
+    BangEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+    And,
+    Or,
+    Bang,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Pow,
+    Assign,
+    AddAssign,
+    Swap,
+    Tilde,
+    Colon,
+    Dot,
+    Ellipsis,
+    Comma,
+    SemiColon,
+    Arrow,
+}
+
+impl<'a> logosky::Token<'a> for Token<'a> {
+    type Char = char;
+    type Kind = TokenKind;
+    type Logos = Self;
+
+    fn kind(&self) -> Self::Kind {
+        match self {
+            Token::Break => TokenKind::Break,
+            Token::Comment(_) => TokenKind::Comment,
+            Token::Number(_) => TokenKind::Number,
+            Token::String(_) => TokenKind::String,
+            Token::Ident(_) => TokenKind::Ident,
+            Token::OpenParen => TokenKind::OpenParen,
+            Token::CloseParen => TokenKind::CloseParen,
+            Token::OpenBrack => TokenKind::OpenBrack,
+            Token::CloseBrack => TokenKind::CloseBrack,
+            Token::OpenBrace => TokenKind::OpenBrace,
+            Token::CloseBrace => TokenKind::CloseBrace,
+            Token::EqEq => TokenKind::EqEq,
+            Token::BangEq => TokenKind::BangEq,
+            Token::Lt => TokenKind::Lt,
+            Token::LtEq => TokenKind::LtEq,
+            Token::Gt => TokenKind::Gt,
+            Token::GtEq => TokenKind::GtEq,
+            Token::And => TokenKind::And,
+            Token::Or => TokenKind::Or,
+            Token::Bang => TokenKind::Bang,
+            Token::Add => TokenKind::Add,
+            Token::Sub => TokenKind::Sub,
+            Token::Mul => TokenKind::Mul,
+            Token::Div => TokenKind::Div,
+            Token::Rem => TokenKind::Rem,
+            Token::Pow => TokenKind::Pow,
+            Token::Assign => TokenKind::Assign,
+            Token::AddAssign => TokenKind::AddAssign,
+            Token::Swap => TokenKind::Swap,
+            Token::Tilde => TokenKind::Tilde,
+            Token::Colon => TokenKind::Colon,
+            Token::Dot => TokenKind::Dot,
+            Token::Ellipsis => TokenKind::Ellipsis,
+            Token::Comma => TokenKind::Comma,
+            Token::SemiColon => TokenKind::SemiColon,
+            Token::Arrow => TokenKind::Arrow,
+        }
+    }
+}
+
+impl<'a> logosky::LosslessToken<'a> for Token<'a> {
+    fn is_trivia(&self) -> bool {
+        Token::is_trivia(self)
     }
 }
 
