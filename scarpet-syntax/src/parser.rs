@@ -845,6 +845,39 @@ mod tests {
     }
 
     #[test]
+    fn semi_binds_looser_than_arrow_in_map() {
+        // `;` (seq_chain) sits outside `->` (arrow_chain), so a map entry
+        // `{1+2 ; 'a'->3*4}` groups as `{(1+2) ; ('a'->(3*4))}`. This mirrors
+        // Scarpet, where `->` (precedence 2) binds tighter than `;` (1).
+        assert_eq!(
+            parse("{1+2;'a'->3*4}"),
+            map(vec![bin(
+                BinOp::Semi,
+                bin(BinOp::Add, num("1"), num("2")),
+                bin(
+                    BinOp::Arrow,
+                    str_("'a'"),
+                    bin(BinOp::Mul, num("3"), num("4"))
+                ),
+            )])
+        );
+    }
+
+    #[test]
+    fn arrow_right_assoc() {
+        // `->` is right-associative, so `{f()->g()->h()}` groups as
+        // `{f() -> (g() -> h())}`.
+        assert_eq!(
+            parse("{f()->g()->h()}"),
+            map(vec![bin(
+                BinOp::Arrow,
+                call("f", vec![]),
+                bin(BinOp::Arrow, call("g", vec![]), call("h", vec![])),
+            )])
+        );
+    }
+
+    #[test]
     fn assignment_right_assoc() {
         assert_eq!(
             parse("a = b = 5"),
