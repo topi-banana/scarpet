@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -83,7 +86,15 @@ jobs:
             echo "| cargo check | $(status '${{ steps.check.outcome }}') |"
             echo "| cargo machete | $(status '${{ steps.machete.outcome }}') |"
             echo "| cargo test | $(status '${{ steps.test.outcome }}') |"
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY" summary.md
+
+      - name: Upload summary
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-summary-1-quality
+          path: summary.md
+          if-no-files-found: error
 
       - name: Fail job if any step failed
         if: >-
@@ -131,4 +142,50 @@ jobs:
             echo ""
             echo "- Command: \`cargo build --target ${{ matrix.target }} ${{ matrix.args }}\`"
             echo "- Result: **${{ steps.build.outcome }}**"
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY" summary.md
+
+      - name: Upload summary
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-summary-2-build-${{ matrix.name }}
+          path: summary.md
+          if-no-files-found: error
+
+  comment:
+    name: PR summary comment
+    needs: [quality, build]
+    if: >-
+      !cancelled() &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Download summaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ci-summary-*
+          path: summaries
+
+      - name: Combine summaries
+        run: |
+          shopt -s nullglob
+          {
+            echo "# CI summary"
+            echo ""
+            for dir in $(printf '%s\n' summaries/ci-summary-* | sort); do
+              cat "$dir/summary.md"
+              echo ""
+            done
+            echo "<sub>Updated for ${{ github.event.pull_request.head.sha }}</sub>"
+          } > combined.md
+          cat combined.md
+
+      - name: Post or update PR comment
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: ci-summary
+          path: combined.md
