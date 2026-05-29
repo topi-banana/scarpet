@@ -133,7 +133,7 @@ jobs:
 
       - name: Upload summary
         if: always() && github.event_name == 'pull_request'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ci-summary-1-quality
           path: summary.md
@@ -197,7 +197,7 @@ jobs:
 
       - name: Upload summary
         if: always() && github.event_name == 'pull_request'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ci-summary-2-build-${{ matrix.name }}
           path: summary.md
