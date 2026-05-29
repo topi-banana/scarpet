@@ -5,4 +5,4 @@ edition = "2024"
 
 [dependencies]
 clap.workspace = true
-scarpet-syntax.workspace = true
+scarpet-fmt.workspace = true

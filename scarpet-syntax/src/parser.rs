@@ -156,6 +156,39 @@ pub fn parse_source(src: &str) -> Result<Cst<'_>, ParseError> {
     }
 }
 
+/// Return a clone of `cst` with all leading trivia removed, recursively.
+///
+/// Useful for comparing two trees for structural equality while ignoring
+/// comments and breaks — e.g. to assert a formatter is non-destructive.
+pub fn strip_trivia<'s>(cst: &Cst<'s>) -> Cst<'s> {
+    let kind = match &cst.kind {
+        CstKind::Call { callee, args } => CstKind::Call {
+            callee: Box::new(strip_trivia(callee)),
+            args: args.iter().map(strip_trivia).collect(),
+        },
+        CstKind::List(items) => CstKind::List(items.iter().map(strip_trivia).collect()),
+        CstKind::Map(items) => CstKind::Map(items.iter().map(strip_trivia).collect()),
+        CstKind::Paren(inner) => CstKind::Paren(Box::new(strip_trivia(inner))),
+        CstKind::Binary { op, lhs, rhs } => CstKind::Binary {
+            op: *op,
+            lhs: Box::new(strip_trivia(lhs)),
+            rhs: Box::new(strip_trivia(rhs)),
+        },
+        CstKind::Unary { op, operand } => CstKind::Unary {
+            op: *op,
+            operand: Box::new(strip_trivia(operand)),
+        },
+        CstKind::Number(s) => CstKind::Number(s),
+        CstKind::Str(s) => CstKind::Str(s),
+        CstKind::Ident(s) => CstKind::Ident(s),
+        CstKind::Empty => CstKind::Empty,
+    };
+    Cst {
+        leading: Vec::new(),
+        kind,
+    }
+}
+
 // ====================================================================
 // chumsky-based parser
 // ====================================================================
@@ -845,6 +878,39 @@ mod tests {
     }
 
     #[test]
+    fn semi_binds_looser_than_arrow_in_map() {
+        // `;` (seq_chain) sits outside `->` (arrow_chain), so a map entry
+        // `{1+2 ; 'a'->3*4}` groups as `{(1+2) ; ('a'->(3*4))}`. This mirrors
+        // Scarpet, where `->` (precedence 2) binds tighter than `;` (1).
+        assert_eq!(
+            parse("{1+2;'a'->3*4}"),
+            map(vec![bin(
+                BinOp::Semi,
+                bin(BinOp::Add, num("1"), num("2")),
+                bin(
+                    BinOp::Arrow,
+                    str_("'a'"),
+                    bin(BinOp::Mul, num("3"), num("4"))
+                ),
+            )])
+        );
+    }
+
+    #[test]
+    fn arrow_right_assoc() {
+        // `->` is right-associative, so `{f()->g()->h()}` groups as
+        // `{f() -> (g() -> h())}`.
+        assert_eq!(
+            parse("{f()->g()->h()}"),
+            map(vec![bin(
+                BinOp::Arrow,
+                call("f", vec![]),
+                bin(BinOp::Arrow, call("g", vec![]), call("h", vec![])),
+            )])
+        );
+    }
+
+    #[test]
     fn assignment_right_assoc() {
         assert_eq!(
             parse("a = b = 5"),
@@ -916,7 +982,7 @@ mod tests {
         );
         // Trivia is preserved, so equality after stripping leading lets us
         // verify the structural shape without enumerating every break.
-        assert_eq!(strip_leading(parse(src)), expected);
+        assert_eq!(strip_trivia(&parse(src)), expected);
     }
 
     // ----- trivia-preservation tests ------------------------------------
@@ -1138,36 +1204,5 @@ mod tests {
             }
             other => panic!("expected Unary(Not, _), got {other:?}"),
         }
-    }
-
-    // Strip leading trivia recursively, for tests that don't care about
-    // trivia placement but still want to compare shape.
-    fn strip_leading<'s>(mut cst: Cst<'s>) -> Cst<'s> {
-        cst.leading.clear();
-        match &mut cst.kind {
-            CstKind::Call { callee, args } => {
-                **callee = strip_leading((**callee).clone());
-                for a in args.iter_mut() {
-                    *a = strip_leading(a.clone());
-                }
-            }
-            CstKind::List(args) | CstKind::Map(args) => {
-                for a in args.iter_mut() {
-                    *a = strip_leading(a.clone());
-                }
-            }
-            CstKind::Paren(inner) => {
-                **inner = strip_leading((**inner).clone());
-            }
-            CstKind::Binary { lhs, rhs, .. } => {
-                **lhs = strip_leading((**lhs).clone());
-                **rhs = strip_leading((**rhs).clone());
-            }
-            CstKind::Unary { operand, .. } => {
-                **operand = strip_leading((**operand).clone());
-            }
-            CstKind::Number(_) | CstKind::Str(_) | CstKind::Ident(_) | CstKind::Empty => {}
-        }
-        cst
     }
 }
