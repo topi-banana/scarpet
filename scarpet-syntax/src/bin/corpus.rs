@@ -13,7 +13,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use scarpet_syntax::parser::{Code, ParseError, ParseErrorKind};
+use scarpet_syntax::parser::{Code, ParseError};
 
 fn corpus_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -71,14 +71,10 @@ impl Outcome {
 ///         ^
 /// ```
 fn describe_error(src: &str, e: &ParseError) -> String {
-    let kind = match e.kind {
-        ParseErrorKind::UnexpectedToken => "unexpected token",
-        ParseErrorKind::UnexpectedEof => "unexpected end of input",
-        ParseErrorKind::Trailing => "trailing input",
-    };
+    let kind = e.kind.message();
 
     // Clamp to a char boundary so slicing can never panic on a stray offset.
-    let mut at = e.at.min(src.len());
+    let mut at = e.span.start.min(src.len());
     while at > 0 && !src.is_char_boundary(at) {
         at -= 1;
     }

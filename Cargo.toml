@@ -3,6 +3,7 @@ resolver = "3"
 members = ["scarpet-cli", "scarpet-fmt", "scarpet-syntax"]
 
 [workspace.dependencies]
+ariadne = { version = "0.6", features = ["auto-color"] }
 clap = { version = "4.6.1", features = ["derive"] }
 chumsky = { version = "0.11" }
 logos = { version = "0.15.1" }

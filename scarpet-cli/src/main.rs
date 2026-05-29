@@ -2,8 +2,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use ariadne::{Label, Report, ReportKind, Source};
 use clap::{Args, Parser, Subcommand};
-use scarpet_fmt::format_source;
+use scarpet_fmt::{FmtError, format_source};
+use scarpet_syntax::parser::ParseError;
 
 #[derive(Parser)]
 #[command(name = "scarpet", about = "Scarpet language tools")]
@@ -55,8 +57,8 @@ fn run_format(args: FormatArgs) -> ExitCode {
                     code = c;
                 }
             }
-            Err(e) => {
-                eprintln!("{}: {e}", path.display());
+            Err(FmtError::Parse(e)) => {
+                report_parse_error(&path.display().to_string(), &src, &e);
                 code = ExitCode::FAILURE;
             }
         }
@@ -102,9 +104,21 @@ fn format_stdin(check: bool) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        Err(e) => {
-            eprintln!("stdin: {e}");
+        Err(FmtError::Parse(e)) => {
+            report_parse_error("<stdin>", &src, &e);
             ExitCode::FAILURE
         }
     }
+}
+
+/// Render a parse error to stderr as a rustc-style ariadne diagnostic that
+/// underlines the offending span in `src`. `name` labels the source — a file
+/// path, or `<stdin>`. Colour is auto-disabled when stderr isn't a terminal.
+fn report_parse_error(name: &str, src: &str, e: &ParseError) {
+    let msg = e.kind.message();
+    let _ = Report::build(ReportKind::Error, (name, e.span.clone()))
+        .with_message(msg)
+        .with_label(Label::new((name, e.span.clone())).with_message(msg))
+        .finish()
+        .eprint((name, Source::from(src)));
 }
