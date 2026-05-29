@@ -128,7 +128,8 @@ pub struct LexError;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
     pub kind: ParseErrorKind,
-    pub at: usize,
+    /// Byte range of the offending token. Empty (`len..len`) at end of input.
+    pub span: std::ops::Range<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +139,18 @@ pub enum ParseErrorKind {
     Trailing,
 }
 
+impl ParseErrorKind {
+    /// Human-readable description of the error kind, shared by the corpus
+    /// reporter and the CLI's ariadne diagnostics.
+    pub fn message(&self) -> &'static str {
+        match self {
+            ParseErrorKind::UnexpectedToken => "unexpected token",
+            ParseErrorKind::UnexpectedEof => "unexpected end of input",
+            ParseErrorKind::Trailing => "trailing input",
+        }
+    }
+}
+
 pub fn parse_source(src: &str) -> Result<Cst<'_>, ParseError> {
     let stream = TokenStream::new(src);
     let len = src.len();
@@ -145,13 +158,13 @@ pub fn parse_source(src: &str) -> Result<Cst<'_>, ParseError> {
         Ok(cst) => Ok(cst),
         Err(errs) => {
             let err = errs.into_iter().next().unwrap();
-            let at = err.span().start();
-            let kind = if at >= len {
+            let span = err.span().start()..err.span().end();
+            let kind = if span.start >= len {
                 ParseErrorKind::UnexpectedEof
             } else {
                 ParseErrorKind::UnexpectedToken
             };
-            Err(ParseError { kind, at })
+            Err(ParseError { kind, span })
         }
     }
 }
