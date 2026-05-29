@@ -4,5 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+ariadne.workspace = true
 clap.workspace = true
 scarpet-fmt.workspace = true
+scarpet-syntax.workspace = true
