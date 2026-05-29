@@ -88,6 +88,16 @@ jobs:
           echo "duration=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
           exit $code
 
+      - name: corpus parse
+        id: corpus
+        continue-on-error: true
+        run: |
+          start=$SECONDS
+          cargo run -p scarpet-syntax --bin corpus -- --markdown > corpus.md && code=0 || code=$?
+          echo "duration=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
+          cat corpus.md
+          exit $code
+
       - name: Write summary
         if: always()
         run: |
@@ -114,6 +124,11 @@ jobs:
             echo "| cargo check | $(status '${{ steps.check.outcome }}') | $(dur '${{ steps.check.outputs.duration }}') |"
             echo "| cargo machete | $(status '${{ steps.machete.outcome }}') | $(dur '${{ steps.machete.outputs.duration }}') |"
             echo "| cargo test | $(status '${{ steps.test.outcome }}') | $(dur '${{ steps.test.outputs.duration }}') |"
+            echo "| corpus parse | $(status '${{ steps.corpus.outcome }}') | $(dur '${{ steps.corpus.outputs.duration }}') |"
+            if [ -s corpus.md ]; then
+              echo ""
+              cat corpus.md
+            fi
           } | tee -a "$GITHUB_STEP_SUMMARY" summary.md
 
       - name: Upload summary

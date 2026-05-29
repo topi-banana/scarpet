@@ -1,26 +1,17 @@
-//! Stand-alone integration runner: walks every `.sc` file under
-//! `example/<org>/<repo>/` and prints a summary. Exits with code 1 if any file
-//! parsed unexpectedly (either an unannounced failure or a `KNOWN_BAD` entry
-//! that has since started parsing cleanly).
+//! Stand-alone corpus runner: walks every `.sc` file under
+//! `example/<org>/<repo>/`, parses each, and reports the parse rate. This is a
+//! progress metric, not a gate — it always exits 0 regardless of how many files
+//! fail to parse (the only non-zero exit is a missing corpus root).
 //!
-//! Run with `cargo run -p scarpet-syntax --bin corpus`.
+//! Run with `cargo run -p scarpet-syntax --bin corpus`. Pass `--markdown` to
+//! emit a GitHub-flavoured Markdown report (CI feeds it into the job summary and
+//! the sticky PR comment) instead of the plain-text summary.
 
-use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use scarpet_syntax::parser::Code;
-
-/// Files whose Scarpet source contains a parse-blocking typo upstream.
-/// Paths are relative to the workspace `example/` root.
-const KNOWN_BAD: &[&str] = &[
-    // `sidelist = l[];` — relies on the legacy `[` → `l(` preprocessor desugar
-    "gnembon/scarpet/programs/survival/portalorient.sc",
-    // `if(decor, ..., '']` — closing bracket mismatched (should be `)`)
-    "gnembon/scarpet/programs/survival/rifts/rifts.sc",
-    // Two adjacent list literals with a missing `,` between them
-    "Ghoulboy78/Scarpet-edit/se.sc",
-];
 
 fn corpus_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -45,14 +36,26 @@ fn walk_sc(dir: &Path, out: &mut Vec<PathBuf>) {
 #[derive(Debug, Default)]
 struct Outcome {
     total: usize,
-    ok: usize,
-    expected_failures: usize,
-    unexpected_failures: Vec<String>,
-    unexpected_passes: Vec<String>,
+    failed: Vec<String>,
 }
 
-/// Walk the corpus and classify each file against `KNOWN_BAD`. Returns Err if
-/// the root is missing.
+impl Outcome {
+    /// Files that parsed cleanly.
+    fn parsed(&self) -> usize {
+        self.total - self.failed.len()
+    }
+
+    /// Share of the corpus that parsed, in percent (0 for an empty corpus).
+    fn parse_rate(&self) -> f64 {
+        if self.total == 0 {
+            return 0.0;
+        }
+        self.parsed() as f64 / self.total as f64 * 100.0
+    }
+}
+
+/// Walk the corpus and parse every `.sc` file. Returns Err only if the root is
+/// missing (a corpus full of parse failures is still a successful run).
 fn run() -> Result<Outcome, String> {
     let root = corpus_root();
     if !root.is_dir() {
@@ -65,7 +68,6 @@ fn run() -> Result<Outcome, String> {
     walk_sc(&root, &mut files);
     files.sort();
 
-    let known_bad: HashSet<&str> = KNOWN_BAD.iter().copied().collect();
     let mut out = Outcome {
         total: files.len(),
         ..Default::default()
@@ -76,24 +78,71 @@ fn run() -> Result<Outcome, String> {
             .unwrap_or(f)
             .to_string_lossy()
             .replace('\\', "/");
-        let is_known_bad = known_bad.contains(rel.as_str());
         let parsed = std::fs::read_to_string(f).is_ok_and(|src| {
             Code::from_source(&src)
                 .ok()
                 .and_then(|c| c.parse().ok())
                 .is_some()
         });
-        match (parsed, is_known_bad) {
-            (true, false) => out.ok += 1,
-            (true, true) => out.unexpected_passes.push(rel),
-            (false, true) => out.expected_failures += 1,
-            (false, false) => out.unexpected_failures.push(rel),
+        if !parsed {
+            out.failed.push(rel);
         }
     }
     Ok(out)
 }
 
+/// Plain-text report for local runs.
+fn render_human(o: &Outcome) -> String {
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "corpus: {} files | parsed={} ({:.1}%) failed={}",
+        o.total,
+        o.parsed(),
+        o.parse_rate(),
+        o.failed.len(),
+    );
+    if !o.failed.is_empty() {
+        let _ = writeln!(s, "\nFailed to parse ({}):", o.failed.len());
+        for f in &o.failed {
+            let _ = writeln!(s, "  - {f}");
+        }
+    }
+    s
+}
+
+/// GitHub-flavoured Markdown report for CI summaries and PR comments.
+fn render_markdown(o: &Outcome) -> String {
+    let mut s = String::new();
+    let status = if o.failed.is_empty() { "✅" } else { "⚠️" };
+
+    let _ = writeln!(s, "### Corpus parse results");
+    let _ = writeln!(s);
+    let _ = writeln!(
+        s,
+        "{status} **Parse rate: {:.1}%** — {} / {} files parsed",
+        o.parse_rate(),
+        o.parsed(),
+        o.total,
+    );
+
+    if !o.failed.is_empty() {
+        let _ = writeln!(s);
+        let _ = writeln!(s, "<details>");
+        let _ = writeln!(s, "<summary>Failed to parse ({})</summary>", o.failed.len());
+        let _ = writeln!(s);
+        for f in &o.failed {
+            let _ = writeln!(s, "- `{f}`");
+        }
+        let _ = writeln!(s);
+        let _ = writeln!(s, "</details>");
+    }
+    s
+}
+
 fn main() -> ExitCode {
+    let markdown = std::env::args().skip(1).any(|a| a == "--markdown");
+
     let outcome = match run() {
         Ok(o) => o,
         Err(e) => {
@@ -102,37 +151,13 @@ fn main() -> ExitCode {
         }
     };
 
-    println!(
-        "corpus: {} files | ok={} expected_failures={} unexpected_failures={} unexpected_passes={}",
-        outcome.total,
-        outcome.ok,
-        outcome.expected_failures,
-        outcome.unexpected_failures.len(),
-        outcome.unexpected_passes.len(),
-    );
-
-    if !outcome.unexpected_failures.is_empty() {
-        println!(
-            "\nUnexpected parse failures ({}):",
-            outcome.unexpected_failures.len()
-        );
-        for f in &outcome.unexpected_failures {
-            println!("  - {f}");
-        }
-    }
-    if !outcome.unexpected_passes.is_empty() {
-        println!(
-            "\nFiles that unexpectedly parsed (remove from KNOWN_BAD): {}",
-            outcome.unexpected_passes.len()
-        );
-        for f in &outcome.unexpected_passes {
-            println!("  - {f}");
-        }
-    }
-
-    if outcome.unexpected_failures.is_empty() && outcome.unexpected_passes.is_empty() {
-        ExitCode::SUCCESS
+    let report = if markdown {
+        render_markdown(&outcome)
     } else {
-        ExitCode::FAILURE
-    }
+        render_human(&outcome)
+    };
+    print!("{report}");
+
+    // Parse failures are a metric, not a gate — always succeed.
+    ExitCode::SUCCESS
 }
