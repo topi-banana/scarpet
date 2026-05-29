@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -34,32 +37,66 @@ jobs:
       - name: cargo fmt --check
         id: fmt
         continue-on-error: true
-        run: cargo fmt --all -- --check
+        run: |
+          start=$SECONDS
+          cargo fmt --all -- --check && code=0 || code=$?
+          echo "duration=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
+          exit $code
 
       - name: taplo fmt --check
         id: taplo
         continue-on-error: true
-        run: taplo fmt --check --diff
+        run: |
+          start=$SECONDS
+          taplo fmt --check --diff && code=0 || code=$?
+          echo "duration=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
+          exit $code
 
       - name: cargo clippy
         id: clippy
         continue-on-error: true
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: |
+          start=$SECONDS
+          cargo clippy --workspace --all-targets -- -D warnings && code=0 || code=$?
+          echo "duration=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
+          exit $code
 
       - name: cargo check
         id: check
         continue-on-error: true
-        run: cargo check --workspace --all-targets
+        run: |
+          start=$SECONDS
+          cargo check --workspace --all-targets && code=0 || code=$?
+          echo "duration=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
+          exit $code
 
       - name: cargo machete
         id: machete
         continue-on-error: true
-        run: cargo machete
+        run: |
+          start=$SECONDS
+          cargo machete && code=0 || code=$?
+          echo "duration=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
+          exit $code
 
       - name: cargo test
         id: test
         continue-on-error: true
-        run: cargo test --workspace --all-targets
+        run: |
+          start=$SECONDS
+          cargo test --workspace --all-targets && code=0 || code=$?
+          echo "duration=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
+          exit $code
+
+      - name: corpus parse
+        id: corpus
+        continue-on-error: true
+        run: |
+          start=$SECONDS
+          cargo run -p scarpet-syntax --bin corpus -- --markdown > corpus.md && code=0 || code=$?
+          echo "duration=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
+          cat corpus.md
+          exit $code
 
       - name: Write summary
         if: always()
@@ -72,18 +109,35 @@ jobs:
               *)       echo "⚠️ $1" ;;
             esac
           }
+          dur() {
+            if [ -z "$1" ]; then echo "—"; return; fi
+            if [ "$1" -ge 60 ]; then printf '%dm%02ds' $(($1 / 60)) $(($1 % 60)); else printf '%ds' "$1"; fi
+          }
           {
             echo "## Quality results"
             echo ""
-            echo "| Step | Result |"
-            echo "| --- | --- |"
-            echo "| cargo fmt --check | $(status '${{ steps.fmt.outcome }}') |"
-            echo "| taplo fmt --check | $(status '${{ steps.taplo.outcome }}') |"
-            echo "| cargo clippy | $(status '${{ steps.clippy.outcome }}') |"
-            echo "| cargo check | $(status '${{ steps.check.outcome }}') |"
-            echo "| cargo machete | $(status '${{ steps.machete.outcome }}') |"
-            echo "| cargo test | $(status '${{ steps.test.outcome }}') |"
-          } >> "$GITHUB_STEP_SUMMARY"
+            echo "| Step | Result | Time |"
+            echo "| --- | --- | --- |"
+            echo "| cargo fmt --check | $(status '${{ steps.fmt.outcome }}') | $(dur '${{ steps.fmt.outputs.duration }}') |"
+            echo "| taplo fmt --check | $(status '${{ steps.taplo.outcome }}') | $(dur '${{ steps.taplo.outputs.duration }}') |"
+            echo "| cargo clippy | $(status '${{ steps.clippy.outcome }}') | $(dur '${{ steps.clippy.outputs.duration }}') |"
+            echo "| cargo check | $(status '${{ steps.check.outcome }}') | $(dur '${{ steps.check.outputs.duration }}') |"
+            echo "| cargo machete | $(status '${{ steps.machete.outcome }}') | $(dur '${{ steps.machete.outputs.duration }}') |"
+            echo "| cargo test | $(status '${{ steps.test.outcome }}') | $(dur '${{ steps.test.outputs.duration }}') |"
+            echo "| corpus parse | $(status '${{ steps.corpus.outcome }}') | $(dur '${{ steps.corpus.outputs.duration }}') |"
+            if [ -s corpus.md ]; then
+              echo ""
+              cat corpus.md
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY" summary.md
+
+      - name: Upload summary
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-summary-1-quality
+          path: summary.md
+          if-no-files-found: error
 
       - name: Fail job if any step failed
         if: >-
@@ -121,14 +175,68 @@ jobs:
 
       - name: cargo build
         id: build
-        run: cargo build --target ${{ matrix.target }} ${{ matrix.args }}
+        run: |
+          start=$SECONDS
+          cargo build --target ${{ matrix.target }} ${{ matrix.args }} && code=0 || code=$?
+          echo "duration=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
+          exit $code
 
       - name: Write summary
         if: always()
         run: |
+          dur() {
+            if [ -z "$1" ]; then echo "—"; return; fi
+            if [ "$1" -ge 60 ]; then printf '%dm%02ds' $(($1 / 60)) $(($1 % 60)); else printf '%ds' "$1"; fi
+          }
           {
             echo "## Build: ${{ matrix.name }} (\`${{ matrix.target }}\`)"
             echo ""
             echo "- Command: \`cargo build --target ${{ matrix.target }} ${{ matrix.args }}\`"
-            echo "- Result: **${{ steps.build.outcome }}**"
-          } >> "$GITHUB_STEP_SUMMARY"
+            echo "- Result: **${{ steps.build.outcome }}** ($(dur '${{ steps.build.outputs.duration }}'))"
+          } | tee -a "$GITHUB_STEP_SUMMARY" summary.md
+
+      - name: Upload summary
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-summary-2-build-${{ matrix.name }}
+          path: summary.md
+          if-no-files-found: error
+
+  comment:
+    name: PR summary comment
+    needs: [quality, build]
+    if: >-
+      !cancelled() &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Download summaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ci-summary-*
+          path: summaries
+
+      - name: Combine summaries
+        run: |
+          shopt -s nullglob
+          {
+            echo "# CI summary"
+            echo ""
+            for dir in $(printf '%s\n' summaries/ci-summary-* | sort); do
+              cat "$dir/summary.md"
+              echo ""
+            done
+            echo "<sub>Updated for ${{ github.event.pull_request.head.sha }}</sub>"
+          } > combined.md
+          cat combined.md
+
+      - name: Post or update PR comment
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: ci-summary
+          path: combined.md
