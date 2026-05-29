@@ -1106,10 +1106,7 @@ mod tests {
                         lhs,
                         rhs,
                     } => {
-                        assert_eq!(
-                            lhs.leading,
-                            vec![Trivia::Comment("// note"), Trivia::Break]
-                        );
+                        assert_eq!(lhs.leading, vec![Trivia::Comment("// note"), Trivia::Break]);
                         assert_eq!(lhs.kind, CstKind::Ident("a"));
                         assert!(rhs.leading.is_empty());
                         assert_eq!(rhs.kind, CstKind::Ident("b"));
