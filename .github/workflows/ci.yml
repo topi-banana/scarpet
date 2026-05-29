@@ -37,32 +37,56 @@ jobs:
       - name: cargo fmt --check
         id: fmt
         continue-on-error: true
-        run: cargo fmt --all -- --check
+        run: |
+          start=$SECONDS
+          cargo fmt --all -- --check && code=0 || code=$?
+          echo "duration=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
+          exit $code
 
       - name: taplo fmt --check
         id: taplo
         continue-on-error: true
-        run: taplo fmt --check --diff
+        run: |
+          start=$SECONDS
+          taplo fmt --check --diff && code=0 || code=$?
+          echo "duration=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
+          exit $code
 
       - name: cargo clippy
         id: clippy
         continue-on-error: true
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: |
+          start=$SECONDS
+          cargo clippy --workspace --all-targets -- -D warnings && code=0 || code=$?
+          echo "duration=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
+          exit $code
 
       - name: cargo check
         id: check
         continue-on-error: true
-        run: cargo check --workspace --all-targets
+        run: |
+          start=$SECONDS
+          cargo check --workspace --all-targets && code=0 || code=$?
+          echo "duration=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
+          exit $code
 
       - name: cargo machete
         id: machete
         continue-on-error: true
-        run: cargo machete
+        run: |
+          start=$SECONDS
+          cargo machete && code=0 || code=$?
+          echo "duration=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
+          exit $code
 
       - name: cargo test
         id: test
         continue-on-error: true
-        run: cargo test --workspace --all-targets
+        run: |
+          start=$SECONDS
+          cargo test --workspace --all-targets && code=0 || code=$?
+          echo "duration=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
+          exit $code
 
       - name: Write summary
         if: always()
@@ -75,17 +99,21 @@ jobs:
               *)       echo "⚠️ $1" ;;
             esac
           }
+          dur() {
+            if [ -z "$1" ]; then echo "—"; return; fi
+            if [ "$1" -ge 60 ]; then printf '%dm%02ds' $(($1 / 60)) $(($1 % 60)); else printf '%ds' "$1"; fi
+          }
           {
             echo "## Quality results"
             echo ""
-            echo "| Step | Result |"
-            echo "| --- | --- |"
-            echo "| cargo fmt --check | $(status '${{ steps.fmt.outcome }}') |"
-            echo "| taplo fmt --check | $(status '${{ steps.taplo.outcome }}') |"
-            echo "| cargo clippy | $(status '${{ steps.clippy.outcome }}') |"
-            echo "| cargo check | $(status '${{ steps.check.outcome }}') |"
-            echo "| cargo machete | $(status '${{ steps.machete.outcome }}') |"
-            echo "| cargo test | $(status '${{ steps.test.outcome }}') |"
+            echo "| Step | Result | Time |"
+            echo "| --- | --- | --- |"
+            echo "| cargo fmt --check | $(status '${{ steps.fmt.outcome }}') | $(dur '${{ steps.fmt.outputs.duration }}') |"
+            echo "| taplo fmt --check | $(status '${{ steps.taplo.outcome }}') | $(dur '${{ steps.taplo.outputs.duration }}') |"
+            echo "| cargo clippy | $(status '${{ steps.clippy.outcome }}') | $(dur '${{ steps.clippy.outputs.duration }}') |"
+            echo "| cargo check | $(status '${{ steps.check.outcome }}') | $(dur '${{ steps.check.outputs.duration }}') |"
+            echo "| cargo machete | $(status '${{ steps.machete.outcome }}') | $(dur '${{ steps.machete.outputs.duration }}') |"
+            echo "| cargo test | $(status '${{ steps.test.outcome }}') | $(dur '${{ steps.test.outputs.duration }}') |"
           } | tee -a "$GITHUB_STEP_SUMMARY" summary.md
 
       - name: Upload summary
@@ -132,16 +160,24 @@ jobs:
 
       - name: cargo build
         id: build
-        run: cargo build --target ${{ matrix.target }} ${{ matrix.args }}
+        run: |
+          start=$SECONDS
+          cargo build --target ${{ matrix.target }} ${{ matrix.args }} && code=0 || code=$?
+          echo "duration=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
+          exit $code
 
       - name: Write summary
         if: always()
         run: |
+          dur() {
+            if [ -z "$1" ]; then echo "—"; return; fi
+            if [ "$1" -ge 60 ]; then printf '%dm%02ds' $(($1 / 60)) $(($1 % 60)); else printf '%ds' "$1"; fi
+          }
           {
             echo "## Build: ${{ matrix.name }} (\`${{ matrix.target }}\`)"
             echo ""
             echo "- Command: \`cargo build --target ${{ matrix.target }} ${{ matrix.args }}\`"
-            echo "- Result: **${{ steps.build.outcome }}**"
+            echo "- Result: **${{ steps.build.outcome }}** ($(dur '${{ steps.build.outputs.duration }}'))"
           } | tee -a "$GITHUB_STEP_SUMMARY" summary.md
 
       - name: Upload summary
