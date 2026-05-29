@@ -39,10 +39,7 @@ pub enum Cst<'s> {
         rhs: Box<Cst<'s>>,
     },
     /// Prefix unary operator application.
-    Unary {
-        op: UnaryOp,
-        operand: Box<Cst<'s>>,
-    },
+    Unary { op: UnaryOp, operand: Box<Cst<'s>> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,16 +123,6 @@ impl<'s> Code<'s> {
     }
 }
 
-/// Builder that produces a [`Code`].
-#[derive(Debug, Default, Clone, Copy)]
-pub struct Builder;
-
-impl Builder {
-    pub fn new<'s>() -> Code<'s> {
-        Code::new()
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LexError;
 
@@ -163,7 +150,7 @@ pub fn parse_tokens<'s>(tokens: &[Token<'s>]) -> Result<Cst<'s>, ParseError> {
     let filtered: Vec<Token<'s>> = tokens.iter().copied().filter(|t| !t.is_trivia()).collect();
     let input: In<'_, 's> = &filtered;
     match parse_program(input) {
-        Ok((rest, cst)) if rest.is_empty() => Ok(cst),
+        Ok(([], cst)) => Ok(cst),
         Ok((rest, _)) => Err(ParseError {
             kind: ParseErrorKind::Trailing,
             at: filtered.len() - rest.len(),
@@ -782,10 +769,7 @@ mod tests {
     #[test]
     fn comments_and_newlines_are_skipped() {
         let cst = parse("// hello\n  a + b\n");
-        assert_eq!(
-            cst,
-            bin(BinOp::Add, Cst::Ident("a"), Cst::Ident("b"))
-        );
+        assert_eq!(cst, bin(BinOp::Add, Cst::Ident("a"), Cst::Ident("b")));
     }
 
     #[test]
@@ -819,7 +803,7 @@ mod tests {
 
     #[test]
     fn code_builder_round_trip() {
-        // Smoke test for the CLI-facing Code/Builder API.
+        // Smoke test for the CLI-facing Code builder API.
         let code: Box<Code<'_>> = Box::new(Code::new())
             .push(Token::Ident("println"))
             .push(Token::OpenParen)

@@ -1,8 +1,5 @@
 use clap::Parser;
-use scarpet_syntax::{
-    lexer::Token,
-    parser::{Builder, Code},
-};
+use scarpet_syntax::{lexer::Token, parser::Code};
 
 #[derive(Parser)]
 struct Cli {}

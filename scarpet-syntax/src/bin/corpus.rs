@@ -28,7 +28,10 @@ fn main() -> ExitCode {
     );
 
     if !outcome.unexpected_failures.is_empty() {
-        println!("\nUnexpected parse failures ({}):", outcome.unexpected_failures.len());
+        println!(
+            "\nUnexpected parse failures ({}):",
+            outcome.unexpected_failures.len()
+        );
         for f in &outcome.unexpected_failures {
             println!("  - {f}");
         }
