@@ -1,0 +1,58 @@
+name: Update submodules
+
+on:
+  schedule:
+    # Every Monday at 06:00 UTC
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update-submodules
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Update example submodules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Update submodules to upstream
+        id: update
+        run: |
+          # Pull the latest commit on each submodule's tracked branch.
+          git submodule update --remote --recursive -- example
+
+          # Collect the changed submodule paths for the PR body.
+          changed="$(git diff --name-only -- example)"
+          if [ -z "$changed" ]; then
+            echo "No submodule updates found."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "## Updated submodules"
+              echo ""
+              git submodule status --recursive -- example | sed 's/^/- /'
+            } > submodule-summary.md
+            cat submodule-summary.md
+          fi
+
+      - name: Create pull request
+        if: steps.update.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: chore/update-submodules
+          delete-branch: true
+          commit-message: "chore: update example submodules to upstream"
+          title: "chore: update example submodules to upstream"
+          body-path: submodule-summary.md
+          labels: dependencies
+          add-paths: |
+            example/**
