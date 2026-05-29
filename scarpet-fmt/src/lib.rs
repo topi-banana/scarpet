@@ -1,0 +1,169 @@
+//! Code formatter for the Scarpet language.
+//!
+//! Parses source into the `scarpet-syntax` CST and pretty-prints it at a fixed
+//! style. Comments and blank-line separators are preserved; horizontal
+//! whitespace is normalized by the formatter.
+
+mod config;
+mod doc;
+mod lower;
+mod trivia;
+
+use scarpet_syntax::parser::{Cst, ParseError, parse_source};
+
+/// Format Scarpet source text. Parses, then renders at the fixed style.
+///
+/// Returns [`FmtError::Parse`] if the source does not parse.
+pub fn format_source(src: &str) -> Result<String, FmtError> {
+    let cst = parse_source(src).map_err(FmtError::Parse)?;
+    Ok(format_cst(&cst))
+}
+
+/// Format an already-parsed CST. Infallible: a well-formed CST always renders.
+pub fn format_cst(cst: &Cst<'_>) -> String {
+    render_top(lower::program(cst))
+}
+
+/// Render a top-level document, guaranteeing the output ends in exactly one
+/// newline (with no trailing blank lines or spaces).
+fn render_top(doc: doc::Doc) -> String {
+    let mut s = doc.render(config::MAX_WIDTH);
+    s.truncate(s.trim_end().len());
+    s.push('\n');
+    s
+}
+
+/// An error produced while formatting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FmtError {
+    /// The source failed to parse.
+    Parse(ParseError),
+}
+
+impl std::fmt::Display for FmtError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FmtError::Parse(e) => write!(f, "parse error at byte {}: {:?}", e.at, e.kind),
+        }
+    }
+}
+
+impl std::error::Error for FmtError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atoms_round_trip() {
+        assert_eq!(format_source("42").unwrap(), "42\n");
+        assert_eq!(format_source("0xff").unwrap(), "0xff\n");
+        assert_eq!(format_source("'hi'").unwrap(), "'hi'\n");
+        assert_eq!(format_source("foo").unwrap(), "foo\n");
+    }
+
+    #[test]
+    fn parse_error_surfaces() {
+        assert!(matches!(format_source("("), Err(FmtError::Parse(_))));
+    }
+}
+
+/// Round-trip the whole `example/` corpus to prove the formatter is safe.
+#[cfg(test)]
+mod corpus {
+    use crate::format_cst;
+    use scarpet_syntax::parser::{parse_source, strip_trivia};
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+
+    /// Files whose Scarpet source doesn't parse (upstream typos). Mirrors the
+    /// list in `scarpet-syntax`'s corpus runner; these are skipped.
+    const KNOWN_BAD: &[&str] = &[
+        "gnembon/scarpet/programs/survival/portalorient.sc",
+        "gnembon/scarpet/programs/survival/rifts/rifts.sc",
+        "Ghoulboy78/Scarpet-edit/se.sc",
+    ];
+
+    fn corpus_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("example")
+    }
+
+    fn walk_sc(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                walk_sc(&p, out);
+            } else if p.extension().and_then(|e| e.to_str()) == Some("sc") {
+                out.push(p);
+            }
+        }
+    }
+
+    /// Every corpus file must format (a) non-destructively — re-parsing the
+    /// output yields a structurally-equal CST — and (b) idempotently. Skips
+    /// quietly when the `example/` submodule isn't checked out.
+    #[test]
+    fn roundtrip_is_nondestructive_and_idempotent() {
+        let root = corpus_root();
+        if !root.is_dir() {
+            eprintln!(
+                "skipping corpus test: {} absent (run `git submodule update --init`)",
+                root.display()
+            );
+            return;
+        }
+        let mut files = Vec::new();
+        walk_sc(&root, &mut files);
+        files.sort();
+
+        let known_bad: HashSet<&str> = KNOWN_BAD.iter().copied().collect();
+        let mut failures = Vec::new();
+        for f in &files {
+            let rel = f
+                .strip_prefix(&root)
+                .unwrap_or(f)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if known_bad.contains(rel.as_str()) {
+                continue;
+            }
+            let Ok(src) = std::fs::read_to_string(f) else {
+                continue;
+            };
+            let cst1 = match parse_source(&src) {
+                Ok(c) => c,
+                Err(_) => {
+                    failures.push(format!("{rel}: unexpected parse failure"));
+                    continue;
+                }
+            };
+            let formatted = format_cst(&cst1);
+            let cst2 = match parse_source(&formatted) {
+                Ok(c) => c,
+                Err(e) => {
+                    failures.push(format!("{rel}: formatted output failed to parse: {e:?}"));
+                    continue;
+                }
+            };
+            if strip_trivia(&cst1) != strip_trivia(&cst2) {
+                failures.push(format!("{rel}: structure changed after formatting"));
+                continue;
+            }
+            let reformatted = format_cst(&cst2);
+            if formatted != reformatted {
+                failures.push(format!("{rel}: not idempotent"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "corpus round-trip failures ({}):\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+}

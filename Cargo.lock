@@ -499,6 +499,13 @@ name = "scarpet-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "scarpet-fmt",
+]
+
+[[package]]
+name = "scarpet-fmt"
+version = "0.1.0"
+dependencies = [
  "scarpet-syntax",
 ]
 

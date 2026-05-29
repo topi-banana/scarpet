@@ -1,10 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["scarpet-cli", "scarpet-syntax"]
+members = ["scarpet-cli", "scarpet-fmt", "scarpet-syntax"]
 
 [workspace.dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
 chumsky = { version = "0.11" }
 logos = { version = "0.15.1" }
 logosky = { version = "0.2" }
+scarpet-fmt = { path = "./scarpet-fmt" }
 scarpet-syntax = { path = "./scarpet-syntax" }
