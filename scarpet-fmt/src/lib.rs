@@ -9,7 +9,7 @@ mod doc;
 mod lower;
 mod trivia;
 
-pub use config::Config;
+pub use config::{Config, LineEnding};
 use scarpet_syntax::parser::{Cst, ParseError, parse_source};
 
 /// Format Scarpet source text. Parses, then renders per `config`.
@@ -28,9 +28,13 @@ pub fn format_cst(cst: &Cst<'_>, config: &Config) -> String {
 /// Render a top-level document, guaranteeing the output ends in exactly one
 /// newline (with no trailing blank lines or spaces).
 fn render_top(doc: doc::Doc, config: &Config) -> String {
-    let mut s = doc.render(config.max_width, config.indent_width);
+    let mut s = doc.render(
+        config.max_width,
+        config.indent_width,
+        config.line_ending.as_str(),
+    );
     s.truncate(s.trim_end().len());
-    s.push('\n');
+    s.push_str(config.line_ending.as_str());
     s
 }
 
@@ -75,6 +79,40 @@ mod tests {
     fn parse_error_surfaces() {
         let r = format_source("(", &Config::default());
         assert!(matches!(r, Err(FmtError::Parse(_))));
+    }
+
+    #[test]
+    fn crlf_line_ending_applies_to_inserted_breaks() {
+        let cfg = Config {
+            line_ending: LineEnding::Crlf,
+            ..Config::default()
+        };
+        assert_eq!(format_source("// c\nx", &cfg).unwrap(), "// c\r\nx\r\n");
+    }
+
+    #[test]
+    fn crlf_output_reparses_and_is_idempotent() {
+        use scarpet_syntax::parser::{parse_source, strip_trivia};
+        let cfg = Config {
+            line_ending: LineEnding::Crlf,
+            ..Config::default()
+        };
+        let src = "// lead\nfoo(a, b);\nbar()->(x;y)\n";
+        let cst1 = parse_source(src).unwrap();
+        let formatted = format_cst(&cst1, &cfg);
+        assert!(formatted.contains("\r\n"), "expected CRLF in {formatted:?}");
+        assert!(!formatted.contains("\r\r"), "doubled CR in {formatted:?}");
+        let cst2 = parse_source(&formatted).unwrap();
+        assert_eq!(
+            strip_trivia(&cst1),
+            strip_trivia(&cst2),
+            "CRLF formatting changed structure"
+        );
+        assert_eq!(
+            formatted,
+            format_cst(&cst2, &cfg),
+            "CRLF formatting not idempotent"
+        );
     }
 }
 
