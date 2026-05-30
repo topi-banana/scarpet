@@ -120,7 +120,7 @@ impl<'s> Code<'s> {
         self.source
     }
 
-    pub fn parse(&self) -> Result<Cst<'s>, ParseError> {
+    pub fn parse(&self) -> Result<Cst<'s>, Box<ParseError>> {
         parse_source(self.source)
     }
 }
@@ -130,23 +130,31 @@ pub struct LexError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
-    /// Byte range the caret points at — the offending token, or `len..len` at
-    /// end of input.
+    /// Byte range the caret points at — the offending token, an unbalanced
+    /// delimiter, or `len..len` at end of input.
     pub span: std::ops::Range<usize>,
     /// What the parser expected at `span`, as display-ready labels — concrete
     /// tokens carry back-ticks (`` `,` ``), higher-level patterns read as prose
     /// (`expression`, `end of input`). De-duplicated, in chumsky's order; empty
-    /// when the parser had nothing specific to offer.
+    /// for delimiter errors and when nothing specific was on offer.
     pub expected: Vec<String>,
     /// Source text of the offending token, or `None` at end of input.
     pub found: Option<String>,
+    /// A fixed headline for structural delimiter errors (`unclosed delimiter`,
+    /// `mismatched closing delimiter`, `unmatched closing delimiter`) that
+    /// replaces the derived `expected …, found …`. `None` for token mismatches.
+    pub headline: Option<String>,
+    /// An optional secondary span and label — the opening delimiter a delimiter
+    /// error refers back to (e.g. `` unclosed `[` ``).
+    pub secondary: Option<(std::ops::Range<usize>, String)>,
+    /// A `help:` suggestion, such as a missing comma between list elements.
+    pub help: Option<String>,
 }
 
 impl ParseError {
     /// The `expected …` clause on its own (no `found`), or `None` when the
     /// parser had nothing specific to expect. Reads as ``expected `,` ``,
-    /// ``expected `(` or `[` ``, or ``expected one of `,`, `;`, or `]` ``. This
-    /// is what the CLI prints at the caret, where the `found` token already sits.
+    /// ``expected `(` or `[` ``, or ``expected one of `,`, `;`, or `]` ``.
     pub fn expected_phrase(&self) -> Option<String> {
         use std::fmt::Write as _;
         let mut m = String::new();
@@ -169,11 +177,24 @@ impl ParseError {
         Some(m)
     }
 
-    /// A one-line, rustc-style summary, e.g. ``expected one of `,`, or `]`,
-    /// found `2` ``. Shared by the CLI's ariadne diagnostic and `FmtError`'s
-    /// `Display`; falls back to `unexpected token` when nothing is known.
+    /// The label printed at the caret: a delimiter error's fixed `headline`,
+    /// otherwise the `expected …` clause (the `found` token already sits there).
+    pub fn caret_label(&self) -> String {
+        if let Some(h) = &self.headline {
+            return h.clone();
+        }
+        self.expected_phrase()
+            .unwrap_or_else(|| "unexpected token".to_string())
+    }
+
+    /// A one-line, rustc-style summary for the report title and `FmtError`'s
+    /// `Display`: a delimiter `headline` verbatim, else ``expected …, found …``,
+    /// else `unexpected token`.
     pub fn message(&self) -> String {
         use std::fmt::Write as _;
+        if let Some(h) = &self.headline {
+            return h.clone();
+        }
         let Some(mut m) = self.expected_phrase() else {
             return "unexpected token".to_string();
         };
@@ -187,7 +208,13 @@ impl ParseError {
     }
 }
 
-pub fn parse_source(src: &str) -> Result<Cst<'_>, ParseError> {
+pub fn parse_source(src: &str) -> Result<Cst<'_>, Box<ParseError>> {
+    // A delimiter pre-pass catches unbalanced brackets with a structural message
+    // (and a pointer back to the opener) that's clearer than whatever token
+    // mismatch the grammar would otherwise trip over first.
+    if let Some(err) = check_delimiters(src) {
+        return Err(Box::new(err));
+    }
     let stream = TokenStream::new(src);
     let len = src.len();
     match program_parser().parse(stream).into_result() {
@@ -204,11 +231,18 @@ pub fn parse_source(src: &str) -> Result<Cst<'_>, ParseError> {
             // A span that starts at end-of-input means EOF (no `found` token);
             // otherwise lift the offending token's text out of `src`.
             let found = (span.start < len).then(|| src[span.clone()].to_string());
-            Err(ParseError {
+            let expected = collect_expected(&err);
+            let help = missing_comma_help(&err, &expected);
+            // Boxed: `ParseError` is large and the error path is cold, so we
+            // keep the hot `Ok` arm of the `Result` cheap (clippy result_large_err).
+            Err(Box::new(ParseError {
                 span,
-                expected: collect_expected(&err),
+                expected,
                 found,
-            })
+                headline: None,
+                secondary: None,
+                help,
+            }))
         }
     }
 }
@@ -249,6 +283,116 @@ fn token_label<'s>(t: &MaybeRef<'s, Lexed<'s, Token<'s>>>) -> Option<&'static st
         Lexed::Token(s) => Some(kind_label(logosky::Token::kind(&s.data))),
         Lexed::Error(_) => None,
     }
+}
+
+// --- delimiter pre-pass ---------------------------------------------
+
+/// Scan the token stream for the first unbalanced delimiter — a stray closer, a
+/// wrong closer, or an opener that never closes — and describe it structurally.
+/// Returns `None` when every bracket balances. Runs straight on the lexer, so
+/// brackets inside strings and comments (which lex as single tokens) are ignored.
+fn check_delimiters(src: &str) -> Option<ParseError> {
+    use logos::Logos as _;
+    let mut stack: Vec<(TokenKind, std::ops::Range<usize>)> = Vec::new();
+    let mut lex = Token::lexer(src);
+    while let Some(res) = lex.next() {
+        let span = lex.span();
+        // A lex error isn't our concern here; let the grammar report it.
+        let Ok(tok) = res else { continue };
+        let k = logosky::Token::kind(&tok);
+        match k {
+            TokenKind::OpenParen | TokenKind::OpenBrack | TokenKind::OpenBrace => {
+                stack.push((k, span));
+            }
+            TokenKind::CloseParen | TokenKind::CloseBrack | TokenKind::CloseBrace => {
+                match stack.pop() {
+                    // A closer with no opener waiting for it.
+                    None => {
+                        return Some(ParseError {
+                            span: span.clone(),
+                            expected: Vec::new(),
+                            found: Some(src[span].to_string()),
+                            headline: Some("unmatched closing delimiter".to_string()),
+                            secondary: None,
+                            help: None,
+                        });
+                    }
+                    // The wrong closer for the opener on top of the stack.
+                    Some((open, open_span)) if closer_for(open) != k => {
+                        return Some(ParseError {
+                            span: span.clone(),
+                            expected: vec![kind_label(closer_for(open)).to_string()],
+                            found: Some(src[span].to_string()),
+                            headline: Some("mismatched closing delimiter".to_string()),
+                            secondary: Some((open_span, format!("unclosed {}", kind_label(open)))),
+                            help: None,
+                        });
+                    }
+                    // A matching pair — keep going.
+                    Some(_) => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    // Anything left on the stack never closed; report the outermost opener.
+    if !stack.is_empty() {
+        let (open, open_span) = stack.remove(0);
+        return Some(ParseError {
+            span: open_span,
+            expected: vec![kind_label(closer_for(open)).to_string()],
+            found: None,
+            headline: Some("unclosed delimiter".to_string()),
+            secondary: None,
+            help: None,
+        });
+    }
+    None
+}
+
+/// The closing delimiter kind that matches an opener (identity for non-openers).
+fn closer_for(open: TokenKind) -> TokenKind {
+    match open {
+        TokenKind::OpenParen => TokenKind::CloseParen,
+        TokenKind::OpenBrack => TokenKind::CloseBrack,
+        TokenKind::OpenBrace => TokenKind::CloseBrace,
+        other => other,
+    }
+}
+
+/// Guess a dropped comma: inside a list / call / map a forgotten `,` surfaces as
+/// an expression token sitting where a closer (and only operators besides) was
+/// expected — e.g. `[1 2]`. Returns the `help:` text, or `None`.
+fn missing_comma_help(err: &RichErr<'_>, expected: &[String]) -> Option<String> {
+    let closer_expected = expected
+        .iter()
+        .any(|e| e == "`]`" || e == "`)`" || e == "`}`");
+    if !closer_expected {
+        return None;
+    }
+    let found_begins_expr = matches!(
+        err.found(),
+        Some(Lexed::Token(s)) if begins_expr(logosky::Token::kind(&s.data))
+    );
+    found_begins_expr.then(|| "missing `,`".to_string())
+}
+
+/// Whether a token can begin an expression — the set whose appearance where a
+/// closer was due signals a dropped separator.
+fn begins_expr(k: TokenKind) -> bool {
+    matches!(
+        k,
+        TokenKind::Number
+            | TokenKind::String
+            | TokenKind::Ident
+            | TokenKind::OpenParen
+            | TokenKind::OpenBrack
+            | TokenKind::OpenBrace
+            | TokenKind::Sub
+            | TokenKind::Add
+            | TokenKind::Bang
+            | TokenKind::Ellipsis
+    )
 }
 
 /// Return a clone of `cst` with all leading trivia removed, recursively.
@@ -1368,7 +1512,7 @@ mod tests {
         }
     }
 
-    // ----- error-message tests ------------------------------------------
+    // ----- token-mismatch errors (delimiters balanced) ------------------
 
     /// Where an operand is due but input ends, the message names the missing
     /// `expression` and reports EOF — not a bare "unexpected token".
@@ -1391,19 +1535,11 @@ mod tests {
         assert_eq!(e.message(), "expected an operator or `]`, found `2`");
     }
 
-    /// A wrong closing delimiter names the one that was actually due.
-    #[test]
-    fn error_mismatched_delimiter_names_expected_closer() {
-        let e = parse_source("[)").unwrap_err();
-        assert_eq!(e.found.as_deref(), Some(")"));
-        assert_eq!(e.message(), "expected `]`, found `)`");
-    }
-
     /// The ~20 infix/prefix operators collapse to one `an operator` rather than
     /// being spelled out across the whole precedence ladder.
     #[test]
     fn error_operator_ladder_collapses() {
-        let e = parse_source("1 2").unwrap_err();
+        let e = parse_source("[0 1]").unwrap_err();
         assert!(e.message().contains("an operator"), "{}", e.message());
         assert!(!e.message().contains("`*`"), "{}", e.message());
     }
@@ -1411,10 +1547,10 @@ mod tests {
     /// Exactly two expectations join with `or` (no `one of`).
     #[test]
     fn error_two_expectations_join_with_or() {
-        let e = parse_source("{1").unwrap_err();
+        let e = parse_source("1 2").unwrap_err();
         assert_eq!(
             e.message(),
-            "expected an operator or `}`, found end of input"
+            "expected an operator or end of input, found `2`"
         );
     }
 
@@ -1426,5 +1562,52 @@ mod tests {
                 assert!(!e.message().is_empty(), "empty message for {src:?}");
             }
         }
+    }
+
+    // ----- delimiter pre-pass errors ------------------------------------
+
+    /// A wrong closer is flagged structurally: the caret sits on the closer and
+    /// a secondary label points back at the still-open opener.
+    #[test]
+    fn error_mismatched_delimiter() {
+        let src = "[)";
+        let e = parse_source(src).unwrap_err();
+        assert_eq!(e.message(), "mismatched closing delimiter");
+        assert_eq!(&src[e.span.clone()], ")");
+        let (opener, label) = e.secondary.clone().expect("opener label");
+        assert_eq!(&src[opener], "[");
+        assert_eq!(label, "unclosed `[`");
+    }
+
+    /// An opener that never closes points the caret at the opener itself.
+    #[test]
+    fn error_unclosed_delimiter() {
+        let src = "foo(a";
+        let e = parse_source(src).unwrap_err();
+        assert_eq!(e.message(), "unclosed delimiter");
+        assert_eq!(&src[e.span.clone()], "(");
+    }
+
+    /// A closer with no opener is its own kind of error.
+    #[test]
+    fn error_unmatched_closing_delimiter() {
+        let e = parse_source("1)").unwrap_err();
+        assert_eq!(e.message(), "unmatched closing delimiter");
+        assert_eq!(e.found.as_deref(), Some(")"));
+    }
+
+    /// A string's contents never count as delimiters.
+    #[test]
+    fn delimiters_inside_strings_are_ignored() {
+        assert!(parse_source("print('(')").is_ok());
+    }
+
+    // ----- help suggestions ---------------------------------------------
+
+    /// Two adjacent elements with no separator suggest the dropped comma.
+    #[test]
+    fn error_missing_comma_help() {
+        let e = parse_source("[1 2]").unwrap_err();
+        assert_eq!(e.help.as_deref(), Some("missing `,`"));
     }
 }
