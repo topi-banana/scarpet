@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use ariadne::{Label, Report, ReportKind, Source};
 use clap::{Args, Parser, Subcommand};
-use scarpet_fmt::{FmtError, format_source};
+use scarpet_fmt::{Config, FmtError, format_source};
 use scarpet_syntax::parser::ParseError;
 
 #[derive(Parser)]
@@ -39,8 +39,9 @@ fn main() -> ExitCode {
 }
 
 fn run_format(args: FormatArgs) -> ExitCode {
+    let config = Config::default();
     if args.files.is_empty() {
-        return format_stdin(args.check);
+        return format_stdin(args.check, &config);
     }
     let mut code = ExitCode::SUCCESS;
     for path in &args.files {
@@ -51,7 +52,7 @@ fn run_format(args: FormatArgs) -> ExitCode {
                 return ExitCode::from(2);
             }
         };
-        match format_source(&src) {
+        match format_source(&src, &config) {
             Ok(formatted) => {
                 if let Some(c) = apply(path, &src, &formatted, &args) {
                     code = c;
@@ -87,13 +88,13 @@ fn apply(path: &Path, src: &str, formatted: &str, args: &FormatArgs) -> Option<E
     None
 }
 
-fn format_stdin(check: bool) -> ExitCode {
+fn format_stdin(check: bool, config: &Config) -> ExitCode {
     let mut src = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut src) {
         eprintln!("stdin: {e}");
         return ExitCode::from(2);
     }
-    match format_source(&src) {
+    match format_source(&src, config) {
         Ok(formatted) => {
             if check {
                 if formatted != src {

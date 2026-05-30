@@ -303,10 +303,10 @@ fn unary_op_str(op: UnaryOp) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use crate::format_source;
+    use crate::{Config, format_source};
 
     fn fmt(src: &str) -> String {
-        format_source(src).unwrap()
+        format_source(src, &Config::default()).unwrap()
     }
 
     #[test]
