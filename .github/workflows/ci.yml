@@ -88,15 +88,53 @@ jobs:
           echo "duration=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
           exit $code
 
-      - name: corpus parse
-        id: corpus
+      - name: format parse
+        id: fmtparse
         continue-on-error: true
         run: |
           start=$SECONDS
-          cargo run -p scarpet-syntax --bin corpus -- --markdown > corpus.md && code=0 || code=$?
+          # Parse-rate metric (replaces the former corpus binary): format every
+          # example/*.sc, capture the diagnostic of any that fails to parse, and
+          # render a Markdown report — parse rate plus a <details> list of the
+          # failures with their error excerpts — for the job summary and PR
+          # comment. A metric, not a gate: it always succeeds, and a few
+          # known-broken upstream files are expected. The real parse/format gate
+          # is the round-trip test under `cargo test`.
+          cargo build -q -p scarpet-cli
+          bin=target/debug/scarpet-cli
+          total=0
+          failed=0
+          : > fails.md
+          while IFS= read -r -d '' f; do
+            total=$((total + 1))
+            if ! err=$("$bin" format "$f" 2>&1 >/dev/null); then
+              failed=$((failed + 1))
+              {
+                printf '`%s`\n\n' "${f#example/}"
+                printf '```text\n%s\n```\n\n' "$err"
+              } >> fails.md
+            fi
+          done < <(find example -name '*.sc' -print0)
+          parsed=$((total - failed))
+          if [ "$total" -gt 0 ]; then
+            rate=$(awk "BEGIN { printf \"%.1f\", $parsed / $total * 100 }")
+          else
+            rate=0.0
+          fi
+          if [ "$failed" -eq 0 ]; then icon="✅"; else icon="⚠️"; fi
+          {
+            printf '### Corpus parse results\n\n'
+            printf '%s **Parse rate: %s%%** — %d / %d files parsed\n' "$icon" "$rate" "$parsed" "$total"
+            if [ "$failed" -gt 0 ]; then
+              printf '\n<details>\n<summary>Failed to parse (%d)</summary>\n\n' "$failed"
+              cat fails.md
+              printf '</details>\n'
+            fi
+          } > fmtparse.md
+          cat fmtparse.md
           echo "duration=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
-          cat corpus.md
-          exit $code
+          # metric, not a gate — always succeed
+          exit 0
 
       - name: Write summary
         if: always()
@@ -124,10 +162,10 @@ jobs:
             echo "| cargo check | $(status '${{ steps.check.outcome }}') | $(dur '${{ steps.check.outputs.duration }}') |"
             echo "| cargo machete | $(status '${{ steps.machete.outcome }}') | $(dur '${{ steps.machete.outputs.duration }}') |"
             echo "| cargo test | $(status '${{ steps.test.outcome }}') | $(dur '${{ steps.test.outputs.duration }}') |"
-            echo "| corpus parse | $(status '${{ steps.corpus.outcome }}') | $(dur '${{ steps.corpus.outputs.duration }}') |"
-            if [ -s corpus.md ]; then
+            echo "| format parse | $(status '${{ steps.fmtparse.outcome }}') | $(dur '${{ steps.fmtparse.outputs.duration }}') |"
+            if [ -s fmtparse.md ]; then
               echo ""
-              cat corpus.md
+              cat fmtparse.md
             fi
           } | tee -a "$GITHUB_STEP_SUMMARY" summary.md
 
