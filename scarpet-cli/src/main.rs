@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use ariadne::{Label, Report, ReportKind, Source};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use scarpet_fmt::{BraceStyle, Config, FmtError, LineEnding, format_source};
-use scarpet_syntax::parser::ParseError;
+use scarpet_syntax::parser::{ParseError, parse_source};
 use serde::Deserialize;
 use similar::{ChangeTag, TextDiff};
 
@@ -20,6 +20,9 @@ struct Cli {
 enum Cmd {
     /// Format Scarpet source.
     Format(FormatArgs),
+    /// Start an interactive parse-only REPL: read a statement, report any
+    /// parse error, then prompt again. Exits on Ctrl+D or Ctrl+C.
+    Repl,
 }
 
 #[derive(Args)]
@@ -140,6 +143,7 @@ fn parse_config(text: &str, name: &str) -> Result<Config, String> {
 fn main() -> ExitCode {
     match Cli::parse().cmd {
         Cmd::Format(args) => run_format(args),
+        Cmd::Repl => run_repl(),
     }
 }
 
@@ -226,6 +230,65 @@ fn format_stdin(check: bool, deny: &[DenyWarning], config: &Config) -> ExitCode 
             ExitCode::FAILURE
         }
     }
+}
+
+/// Run an interactive parse-only REPL. Reads one statement per line, parses it
+/// with [`parse_source`], and prints a diagnostic for any parse error — and
+/// nothing at all on success. There is no evaluator; this only checks that each
+/// entered statement is syntactically valid.
+///
+/// The loop ends on end-of-input (Ctrl+D) or when interrupted (Ctrl+C, which
+/// terminates the process via the default SIGINT handler). The prompt and
+/// banner go to stderr and are suppressed when stdin is not a terminal (piped
+/// input), so a command like `echo '1+' | scarpet repl` emits only diagnostics.
+fn run_repl() -> ExitCode {
+    use std::io::BufRead as _;
+
+    let interactive = std::io::stdin().is_terminal();
+    if interactive {
+        eprintln!("Scarpet REPL (parse-only). Press Ctrl+D or Ctrl+C to exit.");
+    }
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let mut line = String::new();
+    loop {
+        if interactive {
+            // stderr is unbuffered, so the prompt shows before `read_line`
+            // blocks — no explicit flush needed.
+            eprint!("scarpet> ");
+        }
+        line.clear();
+        match input.read_line(&mut line) {
+            // End of input (Ctrl+D): finish the prompt line and leave.
+            Ok(0) => {
+                if interactive {
+                    eprintln!();
+                }
+                return ExitCode::SUCCESS;
+            }
+            Ok(_) => {
+                let src = line.trim_end_matches(['\n', '\r']);
+                if let Some(e) = check_line(src) {
+                    report_parse_error("<repl>", src, &e);
+                }
+            }
+            Err(e) => {
+                eprintln!("repl: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+}
+
+/// Parse one REPL submission, returning its parse error if any. Blank
+/// (whitespace-only) lines are ignored — pressing Enter at an empty prompt does
+/// nothing, as in Python's REPL — so they report no error. The returned
+/// [`ParseError`] owns its data and does not borrow `src`.
+fn check_line(src: &str) -> Option<ParseError> {
+    if src.trim().is_empty() {
+        return None;
+    }
+    parse_source(src).err().map(|e| *e)
 }
 
 /// Render a parse error to stderr as a rustc-style ariadne diagnostic that
@@ -325,6 +388,7 @@ mod tests {
     fn parse_format(argv: &[&str]) -> Result<FormatArgs, clap::Error> {
         Cli::try_parse_from(argv.iter().copied()).map(|cli| match cli.cmd {
             Cmd::Format(args) => args,
+            Cmd::Repl => unreachable!("parse_format only parses `format` invocations"),
         })
     }
 
@@ -383,5 +447,33 @@ mod tests {
     fn parse_config_rejects_unknown_brace_style() {
         let err = parse_config("brace_style = \"allman\"", "x").unwrap_err();
         assert!(err.contains("brace_style"), "{err}");
+    }
+
+    #[test]
+    fn repl_ignores_blank_lines() {
+        // Pressing Enter at an empty prompt must not report an error, even
+        // though an empty program does not parse.
+        assert!(check_line("").is_none());
+        assert!(check_line("   ").is_none());
+        assert!(check_line("\t  ").is_none());
+    }
+
+    #[test]
+    fn repl_accepts_valid_statements() {
+        assert!(check_line("print('Hello World!')").is_none());
+        assert!(check_line("a = 5").is_none());
+        assert!(check_line("foo(a, b) -> a + b").is_none());
+        // A lone trailing `;` is lenient, and several `;`-separated statements
+        // on one line are a single valid program.
+        assert!(check_line("a = 5;").is_none());
+        assert!(check_line("a; b; c").is_none());
+    }
+
+    #[test]
+    fn repl_reports_parse_errors() {
+        // Incomplete input (ends mid-expression) and stray tokens both fail.
+        assert!(check_line("1 +").is_some());
+        assert!(check_line(")").is_some());
+        assert!(check_line("print(").is_some());
     }
 }
