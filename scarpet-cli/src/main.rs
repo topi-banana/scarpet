@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use ariadne::{Label, Report, ReportKind, Source};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use scarpet_fmt::{Config, FmtError, format_source};
 use scarpet_syntax::parser::ParseError;
 use serde::Deserialize;
@@ -36,6 +36,26 @@ struct FormatArgs {
     /// current directory when present.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
+    /// Promote a warning class to a hard error, like clippy's `-D warnings`.
+    /// Pass `warnings` so that an unformatted file makes `--check` exit
+    /// non-zero instead of only printing its diff. Repeatable; needs `--check`.
+    #[arg(short = 'D', long = "deny", value_name = "WARNING", requires = "check")]
+    deny: Vec<DenyWarning>,
+}
+
+/// A warning class that `-D`/`--deny` promotes to a hard error, mirroring
+/// clippy's `-D warnings`. Only `warnings` exists today — an unformatted file
+/// under `--check` — but the value-taking shape leaves room to name more.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum DenyWarning {
+    /// Any formatting difference: a file that is not already formatted.
+    Warnings,
+}
+
+/// Whether `-D warnings` was passed — i.e. formatting differences should fail
+/// the run instead of only being reported.
+fn diffs_denied(deny: &[DenyWarning]) -> bool {
+    deny.contains(&DenyWarning::Warnings)
 }
 
 /// The default config file, read from the current directory when `--config`
@@ -97,7 +117,7 @@ fn run_format(args: FormatArgs) -> ExitCode {
         }
     };
     if args.files.is_empty() {
-        return format_stdin(args.check, &config);
+        return format_stdin(args.check, &args.deny, &config);
     }
     let mut code = ExitCode::SUCCESS;
     for path in &args.files {
@@ -129,7 +149,9 @@ fn apply(path: &Path, src: &str, formatted: &str, args: &FormatArgs) -> Option<E
     if args.check {
         if formatted != src {
             print_diff(&path.display().to_string(), src, formatted);
-            return Some(ExitCode::FAILURE);
+            if diffs_denied(&args.deny) {
+                return Some(ExitCode::FAILURE);
+            }
         }
     } else if args.in_place {
         if formatted != src
@@ -144,7 +166,7 @@ fn apply(path: &Path, src: &str, formatted: &str, args: &FormatArgs) -> Option<E
     None
 }
 
-fn format_stdin(check: bool, config: &Config) -> ExitCode {
+fn format_stdin(check: bool, deny: &[DenyWarning], config: &Config) -> ExitCode {
     let mut src = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut src) {
         eprintln!("stdin: {e}");
@@ -155,7 +177,9 @@ fn format_stdin(check: bool, config: &Config) -> ExitCode {
             if check {
                 if formatted != src {
                     print_diff("<stdin>", &src, &formatted);
-                    return ExitCode::FAILURE;
+                    if diffs_denied(deny) {
+                        return ExitCode::FAILURE;
+                    }
                 }
             } else {
                 print!("{formatted}");
@@ -253,5 +277,32 @@ mod tests {
         let out = render_diff("x", "a\n", "b\n", true);
         assert!(out.contains("\x1b[31m-a\x1b[0m"), "{out}");
         assert!(out.contains("\x1b[32m+b\x1b[0m"), "{out}");
+    }
+
+    /// Parse a `format` invocation, returning its args (or the clap error).
+    fn parse_format(argv: &[&str]) -> Result<FormatArgs, clap::Error> {
+        Cli::try_parse_from(argv.iter().copied()).map(|cli| match cli.cmd {
+            Cmd::Format(args) => args,
+        })
+    }
+
+    #[test]
+    fn deny_warnings_requires_check() {
+        // `-D warnings` on its own is rejected...
+        assert!(parse_format(&["scarpet", "format", "-D", "warnings", "f.sc"]).is_err());
+        // ...but is accepted together with `--check`.
+        let args = parse_format(&["scarpet", "format", "--check", "-D", "warnings"]).unwrap();
+        assert!(diffs_denied(&args.deny));
+    }
+
+    #[test]
+    fn deny_rejects_unknown_warning_class() {
+        assert!(parse_format(&["scarpet", "format", "--check", "-D", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn check_without_deny_does_not_promote_diffs() {
+        let args = parse_format(&["scarpet", "format", "--check"]).unwrap();
+        assert!(!diffs_denied(&args.deny));
     }
 }
