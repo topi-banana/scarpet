@@ -9,4 +9,4 @@ indent = 4
 # Line-length target before a group breaks onto multiple lines.
 max_width = 100
 # Newline style for breaks the formatter inserts: "lf" (Unix) or "crlf" (Windows).
-line_ending = "crlf"
+line_ending = "lf"
