@@ -10,3 +10,5 @@ indent = 4
 max_width = 100
 # Newline style for breaks the formatter inserts: "lf" (Unix) or "crlf" (Windows).
 line_ending = "lf"
+# Opening delimiter of a broken (), [] or {} block: "same_line" (default) or "next_line".
+brace_style = "same_line"

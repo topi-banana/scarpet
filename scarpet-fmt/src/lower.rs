@@ -2,9 +2,9 @@
 //!
 //! The traversal mirrors the shape of `strip_leading` in the parser: one arm
 //! per `CstKind`, recursing into the same children. Each node's leading trivia
-//! is emitted by [`expr`] (own-line comments) or lifted onto the preceding
-//! token by [`child_after`] (same-line / trailing comments). Blank lines are
-//! reconstructed as statement separators.
+//! is emitted by [`Lowerer::expr`] (own-line comments) or lifted onto the
+//! preceding token by [`Lowerer::child_after`] (same-line / trailing comments).
+//! Blank lines are reconstructed as statement separators.
 
 use scarpet_syntax::parser::{BinOp, Cst, CstKind, UnaryOp};
 
@@ -13,92 +13,252 @@ use crate::doc::{
     text,
 };
 use crate::trivia::{has_blank_before, own_line_comments, same_line_comment};
+use crate::{BraceStyle, Config};
 
 /// Lower a whole program (the CST root) to a document.
-pub fn program(root: &Cst) -> Doc {
-    expr(root)
+pub fn program(root: &Cst, config: &Config) -> Doc {
+    Lowerer { config }.expr(root)
 }
 
-/// Lower a node, prefixing its own-line leading comments. Used wherever the
-/// node is *not* preceded by a separator we can lift a trailing comment onto.
-fn expr(cst: &Cst) -> Doc {
-    concat([own_line_comments(&cst.leading), node_body(cst)])
+/// Threads the [`Config`] through the recursive lowering so layout knobs (like
+/// [`BraceStyle`]) are reachable at every node.
+struct Lowerer<'a> {
+    config: &'a Config,
 }
 
-/// Place `cst` after the separator `sep`. If `cst`'s leading begins with a
-/// same-line (trailing) comment, emit it *before* `sep` so it hugs the previous
-/// token, then hard-break; otherwise emit `sep` followed by any own-line
-/// comments. This is what keeps `a; // note` on one line.
-fn child_after(sep: Doc, cst: &Cst) -> Doc {
-    match same_line_comment(&cst.leading) {
-        Some(c) => concat([
-            space(),
-            text(c.to_string()),
-            hardline(),
-            own_line_comments(&cst.leading[1..]),
-            node_body(cst),
-        ]),
-        None => concat([sep, own_line_comments(&cst.leading), node_body(cst)]),
+impl Lowerer<'_> {
+    /// Lower a node, prefixing its own-line leading comments. Used wherever the
+    /// node is *not* preceded by a separator we can lift a trailing comment onto.
+    fn expr(&self, cst: &Cst) -> Doc {
+        concat([own_line_comments(&cst.leading), self.node_body(cst)])
     }
-}
 
-/// Lower a node's `kind`, ignoring its own leading (handled by the caller).
-fn node_body(cst: &Cst) -> Doc {
-    match &cst.kind {
-        CstKind::Number(s) | CstKind::Str(s) | CstKind::Ident(s) => text(s.to_string()),
-        CstKind::Unary { op, operand } => unary(*op, operand),
-        CstKind::Binary { op, lhs, rhs } => match *op {
-            BinOp::Comma => comma_chain(cst),
-            BinOp::Semi => semi_chain(cst),
-            BinOp::Arrow => arrow_chain(cst),
-            BinOp::Get => tight(*op, lhs, rhs),
-            _ => spaced(*op, lhs, rhs),
-        },
-        CstKind::Call { callee, args } => call(callee, args),
-        CstKind::List(items) => collection("[", items, "]"),
-        CstKind::Map(items) => collection("{", items, "}"),
-        CstKind::Paren(inner) => paren(inner),
-        CstKind::Empty => nil(),
+    /// Place `cst` after the separator `sep`. If `cst`'s leading begins with a
+    /// same-line (trailing) comment, emit it *before* `sep` so it hugs the
+    /// previous token, then hard-break; otherwise emit `sep` followed by any
+    /// own-line comments. This is what keeps `a; // note` on one line.
+    fn child_after(&self, sep: Doc, cst: &Cst) -> Doc {
+        match same_line_comment(&cst.leading) {
+            Some(c) => concat([
+                space(),
+                text(c.to_string()),
+                hardline(),
+                own_line_comments(&cst.leading[1..]),
+                self.node_body(cst),
+            ]),
+            None => concat([sep, own_line_comments(&cst.leading), self.node_body(cst)]),
+        }
     }
-}
 
-// ---- operators -----------------------------------------------------
+    /// Lower a node's `kind`, ignoring its own leading (handled by the caller).
+    fn node_body(&self, cst: &Cst) -> Doc {
+        match &cst.kind {
+            CstKind::Number(s) | CstKind::Str(s) | CstKind::Ident(s) => text(s.to_string()),
+            CstKind::Unary { op, operand } => self.unary(*op, operand),
+            CstKind::Binary { op, lhs, rhs } => match *op {
+                BinOp::Comma => self.comma_chain(cst),
+                BinOp::Semi => self.semi_chain(cst),
+                BinOp::Arrow => self.arrow_chain(cst),
+                BinOp::Get => self.tight(*op, lhs, rhs),
+                _ => self.spaced(*op, lhs, rhs),
+            },
+            CstKind::Call { callee, args } => self.call(callee, args),
+            CstKind::List(items) => self.collection("[", items, "]", false),
+            CstKind::Map(items) => self.collection("{", items, "}", false),
+            CstKind::Paren(inner) => self.paren(inner, false),
+            CstKind::Empty => nil(),
+        }
+    }
 
-/// A binary operator with no surrounding space (`a:b`).
-fn tight(op: BinOp, lhs: &Cst, rhs: &Cst) -> Doc {
-    concat([expr(lhs), text(bin_op_str(op)), expr(rhs)])
-}
+    // ---- operators -----------------------------------------------------
 
-/// A binary operator spaced on each side, breakable before the RHS
-/// (`a + b`, breaking to `a +` ⏎ `b` when it doesn't fit).
-fn spaced(op: BinOp, lhs: &Cst, rhs: &Cst) -> Doc {
-    // A trailing comment the parser attached to a *compound* RHS node sat
-    // before the operator in source (`lhs // c` ⏎ `op rhs`): operator-leading
-    // trivia binds to the RHS. Emit it before the operator so re-parsing
-    // returns it to the same node — emitting it after would rebind it to the
-    // RHS's leftmost leaf and break idempotency. (An atom RHS *is* its own
-    // leftmost leaf, so the after-operator placement round-trips and reads
-    // better; leave it to `child_after`.)
-    if let Some(c) = same_line_comment(&rhs.leading)
-        && !is_atom(rhs)
-    {
-        return concat([
-            expr(lhs),
+    /// A binary operator with no surrounding space (`a:b`).
+    fn tight(&self, op: BinOp, lhs: &Cst, rhs: &Cst) -> Doc {
+        concat([self.expr(lhs), text(bin_op_str(op)), self.expr(rhs)])
+    }
+
+    /// A binary operator spaced on each side, breakable before the RHS
+    /// (`a + b`, breaking to `a +` ⏎ `b` when it doesn't fit).
+    fn spaced(&self, op: BinOp, lhs: &Cst, rhs: &Cst) -> Doc {
+        // A trailing comment the parser attached to a *compound* RHS node sat
+        // before the operator in source (`lhs // c` ⏎ `op rhs`): operator-leading
+        // trivia binds to the RHS. Emit it before the operator so re-parsing
+        // returns it to the same node — emitting it after would rebind it to the
+        // RHS's leftmost leaf and break idempotency. (An atom RHS *is* its own
+        // leftmost leaf, so the after-operator placement round-trips and reads
+        // better; leave it to `child_after`.)
+        if let Some(c) = same_line_comment(&rhs.leading)
+            && !is_atom(rhs)
+        {
+            return concat([
+                self.expr(lhs),
+                space(),
+                text(c.to_string()),
+                hardline(),
+                text(bin_op_str(op)),
+                space(),
+                own_line_comments(&rhs.leading[1..]),
+                self.node_body(rhs),
+            ]);
+        }
+        group(concat([
+            self.expr(lhs),
             space(),
-            text(c.to_string()),
-            hardline(),
             text(bin_op_str(op)),
-            space(),
-            own_line_comments(&rhs.leading[1..]),
-            node_body(rhs),
-        ]);
+            self.child_after(line(), rhs),
+        ]))
     }
-    group(concat([
-        expr(lhs),
-        space(),
-        text(bin_op_str(op)),
-        child_after(line(), rhs),
-    ]))
+
+    /// A prefix unary operator (`-x`, `!x`, `...xs`).
+    fn unary(&self, op: UnaryOp, operand: &Cst) -> Doc {
+        concat([text(unary_op_str(op)), self.expr(operand)])
+    }
+
+    // ---- chains --------------------------------------------------------
+
+    /// A `,`-separated chain, flat (`a, b, c`) or one-per-line when wide.
+    fn comma_chain(&self, cst: &Cst) -> Doc {
+        group(self.comma_separated(&flatten_left(BinOp::Comma, cst)))
+    }
+
+    /// A `;`-separated statement sequence.
+    fn semi_chain(&self, cst: &Cst) -> Doc {
+        self.statement_seq(&flatten_left(BinOp::Semi, cst))
+    }
+
+    /// A one-per-line, `;`-terminated statement sequence, preserving blank-line
+    /// separators. Shared by the top level and paren blocks. (A trailing `;` is
+    /// dropped on re-parse, so synthesizing one is non-destructive.)
+    fn statement_seq(&self, stmts: &[&Cst]) -> Doc {
+        let mut parts = Vec::new();
+        for (i, s) in stmts.iter().enumerate() {
+            if i == 0 {
+                parts.push(self.expr(s));
+            } else {
+                let sep = if has_blank_before(&s.leading) {
+                    blank_line()
+                } else {
+                    hardline()
+                };
+                parts.push(self.child_after(sep, s));
+            }
+            parts.push(text(";"));
+        }
+        concat(parts)
+    }
+
+    /// A right-associative `->` chain (`a -> b -> c`). The arrow stays on the
+    /// signature line; the RHS handles its own breaking. The final operand is the
+    /// body, lowered via [`Lowerer::arrow_body`] so its opening delimiter can hug
+    /// the arrow.
+    fn arrow_chain(&self, cst: &Cst) -> Doc {
+        let parts = flatten_right(BinOp::Arrow, cst);
+        let last = parts.len() - 1;
+        let docs = parts.into_iter().enumerate().map(|(i, p)| {
+            if i == last {
+                self.arrow_body(p)
+            } else {
+                self.expr(p)
+            }
+        });
+        join(docs, text(" -> "))
+    }
+
+    /// Lower the right-hand side of a `->` (a lambda/function body, or a map
+    /// value). Its opening delimiter hugs the arrow, so under
+    /// [`BraceStyle::NextLine`] it moves onto its own line. Mirrors
+    /// [`Lowerer::expr`] for the leading-comment handling.
+    fn arrow_body(&self, cst: &Cst) -> Doc {
+        let body = match &cst.kind {
+            CstKind::Paren(inner) => self.paren(inner, true),
+            CstKind::List(items) => self.collection("[", items, "]", true),
+            CstKind::Map(items) => self.collection("{", items, "}", true),
+            _ => return self.expr(cst),
+        };
+        concat([own_line_comments(&cst.leading), body])
+    }
+
+    // ---- calls / collections / parens ----------------------------------
+
+    /// A call `callee(args)`. The argument list hugs the callee, so under
+    /// [`BraceStyle::NextLine`] its `(` moves onto its own line.
+    fn call(&self, callee: &Cst, args: &[Cst]) -> Doc {
+        concat([self.expr(callee), self.collection("(", args, ")", true)])
+    }
+
+    /// A delimited, comma-separated sequence (`(...)`, `[...]`, `{...}`). Laid
+    /// out flat if it fits, else one item per line with a trailing comma. `hug`
+    /// says whether the opening delimiter hugs a preceding head (see
+    /// [`Lowerer::open_delim`]).
+    fn collection(&self, open: &'static str, items: &[Cst], close: &'static str, hug: bool) -> Doc {
+        if items.is_empty() {
+            return concat([text(open), text(close)]);
+        }
+        let body = self.comma_separated(&items.iter().collect::<Vec<_>>());
+        group(concat([
+            self.open_delim(open, hug),
+            nest(concat([softline(), body, if_break(text(","), nil())])),
+            softline(),
+            text(close),
+        ]))
+    }
+
+    /// Join items with `, ` (breakable after each comma), lifting trailing
+    /// comments of the 2nd+ items onto the preceding comma.
+    fn comma_separated(&self, items: &[&Cst]) -> Doc {
+        let mut parts = Vec::new();
+        for (i, item) in items.iter().enumerate() {
+            if i == 0 {
+                parts.push(self.expr(item));
+            } else {
+                parts.push(text(","));
+                parts.push(self.child_after(line(), item));
+            }
+        }
+        concat(parts)
+    }
+
+    /// A parenthesized node. Parens are always preserved. A `;`-chain inside is a
+    /// statement block (one statement per line); anything else is an expression
+    /// paren that may break softly. `hug` says whether the `(` hugs a preceding
+    /// head (true for an arrow body — see [`Lowerer::open_delim`]).
+    fn paren(&self, inner: &Cst, hug: bool) -> Doc {
+        if is_semi_chain(inner) {
+            let stmts = flatten_left(BinOp::Semi, inner);
+            group(concat([
+                self.open_delim("(", hug),
+                nest(concat([hardline(), self.statement_seq(&stmts)])),
+                hardline(),
+                text(")"),
+            ]))
+        } else {
+            group(concat([
+                self.open_delim("(", hug),
+                nest(concat([softline(), self.expr(inner)])),
+                softline(),
+                text(")"),
+            ]))
+        }
+    }
+
+    /// The opening delimiter `open`. When it `hug`s a preceding head (a callee or
+    /// a `->`) and [`BraceStyle::NextLine`] is set, a soft break is emitted before
+    /// it so it starts a fresh line once the enclosing group breaks; otherwise it
+    /// is emitted bare.
+    ///
+    /// A block reached *after* a separator that already breaks — an operator's
+    /// `line()` (`x =` ⏎ `[…]`) or a comma/statement break — is not hugging, so it
+    /// passes `hug = false` and keeps the original layout. That avoids stacking a
+    /// second break on top of the separator's, which would leave a blank line.
+    /// (The soft break is nil while flat, so a block that fits is unaffected and
+    /// the break/flat choice is unchanged.)
+    fn open_delim(&self, open: &'static str, hug: bool) -> Doc {
+        if hug && self.config.brace_style == BraceStyle::NextLine {
+            concat([softline(), text(open)])
+        } else {
+            text(open)
+        }
+    }
 }
 
 /// Whether `cst` is a leaf whose leftmost token is the node itself — so a
@@ -108,110 +268,6 @@ fn is_atom(cst: &Cst) -> bool {
         &cst.kind,
         CstKind::Number(_) | CstKind::Str(_) | CstKind::Ident(_) | CstKind::Empty
     )
-}
-
-/// A prefix unary operator (`-x`, `!x`, `...xs`).
-fn unary(op: UnaryOp, operand: &Cst) -> Doc {
-    concat([text(unary_op_str(op)), expr(operand)])
-}
-
-// ---- chains --------------------------------------------------------
-
-/// A `,`-separated chain, flat (`a, b, c`) or one-per-line when wide.
-fn comma_chain(cst: &Cst) -> Doc {
-    group(comma_separated(&flatten_left(BinOp::Comma, cst)))
-}
-
-/// A `;`-separated statement sequence.
-fn semi_chain(cst: &Cst) -> Doc {
-    statement_seq(&flatten_left(BinOp::Semi, cst))
-}
-
-/// A one-per-line, `;`-terminated statement sequence, preserving blank-line
-/// separators. Shared by the top level and paren blocks. (A trailing `;` is
-/// dropped on re-parse, so synthesizing one is non-destructive.)
-fn statement_seq(stmts: &[&Cst]) -> Doc {
-    let mut parts = Vec::new();
-    for (i, s) in stmts.iter().enumerate() {
-        if i == 0 {
-            parts.push(expr(s));
-        } else {
-            let sep = if has_blank_before(&s.leading) {
-                blank_line()
-            } else {
-                hardline()
-            };
-            parts.push(child_after(sep, s));
-        }
-        parts.push(text(";"));
-    }
-    concat(parts)
-}
-
-/// A right-associative `->` chain (`a -> b -> c`). The arrow stays on the
-/// signature line; the RHS handles its own breaking.
-fn arrow_chain(cst: &Cst) -> Doc {
-    let parts = flatten_right(BinOp::Arrow, cst);
-    join(parts.into_iter().map(expr), text(" -> "))
-}
-
-// ---- calls / collections / parens ----------------------------------
-
-/// A call `callee(args)`.
-fn call(callee: &Cst, args: &[Cst]) -> Doc {
-    concat([expr(callee), collection("(", args, ")")])
-}
-
-/// A delimited, comma-separated sequence (`(...)`, `[...]`, `{...}`). Laid out
-/// flat if it fits, else one item per line with a trailing comma.
-fn collection(open: &'static str, items: &[Cst], close: &'static str) -> Doc {
-    if items.is_empty() {
-        return concat([text(open), text(close)]);
-    }
-    let body = comma_separated(&items.iter().collect::<Vec<_>>());
-    group(concat([
-        text(open),
-        nest(concat([softline(), body, if_break(text(","), nil())])),
-        softline(),
-        text(close),
-    ]))
-}
-
-/// Join items with `, ` (breakable after each comma), lifting trailing comments
-/// of the 2nd+ items onto the preceding comma.
-fn comma_separated(items: &[&Cst]) -> Doc {
-    let mut parts = Vec::new();
-    for (i, item) in items.iter().enumerate() {
-        if i == 0 {
-            parts.push(expr(item));
-        } else {
-            parts.push(text(","));
-            parts.push(child_after(line(), item));
-        }
-    }
-    concat(parts)
-}
-
-/// A parenthesized node. Parens are always preserved. A `;`-chain inside is a
-/// statement block (one statement per line); anything else is an expression
-/// paren that may break softly.
-fn paren(inner: &Cst) -> Doc {
-    if is_semi_chain(inner) {
-        let stmts = flatten_left(BinOp::Semi, inner);
-        group(concat([
-            text("("),
-            nest(concat([hardline(), statement_seq(&stmts)])),
-            hardline(),
-            text(")"),
-        ]))
-    } else {
-        group(concat([
-            text("("),
-            nest(concat([softline(), expr(inner)])),
-            softline(),
-            text(")"),
-        ]))
-    }
 }
 
 fn is_semi_chain(cst: &Cst) -> bool {
@@ -303,10 +359,21 @@ fn unary_op_str(op: UnaryOp) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Config, format_source};
+    use crate::{BraceStyle, Config, format_source};
 
     fn fmt(src: &str) -> String {
         format_source(src, &Config::default()).unwrap()
+    }
+
+    fn fmt_nl(src: &str) -> String {
+        format_source(
+            src,
+            &Config {
+                brace_style: BraceStyle::NextLine,
+                ..Config::default()
+            },
+        )
+        .unwrap()
     }
 
     #[test]
@@ -409,6 +476,72 @@ mod tests {
         }
         expected.push_str("]\n");
         assert_eq!(fmt(&src), expected);
+    }
+
+    // ---- brace style -----------------------------------------------
+
+    #[test]
+    fn next_line_keeps_short_blocks_inline() {
+        // A block that fits on one line is unaffected by the brace style.
+        assert_eq!(fmt_nl("f(a, b, c)"), "f(a, b, c)\n");
+        assert_eq!(fmt_nl("[1, 2, 3]"), "[1, 2, 3]\n");
+        assert_eq!(fmt_nl("{'a' -> 1, 'b' -> 2}"), "{'a' -> 1, 'b' -> 2}\n");
+        assert_eq!(fmt_nl("(a + b)"), "(a + b)\n");
+    }
+
+    #[test]
+    fn next_line_breaks_function_body_open_paren() {
+        // A `;`-body always breaks; the opening paren moves onto its own line.
+        assert_eq!(fmt_nl("foo()->(a;b)"), "foo() ->\n(\n    a;\n    b;\n)\n");
+    }
+
+    #[test]
+    fn next_line_breaks_call_open_paren() {
+        // A call hugs its callee, so the `(` moves onto its own line.
+        let args = [
+            "aaaaaaaaaa",
+            "bbbbbbbbbb",
+            "cccccccccc",
+            "dddddddddd",
+            "eeeeeeeeee",
+            "ffffffffff",
+            "gggggggggg",
+            "hhhhhhhhhh",
+            "iiiiiiiiii",
+        ];
+        let src = format!("call_something({})", args.join(", "));
+        let mut expected = String::from("call_something\n(\n");
+        for a in args {
+            expected.push_str(&format!("    {a},\n"));
+        }
+        expected.push_str(")\n");
+        assert_eq!(fmt_nl(&src), expected);
+    }
+
+    #[test]
+    fn next_line_keeps_operator_rhs_without_a_blank_line() {
+        // The `=` already breaks its RHS onto a fresh line; brace style must not
+        // stack a second break (which would leave a blank line). A literal
+        // assigned to a variable therefore lays out the same under either style.
+        let nums = [
+            "1111111111",
+            "2222222222",
+            "3333333333",
+            "4444444444",
+            "5555555555",
+            "6666666666",
+            "7777777777",
+            "8888888888",
+            "9999999999",
+        ];
+        let src = format!("data = [{}]", nums.join(", "));
+        let mut expected = String::from("data =\n[\n");
+        for n in nums {
+            expected.push_str(&format!("    {n},\n"));
+        }
+        expected.push_str("]\n");
+        assert_eq!(fmt_nl(&src), expected);
+        assert_eq!(fmt_nl(&src), fmt(&src));
     }
 
     // ---- trivia ----------------------------------------------------

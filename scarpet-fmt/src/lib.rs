@@ -9,7 +9,7 @@ mod doc;
 mod lower;
 mod trivia;
 
-pub use config::{Config, LineEnding};
+pub use config::{BraceStyle, Config, LineEnding};
 use scarpet_syntax::parser::{Cst, ParseError, parse_source};
 
 /// Format Scarpet source text. Parses, then renders per `config`.
@@ -22,7 +22,7 @@ pub fn format_source(src: &str, config: &Config) -> Result<String, FmtError> {
 
 /// Format an already-parsed CST. Infallible: a well-formed CST always renders.
 pub fn format_cst(cst: &Cst<'_>, config: &Config) -> String {
-    render_top(lower::program(cst), config)
+    render_top(lower::program(cst, config), config)
 }
 
 /// Render a top-level document, guaranteeing the output ends in exactly one
@@ -119,7 +119,7 @@ mod tests {
 /// Round-trip the whole `example/` corpus to prove the formatter is safe.
 #[cfg(test)]
 mod corpus {
-    use crate::{Config, format_cst};
+    use crate::{BraceStyle, Config, format_cst};
     use scarpet_syntax::parser::{parse_source, strip_trivia};
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
@@ -152,18 +152,17 @@ mod corpus {
         }
     }
 
-    /// Every corpus file must format (a) non-destructively — re-parsing the
-    /// output yields a structurally-equal CST — and (b) idempotently. Skips
-    /// quietly when the `example/` submodule isn't checked out.
-    #[test]
-    fn roundtrip_is_nondestructive_and_idempotent() {
+    /// Round-trip every corpus file under `config`, collecting human-readable
+    /// failures. Returns an empty list (after printing a skip notice) when the
+    /// `example/` submodule isn't checked out.
+    fn roundtrip_failures(config: &Config) -> Vec<String> {
         let root = corpus_root();
         if !root.is_dir() {
             eprintln!(
                 "skipping corpus test: {} absent (run `git submodule update --init`)",
                 root.display()
             );
-            return;
+            return Vec::new();
         }
         let mut files = Vec::new();
         walk_sc(&root, &mut files);
@@ -190,7 +189,7 @@ mod corpus {
                     continue;
                 }
             };
-            let formatted = format_cst(&cst1, &Config::default());
+            let formatted = format_cst(&cst1, config);
             let cst2 = match parse_source(&formatted) {
                 Ok(c) => c,
                 Err(e) => {
@@ -202,14 +201,40 @@ mod corpus {
                 failures.push(format!("{rel}: structure changed after formatting"));
                 continue;
             }
-            let reformatted = format_cst(&cst2, &Config::default());
+            let reformatted = format_cst(&cst2, config);
             if formatted != reformatted {
                 failures.push(format!("{rel}: not idempotent"));
             }
         }
+        failures
+    }
+
+    /// Every corpus file must format (a) non-destructively — re-parsing the
+    /// output yields a structurally-equal CST — and (b) idempotently. Skips
+    /// quietly when the `example/` submodule isn't checked out.
+    #[test]
+    fn roundtrip_is_nondestructive_and_idempotent() {
+        let failures = roundtrip_failures(&Config::default());
         assert!(
             failures.is_empty(),
             "corpus round-trip failures ({}):\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// The same non-destructive + idempotent guarantee must hold under the
+    /// non-default `brace_style = next_line` layout.
+    #[test]
+    fn roundtrip_next_line_braces_is_nondestructive_and_idempotent() {
+        let config = Config {
+            brace_style: BraceStyle::NextLine,
+            ..Config::default()
+        };
+        let failures = roundtrip_failures(&config);
+        assert!(
+            failures.is_empty(),
+            "next-line corpus round-trip failures ({}):\n{}",
             failures.len(),
             failures.join("\n")
         );
