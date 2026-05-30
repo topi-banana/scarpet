@@ -170,3 +170,32 @@ fn render_diff(name: &str, src: &str, formatted: &str, color: bool) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diff_renders_hunk_header_and_signs() {
+        let src = "{\n\tfoo( a , b )\n}\n";
+        let formatted = "{\n\tfoo(a, b)\n}\n";
+        let out = render_diff("example.sc", src, formatted, false);
+        assert!(out.contains("Diff in example.sc at line 1:"), "{out}");
+        assert!(out.contains("-\tfoo( a , b )"), "{out}");
+        assert!(out.contains("+\tfoo(a, b)"), "{out}");
+        assert!(out.contains(" {\n"), "context line kept: {out}");
+    }
+
+    #[test]
+    fn diff_is_plain_when_color_off() {
+        let out = render_diff("x", "a\n", "b\n", false);
+        assert!(!out.contains('\x1b'), "{out}");
+    }
+
+    #[test]
+    fn diff_colours_added_and_removed_lines() {
+        let out = render_diff("x", "a\n", "b\n", true);
+        assert!(out.contains("\x1b[31m-a\x1b[0m"), "{out}");
+        assert!(out.contains("\x1b[32m+b\x1b[0m"), "{out}");
+    }
+}
