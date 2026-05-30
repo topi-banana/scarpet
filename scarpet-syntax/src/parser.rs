@@ -350,6 +350,35 @@ fn check_delimiters(src: &str) -> Option<ParseError> {
     None
 }
 
+/// Whether `src` has at least one delimiter still open — a `(`, `[`, or `{` with
+/// no matching closer yet. Unlike [`check_delimiters`], a *surplus* or
+/// *mismatched* closer is not reported as open: those are genuine errors for the
+/// parser to report, not a reason to wait for more input. Like `check_delimiters`
+/// it runs straight on the lexer, so delimiters inside strings and comments
+/// (which lex as single tokens) are ignored.
+///
+/// The REPL uses this to decide whether to hold a multi-line submission open
+/// until its brackets balance.
+pub fn has_open_delimiter(src: &str) -> bool {
+    use logos::Logos as _;
+    let mut depth: usize = 0;
+    for res in Token::lexer(src) {
+        // A lex error isn't our concern here; let the grammar report it.
+        let Ok(tok) = res else { continue };
+        match logosky::Token::kind(&tok) {
+            TokenKind::OpenParen | TokenKind::OpenBrack | TokenKind::OpenBrace => {
+                depth += 1;
+            }
+            TokenKind::CloseParen | TokenKind::CloseBrack | TokenKind::CloseBrace => {
+                // Saturate at zero so a surplus closer never reads as "open".
+                depth = depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+    depth > 0
+}
+
 /// The closing delimiter kind that matches an opener (identity for non-openers).
 fn closer_for(open: TokenKind) -> TokenKind {
     match open {
@@ -1600,6 +1629,30 @@ mod tests {
     #[test]
     fn delimiters_inside_strings_are_ignored() {
         assert!(parse_source("print('(')").is_ok());
+    }
+
+    /// `has_open_delimiter` is true only while an opener is still waiting for its
+    /// closer — the REPL's signal to keep a multi-line submission open.
+    #[test]
+    fn has_open_delimiter_tracks_unclosed_openers() {
+        // Still open: an opener with no matching closer yet.
+        assert!(has_open_delimiter("foo("));
+        assert!(has_open_delimiter("[1, 2,"));
+        assert!(has_open_delimiter("foo() -> ("));
+        assert!(has_open_delimiter("({["));
+        // Balanced: nothing is waiting to close.
+        assert!(!has_open_delimiter("foo()"));
+        assert!(!has_open_delimiter("(a + b) * [c]"));
+        assert!(!has_open_delimiter("a = 5"));
+        // A surplus or mismatched closer is an error, not "open" — so it is not
+        // held for more input; the parser reports it instead.
+        assert!(!has_open_delimiter("a)"));
+        assert!(!has_open_delimiter("(a]"));
+        // Delimiters inside strings and comments never count.
+        assert!(!has_open_delimiter("print('(')"));
+        assert!(!has_open_delimiter("foo() // (open"));
+        // But an opener before the comment still counts as open.
+        assert!(has_open_delimiter("foo( // a comment"));
     }
 
     // ----- help suggestions ---------------------------------------------
