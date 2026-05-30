@@ -9,8 +9,8 @@
 use scarpet_syntax::parser::{BinOp, Cst, CstKind, UnaryOp};
 
 use crate::doc::{
-    Doc, blank_line, concat, group, hardline, if_break, join, line, nest, nil, softline, space,
-    text,
+    Doc, blank_line, comment, concat, group, hardline, if_break, join, line, nest, nil, softline,
+    space, text,
 };
 use crate::trivia::{has_blank_before, own_line_comments, same_line_comment};
 use crate::{BraceStyle, Config};
@@ -41,7 +41,7 @@ impl Lowerer<'_> {
         match same_line_comment(&cst.leading) {
             Some(c) => concat([
                 space(),
-                text(c.to_string()),
+                comment(c.to_string()),
                 hardline(),
                 own_line_comments(&cst.leading[1..]),
                 self.node_body(cst),
@@ -93,7 +93,7 @@ impl Lowerer<'_> {
             return concat([
                 self.expr(lhs),
                 space(),
-                text(c.to_string()),
+                comment(c.to_string()),
                 hardline(),
                 text(bin_op_str(op)),
                 space(),
@@ -376,6 +376,17 @@ mod tests {
         .unwrap()
     }
 
+    fn fmt_comment_width(src: &str, width: usize) -> String {
+        format_source(
+            src,
+            &Config {
+                comment_width: Some(width),
+                ..Config::default()
+            },
+        )
+        .unwrap()
+    }
+
     #[test]
     fn arithmetic_spacing() {
         assert_eq!(fmt("2+3*4"), "2 + 3 * 4\n");
@@ -571,5 +582,29 @@ mod tests {
     #[test]
     fn own_line_comment_between_statements() {
         assert_eq!(fmt("a;\n// note\nb"), "a;\n// note\nb;\n");
+    }
+
+    #[test]
+    fn comment_width_wraps_own_line_comments() {
+        assert_eq!(
+            fmt_comment_width("// one two three four\nx", 12),
+            "// one two\n// three\n// four\nx\n"
+        );
+    }
+
+    #[test]
+    fn comment_width_wraps_trailing_comments() {
+        assert_eq!(
+            fmt_comment_width("a; // one two three\nb", 14),
+            "a; // one two\n// three\nb;\n"
+        );
+    }
+
+    #[test]
+    fn disabled_comment_width_keeps_comments_verbatim() {
+        assert_eq!(
+            fmt("// one two three four\nx"),
+            "// one two three four\nx\n"
+        );
     }
 }

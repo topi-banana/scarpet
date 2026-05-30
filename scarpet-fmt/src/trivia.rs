@@ -8,13 +8,13 @@
 
 use scarpet_syntax::parser::Trivia;
 
-use crate::doc::{Doc, concat, hardline, text};
+use crate::doc::{Doc, comment, concat, hardline};
 
 /// Lower the comments in `leading`, each on its own line (`comment` + hardline).
 /// Breaks are ignored — blank-line preservation is the separator's job.
 pub fn own_line_comments(leading: &[Trivia]) -> Doc {
     concat(leading.iter().filter_map(|t| match t {
-        Trivia::Comment(c) => Some(concat([text(c.to_string()), hardline()])),
+        Trivia::Comment(c) => Some(concat([comment(c.to_string()), hardline()])),
         Trivia::Break => None,
     }))
 }
