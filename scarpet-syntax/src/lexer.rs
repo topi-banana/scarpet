@@ -7,7 +7,7 @@ pub enum Token<'a> {
     #[token("\n")]
     #[token("$")]
     Break,
-    #[regex(r"//[^\n]*")]
+    #[regex(r"//[^\n\r]*")]
     Comment(&'a str),
 
     // ===== Literals / Atoms =====
@@ -275,6 +275,17 @@ mod tests {
         assert_eq!(
             tokens.unwrap(),
             [Token::Ident("a"), Token::Break, Token::Ident("b")]
+        );
+    }
+
+    #[test]
+    fn crlf_comment_excludes_carriage_return() {
+        // A `\r` before the newline (CRLF source) is whitespace, not part of
+        // the comment text, and the `\n` alone is the Break.
+        let tokens: Result<Vec<_>, _> = logos::Lexer::<Token>::new("// hi\r\nx").collect();
+        assert_eq!(
+            tokens.unwrap(),
+            [Token::Comment("// hi"), Token::Break, Token::Ident("x")]
         );
     }
 }
