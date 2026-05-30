@@ -80,12 +80,13 @@ The style is configurable through a TOML file: `scarpet format` reads `scarpet-f
 
 ```toml
 # scarpet-fmt.toml
-indent = 4               # indentation width, in spaces
-max_width = 100          # line-length target before a group breaks
-line_ending = "lf"       # newline style: "lf" (Unix, default) or "crlf" (Windows)
+indent = 4                # indentation width, in spaces
+max_width = 100           # line-length target before a group breaks
+line_ending = "lf"        # newline style: "lf" (Unix, default) or "crlf" (Windows)
+brace_style = "same_line" # opening delimiter of a broken block: "same_line" (default) or "next_line"
 ```
 
-Unknown keys, `max_width = 0`, and a `line_ending` other than `"lf"` or `"crlf"` are rejected. Beyond these knobs the layout is fixed. Highlights:
+Unknown keys, `max_width = 0`, a `line_ending` other than `"lf"` or `"crlf"`, and a `brace_style` other than `"same_line"` or `"next_line"` are rejected. Beyond these knobs the layout is fixed. Highlights:
 
 - Binary operators are spaced (`a + b`, `a -> b`), except `:` (get), which is tight: `a:b`. Unary prefixes hug their operand: `-x`, `!x`, `...xs`.
 - `;` statement sequences are laid out one per line, each terminated with `;`. A parenthesized `;`-chain becomes an indented block.
@@ -106,7 +107,17 @@ foo() -> (
 )
 ```
 
-The formatter is **non-destructive** (re-parsing its output yields a structurally identical tree) and **idempotent** (formatting twice is the same as once). Both properties are enforced against the whole corpus in CI.
+With `brace_style = "next_line"`, the opening delimiter of a broken call or function body instead starts its own line (Allman-style); a block that already fits on one line is unaffected:
+
+```sc
+foo() ->
+(
+    a;
+    b;
+)
+```
+
+The formatter is **non-destructive** (re-parsing its output yields a structurally identical tree) and **idempotent** (formatting twice is the same as once). Both properties are enforced against the whole corpus in CI — under both brace styles.
 
 ## The corpus
 
