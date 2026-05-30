@@ -75,6 +75,8 @@ struct ConfigFile {
     indent: Option<usize>,
     /// Target maximum line width before a group breaks.
     max_width: Option<usize>,
+    /// Target maximum comment width. `-1` disables comment wrapping.
+    comment_width: Option<isize>,
     /// Line ending for inserted breaks: `"lf"` (default) or `"crlf"`.
     line_ending: Option<String>,
     /// Opening-delimiter placement for broken blocks: `"same_line"` (default)
@@ -131,6 +133,16 @@ fn parse_config(text: &str, name: &str) -> Result<Config, String> {
     let config = Config {
         indent_width: file.indent.unwrap_or(default.indent_width),
         max_width: file.max_width.unwrap_or(default.max_width),
+        comment_width: match file.comment_width {
+            None => default.comment_width,
+            Some(-1) => None,
+            Some(n) if n > 0 => Some(n as usize),
+            Some(n) => {
+                return Err(format!(
+                    "{name}: comment_width must be -1 or at least 1, got {n}"
+                ));
+            }
+        },
         line_ending,
         brace_style,
     };
@@ -421,6 +433,29 @@ mod tests {
     fn parse_config_reads_crlf() {
         let cfg = parse_config("line_ending = \"crlf\"", "x").unwrap();
         assert_eq!(cfg.line_ending, LineEnding::Crlf);
+    }
+
+    #[test]
+    fn parse_config_defaults_comment_width_to_disabled() {
+        assert_eq!(parse_config("", "x").unwrap().comment_width, None);
+    }
+
+    #[test]
+    fn parse_config_reads_comment_width() {
+        let cfg = parse_config("comment_width = 72", "x").unwrap();
+        assert_eq!(cfg.comment_width, Some(72));
+    }
+
+    #[test]
+    fn parse_config_disables_comment_width_with_minus_one() {
+        let cfg = parse_config("comment_width = -1", "x").unwrap();
+        assert_eq!(cfg.comment_width, None);
+    }
+
+    #[test]
+    fn parse_config_rejects_zero_comment_width() {
+        let err = parse_config("comment_width = 0", "x").unwrap_err();
+        assert!(err.contains("comment_width"), "{err}");
     }
 
     #[test]

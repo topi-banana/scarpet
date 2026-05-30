@@ -16,6 +16,9 @@ pub enum Doc {
     Nil,
     /// Literal text with no embedded newline.
     Text(Cow<'static, str>),
+    /// A line comment, rendered verbatim unless `comment_width` asks for
+    /// wrapping.
+    Comment(Cow<'static, str>),
     /// A space when flat, a newline + indent when broken.
     Line,
     /// Nothing when flat, a newline + indent when broken.
@@ -49,6 +52,10 @@ pub fn nil() -> Doc {
 
 pub fn text(s: impl Into<Cow<'static, str>>) -> Doc {
     Doc::Text(s.into())
+}
+
+pub fn comment(s: impl Into<Cow<'static, str>>) -> Doc {
+    Doc::Comment(s.into())
 }
 
 pub fn line() -> Doc {
@@ -116,7 +123,13 @@ impl Doc {
     /// `"\n"` or `"\r\n"`); bytes inside `Text` nodes are left untouched. Each
     /// line is right-trimmed; the result carries no enforced trailing newline
     /// (the caller appends one).
-    pub fn render(&self, width: usize, indent_width: usize, line_ending: &str) -> String {
+    pub fn render(
+        &self,
+        width: usize,
+        comment_width: Option<usize>,
+        indent_width: usize,
+        line_ending: &str,
+    ) -> String {
         let step = indent_width as isize;
         let mut out = String::new();
         let mut col: isize = 0;
@@ -128,6 +141,9 @@ impl Doc {
                 Doc::Text(s) => {
                     out.push_str(s);
                     col += s.chars().count() as isize;
+                }
+                Doc::Comment(s) => {
+                    col = push_comment(&mut out, s, col, indent, comment_width, line_ending);
                 }
                 Doc::Line => match mode {
                     Mode::Flat => {
@@ -211,6 +227,12 @@ fn fits(mut remaining: isize, doc: &Doc) -> bool {
                     return false;
                 }
             }
+            Doc::Comment(s) => {
+                remaining -= s.chars().count() as isize;
+                if remaining < 0 {
+                    return false;
+                }
+            }
             // Flat: `Line` is a space, `SoftLine` is nothing.
             Doc::Line => {
                 remaining -= 1;
@@ -236,6 +258,85 @@ fn fits(mut remaining: isize, doc: &Doc) -> bool {
     true
 }
 
+fn push_comment(
+    out: &mut String,
+    raw: &str,
+    col: isize,
+    indent: isize,
+    comment_width: Option<usize>,
+    nl: &str,
+) -> isize {
+    let Some(width) = comment_width else {
+        out.push_str(raw);
+        return col + raw.chars().count() as isize;
+    };
+    let Some(rest) = raw.strip_prefix("//") else {
+        out.push_str(raw);
+        return col + raw.chars().count() as isize;
+    };
+    let (prefix, body) = if let Some(body) = rest.strip_prefix(' ') {
+        ("// ", body)
+    } else {
+        ("//", rest)
+    };
+    let lines = wrap_comment_body(prefix, body, col as usize, indent.max(0) as usize, width);
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            newline(out, indent, false, nl);
+        }
+        out.push_str(line);
+    }
+    let last_len = lines.last().map_or(0, |line| line.chars().count()) as isize;
+    if lines.len() > 1 {
+        indent + last_len
+    } else {
+        col + last_len
+    }
+}
+
+fn wrap_comment_body(
+    prefix: &str,
+    body: &str,
+    start_col: usize,
+    continuation_col: usize,
+    width: usize,
+) -> Vec<String> {
+    let prefix_len = prefix.chars().count();
+    if width == 0 || start_col + prefix_len >= width {
+        return vec![format!("{prefix}{body}")];
+    }
+
+    let mut lines = Vec::new();
+    let mut current = String::from(prefix);
+    let mut current_len = start_col + prefix_len;
+    let continuation_len = continuation_col + prefix_len;
+    let mut first_word = true;
+
+    for word in body.split_whitespace() {
+        let word_len = word.chars().count();
+        let sep_len = usize::from(!first_word);
+        if !first_word && current_len + sep_len + word_len > width {
+            lines.push(current);
+            current = String::from(prefix);
+            current_len = continuation_len;
+            first_word = true;
+        }
+        if !first_word {
+            current.push(' ');
+            current_len += 1;
+        }
+        current.push_str(word);
+        current_len += word_len;
+        first_word = false;
+    }
+
+    if first_word {
+        current.push_str(body);
+    }
+    lines.push(current);
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,19 +347,19 @@ mod tests {
 
     #[test]
     fn plain_text() {
-        assert_eq!(text("hello").render(80, W, "\n"), "hello");
+        assert_eq!(text("hello").render(80, None, W, "\n"), "hello");
     }
 
     #[test]
     fn group_stays_flat_when_it_fits() {
         let d = group(concat([text("a"), line(), text("b")]));
-        assert_eq!(d.render(80, W, "\n"), "a b");
+        assert_eq!(d.render(80, None, W, "\n"), "a b");
     }
 
     #[test]
     fn group_breaks_when_too_wide() {
         let d = group(concat([text("aaa"), line(), text("bbb")]));
-        assert_eq!(d.render(4, W, "\n"), "aaa\nbbb");
+        assert_eq!(d.render(4, None, W, "\n"), "aaa\nbbb");
     }
 
     #[test]
@@ -269,20 +370,20 @@ mod tests {
             softline(),
             text(")"),
         ]));
-        assert_eq!(d.clone().render(80, W, "\n"), "(x)");
-        assert_eq!(d.render(2, W, "\n"), "(\n    x\n)");
+        assert_eq!(d.clone().render(80, None, W, "\n"), "(x)");
+        assert_eq!(d.render(2, None, W, "\n"), "(\n    x\n)");
     }
 
     #[test]
     fn hardline_forces_break_even_when_it_fits() {
         let d = group(concat([text("a"), hardline(), text("b")]));
-        assert_eq!(d.render(80, W, "\n"), "a\nb");
+        assert_eq!(d.render(80, None, W, "\n"), "a\nb");
     }
 
     #[test]
     fn blank_line_emits_two_newlines() {
         let d = concat([text("a"), blank_line(), text("b")]);
-        assert_eq!(d.render(80, W, "\n"), "a\n\nb");
+        assert_eq!(d.render(80, None, W, "\n"), "a\n\nb");
     }
 
     #[test]
@@ -293,37 +394,64 @@ mod tests {
             line(),
             text("y"),
         ]));
-        assert_eq!(flat.render(80, W, "\n"), "x y");
+        assert_eq!(flat.render(80, None, W, "\n"), "x y");
         let broken = group(concat([
             text("xxxx"),
             if_break(text(","), nil()),
             line(),
             text("yyyy"),
         ]));
-        assert_eq!(broken.render(4, W, "\n"), "xxxx,\nyyyy");
+        assert_eq!(broken.render(4, None, W, "\n"), "xxxx,\nyyyy");
     }
 
     #[test]
     fn trailing_spaces_trimmed_before_newline() {
         let d = concat([text("a"), space(), hardline(), text("b")]);
-        assert_eq!(d.render(80, W, "\n"), "a\nb");
+        assert_eq!(d.render(80, None, W, "\n"), "a\nb");
     }
 
     #[test]
     fn join_inserts_separators() {
         let d = join([text("a"), text("b"), text("c")], text(", "));
-        assert_eq!(d.render(80, W, "\n"), "a, b, c");
+        assert_eq!(d.render(80, None, W, "\n"), "a, b, c");
     }
 
     #[test]
     fn render_uses_supplied_line_ending() {
         let d = group(concat([text("aaa"), line(), text("bbb")]));
-        assert_eq!(d.render(4, W, "\r\n"), "aaa\r\nbbb");
+        assert_eq!(d.render(4, None, W, "\r\n"), "aaa\r\nbbb");
     }
 
     #[test]
     fn crlf_blank_line_emits_two_crlf() {
         let d = concat([text("a"), blank_line(), text("b")]);
-        assert_eq!(d.render(80, W, "\r\n"), "a\r\n\r\nb");
+        assert_eq!(d.render(80, None, W, "\r\n"), "a\r\n\r\nb");
+    }
+
+    #[test]
+    fn comment_width_wraps_line_comments() {
+        let d = comment("// one two three four");
+        assert_eq!(
+            d.render(80, Some(12), W, "\n"),
+            "// one two\n// three\n// four"
+        );
+    }
+
+    #[test]
+    fn disabled_comment_width_keeps_comment_verbatim() {
+        let d = comment("// one two three four");
+        assert_eq!(d.render(80, None, W, "\n"), "// one two three four");
+    }
+
+    #[test]
+    fn wrapped_comment_continuation_uses_current_indent() {
+        let d = concat([
+            text("("),
+            nest(concat([hardline(), comment("// one two three")])),
+        ]);
+        assert_eq!(
+            d.render(80, Some(13), W, "\n"),
+            "(\n    // one\n    // two\n    // three"
+        );
     }
 }

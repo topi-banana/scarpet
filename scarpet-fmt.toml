@@ -8,6 +8,8 @@
 indent = 4
 # Line-length target before a group breaks onto multiple lines.
 max_width = 100
+# Comment line-length target. -1 disables wrapping.
+comment_width = -1
 # Newline style for breaks the formatter inserts: "lf" (Unix) or "crlf" (Windows).
 line_ending = "lf"
 # Opening delimiter of a broken (), [] or {} block: "same_line" (default) or "next_line".

@@ -3,7 +3,8 @@
 //! The CLI parses a TOML config and builds a [`Config`]; this library only
 //! consumes it (it stays `wasm`-clean — no file I/O here). Defaults reproduce
 //! the original fixed style: a 4-space indent at a 100-column target width,
-//! with Unix (`\n`) line endings and same-line opening delimiters.
+//! unwrapped comments, Unix (`\n`) line endings, and same-line opening
+//! delimiters.
 
 /// The line ending the formatter emits for the breaks it inserts.
 ///
@@ -51,6 +52,9 @@ pub struct Config {
     pub indent_width: usize,
     /// Target maximum line width. A `Group` that fits within this stays flat.
     pub max_width: usize,
+    /// Target maximum width for `//` comments. `None` leaves comments
+    /// unwrapped, equivalent to `comment_width = -1` in the TOML config.
+    pub comment_width: Option<usize>,
     /// Line ending emitted for the breaks the formatter inserts.
     pub line_ending: LineEnding,
     /// Placement of the opening delimiter of a broken `()`/`[]`/`{}` block.
@@ -62,6 +66,7 @@ impl Default for Config {
         Self {
             indent_width: 4,
             max_width: 100,
+            comment_width: None,
             line_ending: LineEnding::Lf,
             brace_style: BraceStyle::SameLine,
         }
@@ -86,5 +91,10 @@ mod tests {
     #[test]
     fn default_config_uses_same_line_braces() {
         assert_eq!(Config::default().brace_style, BraceStyle::SameLine);
+    }
+
+    #[test]
+    fn default_config_leaves_comments_unwrapped() {
+        assert_eq!(Config::default().comment_width, None);
     }
 }

@@ -30,6 +30,7 @@ pub fn format_cst(cst: &Cst<'_>, config: &Config) -> String {
 fn render_top(doc: doc::Doc, config: &Config) -> String {
     let mut s = doc.render(
         config.max_width,
+        config.comment_width,
         config.indent_width,
         config.line_ending.as_str(),
     );
