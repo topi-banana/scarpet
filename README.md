@@ -15,7 +15,7 @@ This is a Cargo workspace of three crates plus a test corpus:
 | Crate | What it is |
 | --- | --- |
 | [`scarpet-syntax`](scarpet-syntax) | Lexer ([`logos`](https://crates.io/crates/logos)) and parser ([`chumsky`](https://crates.io/crates/chumsky) via [`logosky`](https://crates.io/crates/logosky)) producing a CST that preserves comments and line breaks. Also builds for `wasm32`. |
-| [`scarpet-fmt`](scarpet-fmt) | Code formatter. Lowers the CST to a Wadler/Lindig pretty-printing IR and renders it at a fixed style. |
+| [`scarpet-fmt`](scarpet-fmt) | Code formatter. Lowers the CST to a Wadler/Lindig pretty-printing IR and renders it at a configurable style. |
 | [`scarpet-cli`](scarpet-cli) | Command-line front end (`scarpet`), built on `clap`. Currently exposes `format`. |
 | [`example/`](example) | Git submodules of community Scarpet scripts, used as a parse/format corpus. |
 
@@ -58,6 +58,9 @@ cargo run -p scarpet-cli -- format --in-place src/*.sc
 
 # Check formatting without writing (non-zero exit if any file differs)
 cargo run -p scarpet-cli -- format --check src/*.sc
+
+# Format with an explicit config file (otherwise scarpet-fmt.toml in the cwd is used)
+cargo run -p scarpet-cli -- format --config scarpet-fmt.toml script.sc
 ```
 
 Install it as a standalone binary:
@@ -66,11 +69,19 @@ Install it as a standalone binary:
 cargo install --path scarpet-cli   # installs `scarpet-cli`
 ```
 
-Exit codes: `0` success, `1` a parse error or a failed `--check`, `2` an I/O error.
+Exit codes: `0` success, `1` a parse error or a failed `--check`, `2` an I/O or configuration error.
 
 ### Formatting style
 
-The MVP style is fixed (4-space indent, 100-column target) and not yet configurable. Highlights:
+The style is configurable through a TOML file: `scarpet format` reads `scarpet-fmt.toml` from the current directory, or an explicit `--config <path>` (which takes precedence); with neither it falls back to the built-in defaults. Every key is optional.
+
+```toml
+# scarpet-fmt.toml
+indent = 4        # indentation width, in spaces
+max_width = 100   # line-length target before a group breaks
+```
+
+Unknown keys and `max_width = 0` are rejected. Beyond these knobs the layout is fixed. Highlights:
 
 - Binary operators are spaced (`a + b`, `a -> b`), except `:` (get), which is tight: `a:b`. Unary prefixes hug their operand: `-x`, `!x`, `...xs`.
 - `;` statement sequences are laid out one per line, each terminated with `;`. A parenthesized `;`-chain becomes an indented block.
