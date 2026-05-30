@@ -6,6 +6,7 @@ use ariadne::{Label, Report, ReportKind, Source};
 use clap::{Args, Parser, Subcommand};
 use scarpet_fmt::{Config, FmtError, format_source};
 use scarpet_syntax::parser::ParseError;
+use serde::Deserialize;
 
 #[derive(Parser)]
 #[command(name = "scarpet", about = "Scarpet language tools")]
@@ -30,6 +31,54 @@ struct FormatArgs {
     /// Exit non-zero if any input is not already formatted; write nothing.
     #[arg(long)]
     check: bool,
+    /// Path to a TOML config file. Defaults to `scarpet-fmt.toml` in the
+    /// current directory when present.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+}
+
+/// The default config file, read from the current directory when `--config`
+/// is not supplied.
+const DEFAULT_CONFIG: &str = "scarpet-fmt.toml";
+
+/// The TOML config schema. Every key is optional; unset keys fall back to the
+/// formatter's defaults. Parsing lives here in the CLI so that `scarpet-fmt`
+/// stays free of file I/O (it builds for `wasm`).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigFile {
+    /// Indentation step, in spaces.
+    indent: Option<usize>,
+    /// Target maximum line width before a group breaks.
+    max_width: Option<usize>,
+}
+
+/// Resolve the formatting [`Config`]. An explicit `--config` path must exist
+/// and parse. Otherwise `scarpet-fmt.toml` in the current directory is used if
+/// present; a missing default file falls back to [`Config::default`].
+fn resolve_config(explicit: Option<&Path>) -> Result<Config, String> {
+    let (text, name) = match explicit {
+        Some(path) => {
+            let s =
+                std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            (s, path.display().to_string())
+        }
+        None => match std::fs::read_to_string(DEFAULT_CONFIG) {
+            Ok(s) => (s, DEFAULT_CONFIG.to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
+            Err(e) => return Err(format!("{DEFAULT_CONFIG}: {e}")),
+        },
+    };
+    let file: ConfigFile = toml::from_str(&text).map_err(|e| format!("{name}: {e}"))?;
+    let default = Config::default();
+    let config = Config {
+        indent_width: file.indent.unwrap_or(default.indent_width),
+        max_width: file.max_width.unwrap_or(default.max_width),
+    };
+    if config.max_width == 0 {
+        return Err(format!("{name}: max_width must be at least 1"));
+    }
+    Ok(config)
 }
 
 fn main() -> ExitCode {
@@ -39,7 +88,13 @@ fn main() -> ExitCode {
 }
 
 fn run_format(args: FormatArgs) -> ExitCode {
-    let config = Config::default();
+    let config = match resolve_config(args.config.as_deref()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
     if args.files.is_empty() {
         return format_stdin(args.check, &config);
     }

@@ -10,3 +10,5 @@ logos = { version = "0.15.1" }
 logosky = { version = "0.2" }
 scarpet-fmt = { path = "./scarpet-fmt" }
 scarpet-syntax = { path = "./scarpet-syntax" }
+serde = { version = "1", features = ["derive"] }
+toml = { version = "1" }
