@@ -41,20 +41,16 @@ fn render_top(doc: doc::Doc, config: &Config) -> String {
 /// An error produced while formatting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FmtError {
-    /// The source failed to parse.
-    Parse(ParseError),
+    /// The source failed to parse. Boxed because [`ParseError`] is large and
+    /// this is the cold path (keeps `Result`'s `Ok` arm cheap).
+    Parse(Box<ParseError>),
 }
 
 impl std::fmt::Display for FmtError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FmtError::Parse(e) => {
-                write!(
-                    f,
-                    "parse error at byte {}: {}",
-                    e.span.start,
-                    e.kind.message()
-                )
+                write!(f, "parse error at byte {}: {}", e.span.start, e.message())
             }
         }
     }

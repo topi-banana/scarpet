@@ -232,12 +232,19 @@ fn format_stdin(check: bool, deny: &[DenyWarning], config: &Config) -> ExitCode 
 /// underlines the offending span in `src`. `name` labels the source — a file
 /// path, or `<stdin>`. Colour is auto-disabled when stderr isn't a terminal.
 fn report_parse_error(name: &str, src: &str, e: &ParseError) {
-    let msg = e.kind.message();
-    let _ = Report::build(ReportKind::Error, (name, e.span.clone()))
-        .with_message(msg)
-        .with_label(Label::new((name, e.span.clone())).with_message(msg))
-        .finish()
-        .eprint((name, Source::from(src)));
+    // The title carries the full rustc-style line; the caret label is the
+    // shorter `caret_label` (an `expected …` clause or a delimiter headline).
+    // A delimiter error adds a second label at its opener; some errors a `help:`.
+    let mut report = Report::build(ReportKind::Error, (name, e.span.clone()))
+        .with_message(e.message())
+        .with_label(Label::new((name, e.span.clone())).with_message(e.caret_label()));
+    if let Some((span, label)) = &e.secondary {
+        report = report.with_label(Label::new((name, span.clone())).with_message(label));
+    }
+    if let Some(help) = &e.help {
+        report = report.with_help(help);
+    }
+    let _ = report.finish().eprint((name, Source::from(src)));
 }
 
 /// Print a rustfmt-style unified diff of `src` (the original) against
