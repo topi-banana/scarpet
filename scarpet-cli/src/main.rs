@@ -448,4 +448,32 @@ mod tests {
         let err = parse_config("brace_style = \"allman\"", "x").unwrap_err();
         assert!(err.contains("brace_style"), "{err}");
     }
+
+    #[test]
+    fn repl_ignores_blank_lines() {
+        // Pressing Enter at an empty prompt must not report an error, even
+        // though an empty program does not parse.
+        assert!(check_line("").is_none());
+        assert!(check_line("   ").is_none());
+        assert!(check_line("\t  ").is_none());
+    }
+
+    #[test]
+    fn repl_accepts_valid_statements() {
+        assert!(check_line("print('Hello World!')").is_none());
+        assert!(check_line("a = 5").is_none());
+        assert!(check_line("foo(a, b) -> a + b").is_none());
+        // A lone trailing `;` is lenient, and several `;`-separated statements
+        // on one line are a single valid program.
+        assert!(check_line("a = 5;").is_none());
+        assert!(check_line("a; b; c").is_none());
+    }
+
+    #[test]
+    fn repl_reports_parse_errors() {
+        // Incomplete input (ends mid-expression) and stray tokens both fail.
+        assert!(check_line("1 +").is_some());
+        assert!(check_line(")").is_some());
+        assert!(check_line("print(").is_some());
+    }
 }
