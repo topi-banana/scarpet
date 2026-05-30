@@ -82,16 +82,17 @@ The style is configurable through a TOML file: `scarpet format` reads `scarpet-f
 # scarpet-fmt.toml
 indent = 4                # indentation width, in spaces
 max_width = 100           # line-length target before a group breaks
+comment_width = -1        # comment line-length target; -1 disables wrapping
 line_ending = "lf"        # newline style: "lf" (Unix, default) or "crlf" (Windows)
 brace_style = "same_line" # opening delimiter of a broken block: "same_line" (default) or "next_line"
 ```
 
-Unknown keys, `max_width = 0`, a `line_ending` other than `"lf"` or `"crlf"`, and a `brace_style` other than `"same_line"` or `"next_line"` are rejected. Beyond these knobs the layout is fixed. Highlights:
+Unknown keys, `max_width = 0`, `comment_width = 0` or less than `-1`, a `line_ending` other than `"lf"` or `"crlf"`, and a `brace_style` other than `"same_line"` or `"next_line"` are rejected. Beyond these knobs the layout is fixed. Highlights:
 
 - Binary operators are spaced (`a + b`, `a -> b`), except `:` (get), which is tight: `a:b`. Unary prefixes hug their operand: `-x`, `!x`, `...xs`.
 - `;` statement sequences are laid out one per line, each terminated with `;`. A parenthesized `;`-chain becomes an indented block.
 - Lists, maps, and call arguments stay on one line when they fit, otherwise break to one item per line with a trailing comma.
-- Comments are preserved. A comment on its own line stays on its own line; a trailing comment stays on the line it followed. Runs of blank lines collapse to a single blank line.
+- Comments are preserved. A comment on its own line stays on its own line; a trailing comment stays on the line it followed. When `comment_width` is positive, long `//` comments wrap to that width; `-1` leaves them unwrapped. Runs of blank lines collapse to a single blank line.
 - Output always ends in exactly one newline, with no trailing whitespace.
 
 ```sc
