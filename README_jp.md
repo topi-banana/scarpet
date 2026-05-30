@@ -56,8 +56,11 @@ echo "print('hi')" | cargo run -p scarpet-cli -- format
 # ファイルをその場で書き換え
 cargo run -p scarpet-cli -- format --in-place src/*.sc
 
-# 書き込まずに整形済みかどうかを確認（差分があれば非ゼロ終了）
+# 書き込まずに整形済みかどうかを確認（未整形ファイルごとに差分を表示）
 cargo run -p scarpet-cli -- format --check src/*.sc
+
+# 同上、ただし差分があれば非ゼロ終了（CI 向け）。clippy の `-D warnings` と同じ要領
+cargo run -p scarpet-cli -- format --check -D warnings src/*.sc
 
 # 設定ファイルを明示指定して整形（指定しなければカレントの scarpet-fmt.toml を使用）
 cargo run -p scarpet-cli -- format --config scarpet-fmt.toml script.sc
@@ -69,7 +72,7 @@ cargo run -p scarpet-cli -- format --config scarpet-fmt.toml script.sc
 cargo install --path scarpet-cli   # `scarpet-cli` がインストールされます
 ```
 
-終了コード: `0` 成功、`1` 解析エラーまたは `--check` 失敗、`2` 入出力または設定エラー。
+終了コード: `0` 成功（`--check` で差分のあるファイルを含む。既定では差分を表示するだけで失敗しません）、`1` 解析エラー、または `-D warnings` 指定時の `--check` の差分、`2` 入出力または設定エラー。
 
 ### 整形スタイル
 
@@ -108,12 +111,7 @@ foo() -> (
 
 [`example/`](example) はコミュニティ製の Scarpet リポジトリ 9 つを git サブモジュールとして取り込んでおり、合計 220 個の `.sc` ファイルがあります。これらは 2 つの用途で使われます。
 
-- **解析率（parse rate）。** スタンドアロンのランナーが全ファイルを解析し、成功数を報告します。これはゲートではなく進捗の指標です（常に 0 で終了します。既知の上流側の構文エラー 3 件はランナー内に列挙されています）。
-
-  ```sh
-  cargo run -p scarpet-syntax --bin corpus            # 人間向けの要約
-  cargo run -p scarpet-syntax --bin corpus -- --markdown   # CI/PR 用 Markdown レポート
-  ```
+- **解析率（parse rate）。** CI の `format parse` ステップが全ファイルを整形し、解析できた数を報告します。これはゲートではなく進捗の指標です（常に成功します。既知の上流側の構文エラーが数件あります）。
 
 - **フォーマッタの安全性。** テスト（`scarpet-fmt` の `corpus` モジュール）が解析可能な全ファイルを整形し、結果が構造的に等しい木に再解析されること、かつ冪等であることを検証します。サブモジュールが未チェックアウトの場合は静かにスキップします。
 

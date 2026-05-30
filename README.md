@@ -56,8 +56,11 @@ echo "print('hi')" | cargo run -p scarpet-cli -- format
 # Rewrite files in place
 cargo run -p scarpet-cli -- format --in-place src/*.sc
 
-# Check formatting without writing (non-zero exit if any file differs)
+# Check formatting without writing — prints a diff for each unformatted file
 cargo run -p scarpet-cli -- format --check src/*.sc
+
+# Same, but exit non-zero when any file differs (for CI), like clippy's `-D warnings`
+cargo run -p scarpet-cli -- format --check -D warnings src/*.sc
 
 # Format with an explicit config file (otherwise scarpet-fmt.toml in the cwd is used)
 cargo run -p scarpet-cli -- format --config scarpet-fmt.toml script.sc
@@ -69,7 +72,7 @@ Install it as a standalone binary:
 cargo install --path scarpet-cli   # installs `scarpet-cli`
 ```
 
-Exit codes: `0` success, `1` a parse error or a failed `--check`, `2` an I/O or configuration error.
+Exit codes: `0` success — including unformatted files under `--check`, which print a diff but do not fail by default; `1` a parse error, or a `--check` difference when `-D warnings` is set; `2` an I/O or configuration error.
 
 ### Formatting style
 
@@ -108,12 +111,7 @@ The formatter is **non-destructive** (re-parsing its output yields a structurall
 
 [`example/`](example) vendors nine community Scarpet repositories as git submodules — 220 `.sc` files in total. They are used two ways:
 
-- **Parse rate.** A standalone runner parses every file and reports how many succeed. It is a progress metric, not a gate (it always exits 0; the three known upstream syntax errors are listed in the runner).
-
-  ```sh
-  cargo run -p scarpet-syntax --bin corpus            # human-readable summary
-  cargo run -p scarpet-syntax --bin corpus -- --markdown   # CI/PR Markdown report
-  ```
+- **Parse rate.** CI's `format parse` step formats every file and reports how many parse. It is a progress metric, not a gate (it always succeeds; a few known upstream syntax errors are expected).
 
 - **Formatter safety.** A test (`scarpet-fmt`'s `corpus` module) formats every parseable file and asserts the result re-parses to a structurally equal tree and is idempotent. It skips quietly if the submodules are not checked out.
 
