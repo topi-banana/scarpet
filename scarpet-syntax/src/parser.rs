@@ -1,9 +1,12 @@
 use crate::lexer::{Token, TokenKind};
-use chumsky::{extra, prelude::*, recursive::Recursive};
+use chumsky::{
+    error::RichPattern, extra, label::LabelError, prelude::*, recursive::Recursive, util::MaybeRef,
+};
 use logosky::{Lexed, utils::Span};
 
 type TokenStream<'s> = logosky::TokenStream<'s, Token<'s>>;
-type Extra<'s> = extra::Err<Rich<'s, Lexed<'s, Token<'s>>, Span>>;
+type RichErr<'s> = Rich<'s, Lexed<'s, Token<'s>>, Span>;
+type Extra<'s> = extra::Err<RichErr<'s>>;
 type BoxedP<'s, O> = Boxed<'s, 's, TokenStream<'s>, O, Extra<'s>>;
 
 // ====================================================================
@@ -127,27 +130,60 @@ pub struct LexError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
-    pub kind: ParseErrorKind,
-    /// Byte range of the offending token. Empty (`len..len`) at end of input.
+    /// Byte range the caret points at — the offending token, or `len..len` at
+    /// end of input.
     pub span: std::ops::Range<usize>,
+    /// What the parser expected at `span`, as display-ready labels — concrete
+    /// tokens carry back-ticks (`` `,` ``), higher-level patterns read as prose
+    /// (`expression`, `end of input`). De-duplicated, in chumsky's order; empty
+    /// when the parser had nothing specific to offer.
+    pub expected: Vec<String>,
+    /// Source text of the offending token, or `None` at end of input.
+    pub found: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ParseErrorKind {
-    UnexpectedToken,
-    UnexpectedEof,
-    Trailing,
-}
-
-impl ParseErrorKind {
-    /// Human-readable description of the error kind, shared by the corpus
-    /// reporter and the CLI's ariadne diagnostics.
-    pub fn message(&self) -> &'static str {
-        match self {
-            ParseErrorKind::UnexpectedToken => "unexpected token",
-            ParseErrorKind::UnexpectedEof => "unexpected end of input",
-            ParseErrorKind::Trailing => "trailing input",
+impl ParseError {
+    /// The `expected …` clause on its own (no `found`), or `None` when the
+    /// parser had nothing specific to expect. Reads as ``expected `,` ``,
+    /// ``expected `(` or `[` ``, or ``expected one of `,`, `;`, or `]` ``. This
+    /// is what the CLI prints at the caret, where the `found` token already sits.
+    pub fn expected_phrase(&self) -> Option<String> {
+        use std::fmt::Write as _;
+        let mut m = String::new();
+        match self.expected.as_slice() {
+            [] => return None,
+            [a] => {
+                let _ = write!(m, "expected {a}");
+            }
+            [a, b] => {
+                let _ = write!(m, "expected {a} or {b}");
+            }
+            [rest @ .., last] => {
+                m.push_str("expected one of ");
+                for e in rest {
+                    let _ = write!(m, "{e}, ");
+                }
+                let _ = write!(m, "or {last}");
+            }
         }
+        Some(m)
+    }
+
+    /// A one-line, rustc-style summary, e.g. ``expected one of `,`, or `]`,
+    /// found `2` ``. Shared by the CLI's ariadne diagnostic and `FmtError`'s
+    /// `Display`; falls back to `unexpected token` when nothing is known.
+    pub fn message(&self) -> String {
+        use std::fmt::Write as _;
+        let Some(mut m) = self.expected_phrase() else {
+            return "unexpected token".to_string();
+        };
+        match &self.found {
+            Some(found) => {
+                let _ = write!(m, ", found `{found}`");
+            }
+            None => m.push_str(", found end of input"),
+        }
+        m
     }
 }
 
@@ -158,14 +194,60 @@ pub fn parse_source(src: &str) -> Result<Cst<'_>, ParseError> {
         Ok(cst) => Ok(cst),
         Err(errs) => {
             let err = errs.into_iter().next().unwrap();
-            let span = err.span().start()..err.span().end();
-            let kind = if span.start >= len {
-                ParseErrorKind::UnexpectedEof
-            } else {
-                ParseErrorKind::UnexpectedToken
+            // Prefer the offending token's own span: chumsky's error span can
+            // begin at the *previous* token's end, folding the inter-token
+            // whitespace into `found`. Lex errors / EOF keep the raw span.
+            let span = match err.found() {
+                Some(Lexed::Token(s)) => s.span.range(),
+                _ => err.span().start()..err.span().end(),
             };
-            Err(ParseError { kind, span })
+            // A span that starts at end-of-input means EOF (no `found` token);
+            // otherwise lift the offending token's text out of `src`.
+            let found = (span.start < len).then(|| src[span.clone()].to_string());
+            Err(ParseError {
+                span,
+                expected: collect_expected(&err),
+                found,
+            })
         }
+    }
+}
+
+/// Lower the expected-patterns of a chumsky `Rich` error into display-ready,
+/// de-duplicated labels. Concrete tokens come back back-ticked via
+/// [`kind_label`]; higher-level patterns (from `.labelled(...)`) read as prose.
+/// `Any` / `SomethingElse` carry nothing worth showing and are dropped.
+fn collect_expected(err: &RichErr<'_>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for pat in err.expected() {
+        let label = match pat {
+            RichPattern::Token(t) => token_label(t).map(str::to_string),
+            RichPattern::Label(l) => Some(l.to_string()),
+            RichPattern::Identifier(i) => Some(format!("`{i}`")),
+            RichPattern::EndOfInput => Some("end of input".to_string()),
+            _ => None,
+        };
+        if let Some(label) = label
+            && !out.contains(&label)
+        {
+            out.push(label);
+        }
+    }
+    // A position that accepts an `expression` also accepts the prefix operators
+    // that begin one (`-`, `!`, …), so listing `an operator` next to it is just
+    // noise — drop it.
+    if out.iter().any(|s| s == "expression") {
+        out.retain(|s| s != "an operator");
+    }
+    out
+}
+
+/// The back-ticked display label for a concrete expected token, or `None` for
+/// a lex-error placeholder.
+fn token_label<'s>(t: &MaybeRef<'s, Lexed<'s, Token<'s>>>) -> Option<&'static str> {
+    match &**t {
+        Lexed::Token(s) => Some(kind_label(logosky::Token::kind(&s.data))),
+        Lexed::Error(_) => None,
     }
 }
 
@@ -314,7 +396,9 @@ fn top_parser<'s>() -> BoxedP<'s, Cst<'s>> {
                 kind: CstKind::Map(args),
             });
 
-        choice((number, string, ident_or_call, paren, list, map)).boxed()
+        choice((number, string, ident_or_call, paren, list, map))
+            .labelled("expression")
+            .boxed()
     };
 
     let get = primary
@@ -734,21 +818,26 @@ fn leading_trivia<'s>() -> BoxedP<'s, Vec<Trivia<'s>>> {
     .boxed()
 }
 
-/// Match a token kind, returning its leading trivia.
+/// Match a token kind, returning its leading trivia. On mismatch the failure is
+/// labelled with the kind's spelling, so that `choice`/`foldl` can union the
+/// alternatives into an `expected one of …` set (see [`kind_label`]).
 fn kind<'s>(k: TokenKind) -> BoxedP<'s, Vec<Trivia<'s>>> {
     leading_trivia()
         .then(
-            any().try_map(move |tok: Lexed<'s, Token<'s>>, span: Span| match tok {
-                Lexed::Token(t) if logosky::Token::kind(&t.data) == k => Ok(()),
-                _ => Err(Rich::custom(span, "unexpected token")),
-            }),
+            any()
+                .try_map(move |tok: Lexed<'s, Token<'s>>, span: Span| match tok {
+                    Lexed::Token(t) if logosky::Token::kind(&t.data) == k => Ok(()),
+                    other => Err(unexpected(other, span)),
+                })
+                .labelled(kind_label(k)),
         )
         .map(|(leading, _)| leading)
         .boxed()
 }
 
 /// Match a token and project a value from it, returning the leading trivia
-/// alongside.
+/// alongside. Callers that want a friendly expectation wrap this in
+/// `.labelled(...)` — e.g. the `primary` choice is labelled `expression`.
 fn tok_matching<'s, T: 's, F>(f: F) -> BoxedP<'s, (Vec<Trivia<'s>>, T)>
 where
     F: Fn(Token<'s>) -> Option<T> + Clone + 's,
@@ -756,11 +845,71 @@ where
     leading_trivia()
         .then(
             any().try_map(move |tok: Lexed<'s, Token<'s>>, span: Span| match tok {
-                Lexed::Token(t) => f(t.data).ok_or_else(|| Rich::custom(span, "unexpected token")),
-                _ => Err(Rich::custom(span, "unexpected token")),
+                Lexed::Token(t) => f(t.data).ok_or_else(|| unexpected(Lexed::Token(t), span)),
+                other => Err(unexpected(other, span)),
             }),
         )
         .boxed()
+}
+
+/// A `Rich` error reporting `found` where it was not expected, leaving the
+/// expected-set empty for a wrapping `.labelled(...)` to fill in. Built by hand
+/// because the trivia-peeling matchers above can't use chumsky's own
+/// `just`/`select` (which would synthesise this automatically).
+fn unexpected<'s>(found: Lexed<'s, Token<'s>>, span: Span) -> RichErr<'s> {
+    <RichErr<'s> as LabelError<'s, TokenStream<'s>, RichPattern<'s, Lexed<'s, Token<'s>>>>>::expected_found(
+        core::iter::empty(),
+        Some(MaybeRef::Val(found)),
+        span,
+    )
+}
+
+/// The display label for a token kind in `expected …` messages. Delimiters and
+/// separators are shown literally (`` `,` ``, `` `]` ``); the whole operator
+/// ladder collapses to a single `an operator`, so a position that accepts any
+/// of ~20 operators doesn't spell them all out; literals read as prose.
+fn kind_label(k: TokenKind) -> &'static str {
+    match k {
+        // Delimiters & separators — shown literally.
+        TokenKind::OpenParen => "`(`",
+        TokenKind::CloseParen => "`)`",
+        TokenKind::OpenBrack => "`[`",
+        TokenKind::CloseBrack => "`]`",
+        TokenKind::OpenBrace => "`{`",
+        TokenKind::CloseBrace => "`}`",
+        TokenKind::Comma => "`,`",
+        TokenKind::SemiColon => "`;`",
+        TokenKind::Dot => "`.`",
+        // Literals / words.
+        TokenKind::Number => "number",
+        TokenKind::String => "string",
+        TokenKind::Ident => "identifier",
+        TokenKind::Break => "line break",
+        TokenKind::Comment => "comment",
+        // The entire precedence ladder collapses to one label.
+        TokenKind::Arrow
+        | TokenKind::Assign
+        | TokenKind::AddAssign
+        | TokenKind::Swap
+        | TokenKind::Add
+        | TokenKind::Sub
+        | TokenKind::Mul
+        | TokenKind::Div
+        | TokenKind::Rem
+        | TokenKind::Pow
+        | TokenKind::EqEq
+        | TokenKind::BangEq
+        | TokenKind::Lt
+        | TokenKind::LtEq
+        | TokenKind::Gt
+        | TokenKind::GtEq
+        | TokenKind::And
+        | TokenKind::Or
+        | TokenKind::Bang
+        | TokenKind::Tilde
+        | TokenKind::Colon
+        | TokenKind::Ellipsis => "an operator",
+    }
 }
 
 // --- helpers --------------------------------------------------------
@@ -1216,6 +1365,66 @@ mod tests {
                 assert_eq!(operand.kind, CstKind::Ident("x"));
             }
             other => panic!("expected Unary(Not, _), got {other:?}"),
+        }
+    }
+
+    // ----- error-message tests ------------------------------------------
+
+    /// Where an operand is due but input ends, the message names the missing
+    /// `expression` and reports EOF — not a bare "unexpected token".
+    #[test]
+    fn error_expected_expression_at_eof() {
+        let e = parse_source("1 +").unwrap_err();
+        assert_eq!(e.found, None);
+        assert_eq!(e.expected, ["expression"]);
+        assert_eq!(e.message(), "expected expression, found end of input");
+    }
+
+    /// The `found` span covers exactly the offending token, not the leading
+    /// whitespace that chumsky's raw error span would fold in.
+    #[test]
+    fn error_found_span_is_the_token() {
+        let src = "[0, 1 2]";
+        let e = parse_source(src).unwrap_err();
+        assert_eq!(&src[e.span.clone()], "2");
+        assert_eq!(e.found.as_deref(), Some("2"));
+        assert_eq!(e.message(), "expected an operator or `]`, found `2`");
+    }
+
+    /// A wrong closing delimiter names the one that was actually due.
+    #[test]
+    fn error_mismatched_delimiter_names_expected_closer() {
+        let e = parse_source("[)").unwrap_err();
+        assert_eq!(e.found.as_deref(), Some(")"));
+        assert_eq!(e.message(), "expected `]`, found `)`");
+    }
+
+    /// The ~20 infix/prefix operators collapse to one `an operator` rather than
+    /// being spelled out across the whole precedence ladder.
+    #[test]
+    fn error_operator_ladder_collapses() {
+        let e = parse_source("1 2").unwrap_err();
+        assert!(e.message().contains("an operator"), "{}", e.message());
+        assert!(!e.message().contains("`*`"), "{}", e.message());
+    }
+
+    /// Exactly two expectations join with `or` (no `one of`).
+    #[test]
+    fn error_two_expectations_join_with_or() {
+        let e = parse_source("{1").unwrap_err();
+        assert_eq!(
+            e.message(),
+            "expected an operator or `}`, found end of input"
+        );
+    }
+
+    /// Every parse failure yields a non-empty, specific message.
+    #[test]
+    fn error_message_is_never_empty() {
+        for src in ["", "1 +", "[)", "1 2", "{", "((", "f(,,", ")"] {
+            if let Err(e) = parse_source(src) {
+                assert!(!e.message().is_empty(), "empty message for {src:?}");
+            }
         }
     }
 }

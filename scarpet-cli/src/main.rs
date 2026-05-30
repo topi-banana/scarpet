@@ -218,10 +218,14 @@ fn format_stdin(check: bool, deny: &[DenyWarning], config: &Config) -> ExitCode 
 /// underlines the offending span in `src`. `name` labels the source — a file
 /// path, or `<stdin>`. Colour is auto-disabled when stderr isn't a terminal.
 fn report_parse_error(name: &str, src: &str, e: &ParseError) {
-    let msg = e.kind.message();
+    // The title carries the full rustc-style line; the caret label shows just
+    // the `expected …` clause, since the `found` token already sits under it.
+    let label = e
+        .expected_phrase()
+        .unwrap_or_else(|| "unexpected token".to_string());
     let _ = Report::build(ReportKind::Error, (name, e.span.clone()))
-        .with_message(msg)
-        .with_label(Label::new((name, e.span.clone())).with_message(msg))
+        .with_message(e.message())
+        .with_label(Label::new((name, e.span.clone())).with_message(label))
         .finish()
         .eprint((name, Source::from(src)));
 }

@@ -49,12 +49,7 @@ impl std::fmt::Display for FmtError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FmtError::Parse(e) => {
-                write!(
-                    f,
-                    "parse error at byte {}: {}",
-                    e.span.start,
-                    e.kind.message()
-                )
+                write!(f, "parse error at byte {}: {}", e.span.start, e.message())
             }
         }
     }
