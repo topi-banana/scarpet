@@ -4,8 +4,15 @@ use std::process::ExitCode;
 
 use ariadne::{Label, Report, ReportKind, Source};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use rustyline::completion::Completer;
+use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::history::DefaultHistory;
+use rustyline::validate::{ValidationContext, ValidationResult, Validator};
+use rustyline::{Editor, EventHandler, Helper, KeyCode, KeyEvent, Modifiers};
 use scarpet_fmt::{BraceStyle, Config, FmtError, LineEnding, format_source};
-use scarpet_syntax::parser::{ParseError, parse_source};
+use scarpet_syntax::parser::{ParseError, has_open_delimiter, parse_source};
 use serde::Deserialize;
 use similar::{ChangeTag, TextDiff};
 
@@ -21,7 +28,7 @@ enum Cmd {
     /// Format Scarpet source.
     Format(FormatArgs),
     /// Start an interactive parse-only REPL: read a statement, report any
-    /// parse error, then prompt again. Exits on Ctrl+D or Ctrl+C.
+    /// parse error, then prompt again. Exits on Ctrl+D.
     Repl,
 }
 
@@ -244,40 +251,106 @@ fn format_stdin(check: bool, deny: &[DenyWarning], config: &Config) -> ExitCode 
     }
 }
 
-/// Run an interactive parse-only REPL. Reads one statement per line, parses it
-/// with [`parse_source`], and prints a diagnostic for any parse error — and
-/// nothing at all on success. There is no evaluator; this only checks that each
-/// entered statement is syntactically valid.
+/// Run an interactive parse-only REPL. Reads one statement per submission,
+/// parses it with [`parse_source`], and prints a diagnostic for any parse error
+/// — and nothing at all on success. There is no evaluator; this only checks
+/// that each entered statement is syntactically valid.
 ///
-/// The loop ends on end-of-input (Ctrl+D) or when interrupted (Ctrl+C, which
-/// terminates the process via the default SIGINT handler). The prompt and
-/// banner go to stderr and are suppressed when stdin is not a terminal (piped
-/// input), so a command like `echo '1+' | scarpet repl` emits only diagnostics.
+/// On a terminal, input is read through `rustyline` for line editing and an
+/// in-session command history; see [`run_repl_interactive`]. When stdin is not a
+/// terminal (piped or redirected input), it falls back to a plain line reader
+/// with no prompt or banner — so `echo '1+' | scarpet repl` emits only
+/// diagnostics; see [`run_repl_piped`].
 fn run_repl() -> ExitCode {
+    if std::io::stdin().is_terminal() {
+        run_repl_interactive()
+    } else {
+        run_repl_piped()
+    }
+}
+
+/// The terminal REPL, backed by `rustyline` for line editing and an up/down
+/// command history. The history is kept only for the session — it is not
+/// written to disk.
+///
+/// A submission may span several lines. The [`ScarpetHelper`] validator holds a
+/// submission open while its brackets are unbalanced, so a plain Enter inside an
+/// open `(`/`[`/`{` starts a new line and only submits once they close.
+/// Shift+Enter — and Alt+Enter, its fallback on terminals that send the same
+/// bytes for Enter and Shift+Enter — forces a newline even when the brackets
+/// already balance.
+///
+/// Ctrl+C abandons the input in progress and prompts again; Ctrl+D (or end of
+/// input) exits.
+fn run_repl_interactive() -> ExitCode {
+    let mut rl: Editor<ScarpetHelper, DefaultHistory> = match Editor::new() {
+        Ok(rl) => rl,
+        Err(e) => {
+            eprintln!("repl: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    // The helper's `Validator` keeps a submission open while its brackets are
+    // unbalanced, so a parenthesized block can span several lines.
+    rl.set_helper(Some(ScarpetHelper));
+    // Also bind Shift+Enter (and Alt+Enter, its fallback on terminals that send
+    // the same bytes for Enter and Shift+Enter) to insert a newline regardless,
+    // so a newline can be forced even when the brackets already balance.
+    rl.bind_sequence(
+        KeyEvent(KeyCode::Enter, Modifiers::SHIFT),
+        EventHandler::Simple(rustyline::Cmd::Newline),
+    );
+    rl.bind_sequence(
+        KeyEvent(KeyCode::Enter, Modifiers::ALT),
+        EventHandler::Simple(rustyline::Cmd::Newline),
+    );
+    eprintln!(
+        "Scarpet REPL (parse-only). Enter submits (continuing while brackets are \
+         open); Shift+Enter or Alt+Enter forces a newline; Ctrl+D exits."
+    );
+    loop {
+        match rl.readline("scarpet> ") {
+            Ok(line) => {
+                // `rustyline` returns the line without its trailing newline.
+                // Blank submissions are ignored and kept out of the history,
+                // matching the piped path and Python's REPL.
+                if line.trim().is_empty() {
+                    continue;
+                }
+                // Record every non-blank submission, valid or not, so the
+                // history mirrors exactly what was typed.
+                let _ = rl.add_history_entry(line.as_str());
+                if let Some(e) = check_line(&line) {
+                    report_parse_error("<repl>", &line, &e);
+                }
+            }
+            // Ctrl+C: discard the current line and prompt again.
+            Err(ReadlineError::Interrupted) => continue,
+            // Ctrl+D or end of input: leave the REPL.
+            Err(ReadlineError::Eof) => return ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("repl: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+}
+
+/// The non-terminal REPL: a plain line reader for piped or redirected stdin,
+/// with no prompt or banner. Reads one statement per line and reports parse
+/// errors, so `echo '1+' | scarpet repl` emits only diagnostics. Ends at
+/// end-of-input.
+fn run_repl_piped() -> ExitCode {
     use std::io::BufRead as _;
 
-    let interactive = std::io::stdin().is_terminal();
-    if interactive {
-        eprintln!("Scarpet REPL (parse-only). Press Ctrl+D or Ctrl+C to exit.");
-    }
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     let mut line = String::new();
     loop {
-        if interactive {
-            // stderr is unbuffered, so the prompt shows before `read_line`
-            // blocks — no explicit flush needed.
-            eprint!("scarpet> ");
-        }
         line.clear();
         match input.read_line(&mut line) {
-            // End of input (Ctrl+D): finish the prompt line and leave.
-            Ok(0) => {
-                if interactive {
-                    eprintln!();
-                }
-                return ExitCode::SUCCESS;
-            }
+            // End of input.
+            Ok(0) => return ExitCode::SUCCESS,
             Ok(_) => {
                 let src = line.trim_end_matches(['\n', '\r']);
                 if let Some(e) = check_line(src) {
@@ -301,6 +374,42 @@ fn check_line(src: &str) -> Option<ParseError> {
         return None;
     }
     parse_source(src).err().map(|e| *e)
+}
+
+/// A `rustyline` helper whose only customization is multi-line continuation: its
+/// [`Validator`] holds a submission open while the input has unclosed brackets,
+/// so a block spanning several lines is entered as a single submission.
+/// Completion, hinting, and highlighting are left at their no-op defaults.
+struct ScarpetHelper;
+
+impl Completer for ScarpetHelper {
+    type Candidate = String;
+}
+impl Hinter for ScarpetHelper {
+    type Hint = String;
+}
+impl Highlighter for ScarpetHelper {}
+impl Helper for ScarpetHelper {}
+
+impl Validator for ScarpetHelper {
+    fn validate(&self, ctx: &mut ValidationContext) -> rustyline::Result<ValidationResult> {
+        if input_incomplete(ctx.input()) {
+            Ok(ValidationResult::Incomplete)
+        } else {
+            Ok(ValidationResult::Valid(None))
+        }
+    }
+}
+
+/// Whether `src` is an unfinished submission the REPL should keep open for more
+/// input instead of parsing now: true while a `(`/`[`/`{` is still unclosed.
+/// Delegates to [`has_open_delimiter`], which runs the Scarpet lexer, so a
+/// bracket inside a `'…'` string or a `//` comment never counts. A surplus
+/// *closing* bracket is not treated as incomplete — the input is submitted so
+/// the parser can report it. Anything else that should span lines can still be
+/// continued with Shift+Enter / Alt+Enter.
+fn input_incomplete(src: &str) -> bool {
+    has_open_delimiter(src)
 }
 
 /// Render a parse error to stderr as a rustc-style ariadne diagnostic that
@@ -510,5 +619,31 @@ mod tests {
         assert!(check_line("1 +").is_some());
         assert!(check_line(")").is_some());
         assert!(check_line("print(").is_some());
+    }
+
+    #[test]
+    fn repl_continues_while_brackets_open() {
+        // An unclosed bracket keeps the submission open for another line.
+        assert!(input_incomplete("foo("));
+        assert!(input_incomplete("[1, 2,"));
+        assert!(input_incomplete("foo() -> ("));
+        // Balanced input is complete and ready to submit.
+        assert!(!input_incomplete("foo()"));
+        assert!(!input_incomplete("a = 5"));
+        assert!(!input_incomplete("(a + b) * [c]"));
+        // A surplus close is submitted, not held open, so the parser reports it.
+        assert!(!input_incomplete("a)"));
+    }
+
+    #[test]
+    fn repl_ignores_brackets_in_strings_and_comments() {
+        // A bracket inside a string literal doesn't count toward the depth.
+        assert!(!input_incomplete("print('(')"));
+        assert!(!input_incomplete("a = ')['"));
+        // Brackets after `//` are a comment and are ignored.
+        assert!(!input_incomplete("foo() // (open"));
+        // A multi-line string is still held open by its enclosing bracket, so a
+        // string can be continued onto the next line inside a call.
+        assert!(input_incomplete("print('hello"));
     }
 }

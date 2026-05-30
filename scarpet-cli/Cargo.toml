@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 ariadne.workspace = true
 clap.workspace = true
+rustyline.workspace = true
 scarpet-fmt.workspace = true
 scarpet-syntax.workspace = true
 serde.workspace = true
