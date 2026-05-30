@@ -10,8 +10,6 @@
 
 use std::borrow::Cow;
 
-use crate::config::INDENT;
-
 #[derive(Debug, Clone)]
 pub enum Doc {
     /// Empty document.
@@ -30,7 +28,8 @@ pub enum Doc {
     IfBreak(Box<Doc>, Box<Doc>),
     /// A sequence of documents.
     Concat(Vec<Doc>),
-    /// Increase the indent of the contained document by `n` spaces.
+    /// Increase the indent of the contained document by `n` levels; each level
+    /// is `indent_width` spaces, applied at render time.
     Nest(isize, Box<Doc>),
     /// A group: rendered flat if it fits the remaining width, else broken.
     Group(Box<Doc>),
@@ -80,9 +79,10 @@ pub fn group(d: Doc) -> Doc {
     Doc::Group(Box::new(d))
 }
 
-/// Indent the contained document by one step ([`INDENT`]).
+/// Indent the contained document by one level. A level's width in spaces is
+/// supplied at render time, so this builder is style-agnostic.
 pub fn nest(d: Doc) -> Doc {
-    Doc::Nest(INDENT, Box::new(d))
+    Doc::Nest(1, Box::new(d))
 }
 
 /// Concatenate documents, dropping `Nil`s and collapsing the trivial cases.
@@ -111,9 +111,11 @@ pub fn join(items: impl IntoIterator<Item = Doc>, sep: Doc) -> Doc {
 }
 
 impl Doc {
-    /// Render at the given target width. Each line is right-trimmed; the result
-    /// carries no enforced trailing newline (the caller appends one).
-    pub fn render(&self, width: usize) -> String {
+    /// Render at the given target width, indenting each level by `indent_width`
+    /// spaces. Each line is right-trimmed; the result carries no enforced
+    /// trailing newline (the caller appends one).
+    pub fn render(&self, width: usize, indent_width: usize) -> String {
+        let step = indent_width as isize;
         let mut out = String::new();
         let mut col: isize = 0;
         // Work stack of (indent, mode, doc), processed LIFO.
@@ -159,7 +161,7 @@ impl Doc {
                         stack.push((indent, mode, p));
                     }
                 }
-                Doc::Nest(n, d) => stack.push((indent + n, mode, d)),
+                Doc::Nest(n, d) => stack.push((indent + n * step, mode, d)),
                 Doc::Group(d) => {
                     let m = if fits(width as isize - col, d) {
                         Mode::Flat
@@ -222,6 +224,9 @@ fn fits(mut remaining: isize, doc: &Doc) -> bool {
                     work.push(p);
                 }
             }
+            // Indentation never affects fit: a level's width is added only when
+            // broken, so the break/flat choice is independent of `indent_width`
+            // — which is what keeps formatting idempotent per config.
             Doc::Nest(_, d) => work.push(d),
             Doc::Group(d) => work.push(d),
         }
@@ -233,21 +238,25 @@ fn fits(mut remaining: isize, doc: &Doc) -> bool {
 mod tests {
     use super::*;
 
+    /// All `Doc` tests render at `indent_width = 4` to match the default style;
+    /// the expected strings bake in 4-space indentation.
+    const W: usize = 4;
+
     #[test]
     fn plain_text() {
-        assert_eq!(text("hello").render(80), "hello");
+        assert_eq!(text("hello").render(80, W), "hello");
     }
 
     #[test]
     fn group_stays_flat_when_it_fits() {
         let d = group(concat([text("a"), line(), text("b")]));
-        assert_eq!(d.render(80), "a b");
+        assert_eq!(d.render(80, W), "a b");
     }
 
     #[test]
     fn group_breaks_when_too_wide() {
         let d = group(concat([text("aaa"), line(), text("bbb")]));
-        assert_eq!(d.render(4), "aaa\nbbb");
+        assert_eq!(d.render(4, W), "aaa\nbbb");
     }
 
     #[test]
@@ -258,20 +267,20 @@ mod tests {
             softline(),
             text(")"),
         ]));
-        assert_eq!(d.clone().render(80), "(x)");
-        assert_eq!(d.render(2), "(\n    x\n)");
+        assert_eq!(d.clone().render(80, W), "(x)");
+        assert_eq!(d.render(2, W), "(\n    x\n)");
     }
 
     #[test]
     fn hardline_forces_break_even_when_it_fits() {
         let d = group(concat([text("a"), hardline(), text("b")]));
-        assert_eq!(d.render(80), "a\nb");
+        assert_eq!(d.render(80, W), "a\nb");
     }
 
     #[test]
     fn blank_line_emits_two_newlines() {
         let d = concat([text("a"), blank_line(), text("b")]);
-        assert_eq!(d.render(80), "a\n\nb");
+        assert_eq!(d.render(80, W), "a\n\nb");
     }
 
     #[test]
@@ -282,25 +291,25 @@ mod tests {
             line(),
             text("y"),
         ]));
-        assert_eq!(flat.render(80), "x y");
+        assert_eq!(flat.render(80, W), "x y");
         let broken = group(concat([
             text("xxxx"),
             if_break(text(","), nil()),
             line(),
             text("yyyy"),
         ]));
-        assert_eq!(broken.render(4), "xxxx,\nyyyy");
+        assert_eq!(broken.render(4, W), "xxxx,\nyyyy");
     }
 
     #[test]
     fn trailing_spaces_trimmed_before_newline() {
         let d = concat([text("a"), space(), hardline(), text("b")]);
-        assert_eq!(d.render(80), "a\nb");
+        assert_eq!(d.render(80, W), "a\nb");
     }
 
     #[test]
     fn join_inserts_separators() {
         let d = join([text("a"), text("b"), text("c")], text(", "));
-        assert_eq!(d.render(80), "a, b, c");
+        assert_eq!(d.render(80, W), "a, b, c");
     }
 }

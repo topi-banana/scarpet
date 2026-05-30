@@ -8,4 +8,6 @@ ariadne.workspace = true
 clap.workspace = true
 scarpet-fmt.workspace = true
 scarpet-syntax.workspace = true
+serde.workspace = true
 similar.workspace = true
+toml.workspace = true

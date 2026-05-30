@@ -9,25 +9,26 @@ mod doc;
 mod lower;
 mod trivia;
 
+pub use config::Config;
 use scarpet_syntax::parser::{Cst, ParseError, parse_source};
 
-/// Format Scarpet source text. Parses, then renders at the fixed style.
+/// Format Scarpet source text. Parses, then renders per `config`.
 ///
 /// Returns [`FmtError::Parse`] if the source does not parse.
-pub fn format_source(src: &str) -> Result<String, FmtError> {
+pub fn format_source(src: &str, config: &Config) -> Result<String, FmtError> {
     let cst = parse_source(src).map_err(FmtError::Parse)?;
-    Ok(format_cst(&cst))
+    Ok(format_cst(&cst, config))
 }
 
 /// Format an already-parsed CST. Infallible: a well-formed CST always renders.
-pub fn format_cst(cst: &Cst<'_>) -> String {
-    render_top(lower::program(cst))
+pub fn format_cst(cst: &Cst<'_>, config: &Config) -> String {
+    render_top(lower::program(cst), config)
 }
 
 /// Render a top-level document, guaranteeing the output ends in exactly one
 /// newline (with no trailing blank lines or spaces).
-fn render_top(doc: doc::Doc) -> String {
-    let mut s = doc.render(config::MAX_WIDTH);
+fn render_top(doc: doc::Doc, config: &Config) -> String {
+    let mut s = doc.render(config.max_width, config.indent_width);
     s.truncate(s.trim_end().len());
     s.push('\n');
     s
@@ -63,22 +64,24 @@ mod tests {
 
     #[test]
     fn atoms_round_trip() {
-        assert_eq!(format_source("42").unwrap(), "42\n");
-        assert_eq!(format_source("0xff").unwrap(), "0xff\n");
-        assert_eq!(format_source("'hi'").unwrap(), "'hi'\n");
-        assert_eq!(format_source("foo").unwrap(), "foo\n");
+        let cfg = Config::default();
+        assert_eq!(format_source("42", &cfg).unwrap(), "42\n");
+        assert_eq!(format_source("0xff", &cfg).unwrap(), "0xff\n");
+        assert_eq!(format_source("'hi'", &cfg).unwrap(), "'hi'\n");
+        assert_eq!(format_source("foo", &cfg).unwrap(), "foo\n");
     }
 
     #[test]
     fn parse_error_surfaces() {
-        assert!(matches!(format_source("("), Err(FmtError::Parse(_))));
+        let r = format_source("(", &Config::default());
+        assert!(matches!(r, Err(FmtError::Parse(_))));
     }
 }
 
 /// Round-trip the whole `example/` corpus to prove the formatter is safe.
 #[cfg(test)]
 mod corpus {
-    use crate::format_cst;
+    use crate::{Config, format_cst};
     use scarpet_syntax::parser::{parse_source, strip_trivia};
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
@@ -149,7 +152,7 @@ mod corpus {
                     continue;
                 }
             };
-            let formatted = format_cst(&cst1);
+            let formatted = format_cst(&cst1, &Config::default());
             let cst2 = match parse_source(&formatted) {
                 Ok(c) => c,
                 Err(e) => {
@@ -161,7 +164,7 @@ mod corpus {
                 failures.push(format!("{rel}: structure changed after formatting"));
                 continue;
             }
-            let reformatted = format_cst(&cst2);
+            let reformatted = format_cst(&cst2, &Config::default());
             if formatted != reformatted {
                 failures.push(format!("{rel}: not idempotent"));
             }

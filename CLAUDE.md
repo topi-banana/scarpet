@@ -7,7 +7,7 @@ Guidance for Claude Code when working in this repository.
 Rust tooling for **Scarpet**, the scripting language of Minecraft's Carpet mod (`.sc` files). A Cargo workspace (edition 2024) of three crates:
 
 - `scarpet-syntax` — lexer (`logos`) + parser (`chumsky` via the `logosky` bridge) → a CST that preserves comments and line breaks as **leading trivia** on each node. Also a `corpus` binary. Builds for `wasm32`.
-- `scarpet-fmt` — formatter: lowers the CST to a Wadler/Lindig pretty-printing `Doc` IR, then renders it at a fixed style.
+- `scarpet-fmt` — formatter: lowers the CST to a Wadler/Lindig pretty-printing `Doc` IR, then renders it at a style set by a `Config` (indent width, max width).
 - `scarpet-cli` — `clap` CLI (`scarpet format`). Built binary is `scarpet-cli`.
 
 Data flow: `source → lexer → parser → CST (trivia) → lower → Doc → string`. It is strictly one-directional; there is no evaluator/interpreter here.
@@ -28,7 +28,7 @@ cargo test --workspace --all-targets
 Other useful invocations:
 
 ```sh
-cargo run -p scarpet-cli -- format <file>         # format to stdout (also: --in-place, --check, stdin)
+cargo run -p scarpet-cli -- format <file>         # format to stdout (also: --in-place, --check, --config, stdin)
 cargo run -p scarpet-syntax --bin corpus          # parse-rate report (add -- --markdown for CI format)
 git submodule update --init --recursive           # fetch example/ corpus (needed for corpus tests)
 ```
@@ -48,6 +48,7 @@ CI also builds `wasm32-unknown-unknown` (only `scarpet-syntax --lib`); keep that
 - Shared dep versions live in the root `[workspace.dependencies]`; member crates reference them with `.workspace = true`.
 - The corpus parse rate is a **metric, not a gate** — the `corpus` binary always exits 0 and reports the ~3 genuinely-broken upstream files among its failures. The `scarpet-fmt` round-trip test, by contrast, *is* a gate, so it skips those same files via a `KNOWN_BAD` list (`scarpet-fmt/src/lib.rs`); keep that list current as the corpus changes.
 - Prefer adding tests next to the code (the crates use inline `#[cfg(test)] mod tests`). Match the existing style: small focused unit tests plus the corpus round-trip for breadth.
+- Formatting style is a `scarpet_fmt::Config` (indent width, max width) threaded into rendering; its `Default` reproduces the original fixed style (4-space indent, 100 columns). **TOML parsing lives in `scarpet-cli`** (`ConfigFile` → `Config`) so `scarpet-fmt` stays file-I/O-free and `wasm`-clean — add new knobs to `Config` and the CLI's `ConfigFile` together, not by reading files in the library.
 
 ## Gotchas
 
