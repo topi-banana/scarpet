@@ -1,0 +1,12 @@
+# scarpet-fmt.toml — configuration for the Scarpet formatter (`scarpet format`).
+#
+# Every key is optional; an omitted key uses the built-in default shown here.
+# `scarpet format` reads this file from the current directory, or from the path
+# passed with `--config`.
+
+# Indentation width, in spaces.
+indent = 4
+# Line-length target before a group breaks onto multiple lines.
+max_width = 100
+# Newline style for breaks the formatter inserts: "lf" (Unix) or "crlf" (Windows).
+line_ending = "crlf"

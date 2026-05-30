@@ -112,9 +112,11 @@ pub fn join(items: impl IntoIterator<Item = Doc>, sep: Doc) -> Doc {
 
 impl Doc {
     /// Render at the given target width, indenting each level by `indent_width`
-    /// spaces. Each line is right-trimmed; the result carries no enforced
-    /// trailing newline (the caller appends one).
-    pub fn render(&self, width: usize, indent_width: usize) -> String {
+    /// spaces. Breaks the formatter inserts are emitted as `line_ending` (e.g.
+    /// `"\n"` or `"\r\n"`); bytes inside `Text` nodes are left untouched. Each
+    /// line is right-trimmed; the result carries no enforced trailing newline
+    /// (the caller appends one).
+    pub fn render(&self, width: usize, indent_width: usize, line_ending: &str) -> String {
         let step = indent_width as isize;
         let mut out = String::new();
         let mut col: isize = 0;
@@ -133,23 +135,23 @@ impl Doc {
                         col += 1;
                     }
                     Mode::Break => {
-                        newline(&mut out, indent, false);
+                        newline(&mut out, indent, false, line_ending);
                         col = indent;
                     }
                 },
                 Doc::SoftLine => match mode {
                     Mode::Flat => {}
                     Mode::Break => {
-                        newline(&mut out, indent, false);
+                        newline(&mut out, indent, false, line_ending);
                         col = indent;
                     }
                 },
                 Doc::HardLine => {
-                    newline(&mut out, indent, false);
+                    newline(&mut out, indent, false, line_ending);
                     col = indent;
                 }
                 Doc::BlankLine => {
-                    newline(&mut out, indent, true);
+                    newline(&mut out, indent, true, line_ending);
                     col = indent;
                 }
                 Doc::IfBreak(broken, flat) => {
@@ -176,15 +178,15 @@ impl Doc {
     }
 }
 
-/// Append a newline (or a blank line) followed by `indent` spaces, trimming any
-/// trailing spaces from the line just finished.
-fn newline(out: &mut String, indent: isize, blank: bool) {
+/// Append the break `nl` (or a blank line: two of them) followed by `indent`
+/// spaces, trimming any trailing spaces from the line just finished.
+fn newline(out: &mut String, indent: isize, blank: bool, nl: &str) {
     while out.ends_with(' ') {
         out.pop();
     }
-    out.push('\n');
+    out.push_str(nl);
     if blank {
-        out.push('\n');
+        out.push_str(nl);
     }
     for _ in 0..indent {
         out.push(' ');
@@ -244,19 +246,19 @@ mod tests {
 
     #[test]
     fn plain_text() {
-        assert_eq!(text("hello").render(80, W), "hello");
+        assert_eq!(text("hello").render(80, W, "\n"), "hello");
     }
 
     #[test]
     fn group_stays_flat_when_it_fits() {
         let d = group(concat([text("a"), line(), text("b")]));
-        assert_eq!(d.render(80, W), "a b");
+        assert_eq!(d.render(80, W, "\n"), "a b");
     }
 
     #[test]
     fn group_breaks_when_too_wide() {
         let d = group(concat([text("aaa"), line(), text("bbb")]));
-        assert_eq!(d.render(4, W), "aaa\nbbb");
+        assert_eq!(d.render(4, W, "\n"), "aaa\nbbb");
     }
 
     #[test]
@@ -267,20 +269,20 @@ mod tests {
             softline(),
             text(")"),
         ]));
-        assert_eq!(d.clone().render(80, W), "(x)");
-        assert_eq!(d.render(2, W), "(\n    x\n)");
+        assert_eq!(d.clone().render(80, W, "\n"), "(x)");
+        assert_eq!(d.render(2, W, "\n"), "(\n    x\n)");
     }
 
     #[test]
     fn hardline_forces_break_even_when_it_fits() {
         let d = group(concat([text("a"), hardline(), text("b")]));
-        assert_eq!(d.render(80, W), "a\nb");
+        assert_eq!(d.render(80, W, "\n"), "a\nb");
     }
 
     #[test]
     fn blank_line_emits_two_newlines() {
         let d = concat([text("a"), blank_line(), text("b")]);
-        assert_eq!(d.render(80, W), "a\n\nb");
+        assert_eq!(d.render(80, W, "\n"), "a\n\nb");
     }
 
     #[test]
@@ -291,25 +293,37 @@ mod tests {
             line(),
             text("y"),
         ]));
-        assert_eq!(flat.render(80, W), "x y");
+        assert_eq!(flat.render(80, W, "\n"), "x y");
         let broken = group(concat([
             text("xxxx"),
             if_break(text(","), nil()),
             line(),
             text("yyyy"),
         ]));
-        assert_eq!(broken.render(4, W), "xxxx,\nyyyy");
+        assert_eq!(broken.render(4, W, "\n"), "xxxx,\nyyyy");
     }
 
     #[test]
     fn trailing_spaces_trimmed_before_newline() {
         let d = concat([text("a"), space(), hardline(), text("b")]);
-        assert_eq!(d.render(80, W), "a\nb");
+        assert_eq!(d.render(80, W, "\n"), "a\nb");
     }
 
     #[test]
     fn join_inserts_separators() {
         let d = join([text("a"), text("b"), text("c")], text(", "));
-        assert_eq!(d.render(80, W), "a, b, c");
+        assert_eq!(d.render(80, W, "\n"), "a, b, c");
+    }
+
+    #[test]
+    fn render_uses_supplied_line_ending() {
+        let d = group(concat([text("aaa"), line(), text("bbb")]));
+        assert_eq!(d.render(4, W, "\r\n"), "aaa\r\nbbb");
+    }
+
+    #[test]
+    fn crlf_blank_line_emits_two_crlf() {
+        let d = concat([text("a"), blank_line(), text("b")]);
+        assert_eq!(d.render(80, W, "\r\n"), "a\r\n\r\nb");
     }
 }

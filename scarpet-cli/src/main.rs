@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use ariadne::{Label, Report, ReportKind, Source};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use scarpet_fmt::{Config, FmtError, format_source};
+use scarpet_fmt::{Config, FmtError, LineEnding, format_source};
 use scarpet_syntax::parser::ParseError;
 use serde::Deserialize;
 use similar::{ChangeTag, TextDiff};
@@ -72,6 +72,8 @@ struct ConfigFile {
     indent: Option<usize>,
     /// Target maximum line width before a group breaks.
     max_width: Option<usize>,
+    /// Line ending for inserted breaks: `"lf"` (default) or `"crlf"`.
+    line_ending: Option<String>,
 }
 
 /// Resolve the formatting [`Config`]. An explicit `--config` path must exist
@@ -90,11 +92,30 @@ fn resolve_config(explicit: Option<&Path>) -> Result<Config, String> {
             Err(e) => return Err(format!("{DEFAULT_CONFIG}: {e}")),
         },
     };
-    let file: ConfigFile = toml::from_str(&text).map_err(|e| format!("{name}: {e}"))?;
+    parse_config(&text, &name)
+}
+
+/// Parse TOML config `text` into a [`Config`], filling unset keys from
+/// [`Config::default`]. `name` labels the source in error messages. Split out
+/// from [`resolve_config`] so it is unit-testable without touching the
+/// filesystem.
+fn parse_config(text: &str, name: &str) -> Result<Config, String> {
+    let file: ConfigFile = toml::from_str(text).map_err(|e| format!("{name}: {e}"))?;
     let default = Config::default();
+    let line_ending = match file.line_ending.as_deref() {
+        None => default.line_ending,
+        Some("lf") => LineEnding::Lf,
+        Some("crlf") => LineEnding::Crlf,
+        Some(other) => {
+            return Err(format!(
+                "{name}: line_ending must be \"lf\" or \"crlf\", got {other:?}"
+            ));
+        }
+    };
     let config = Config {
         indent_width: file.indent.unwrap_or(default.indent_width),
         max_width: file.max_width.unwrap_or(default.max_width),
+        line_ending,
     };
     if config.max_width == 0 {
         return Err(format!("{name}: max_width must be at least 1"));
@@ -304,5 +325,22 @@ mod tests {
     fn check_without_deny_does_not_promote_diffs() {
         let args = parse_format(&["scarpet", "format", "--check"]).unwrap();
         assert!(!diffs_denied(&args.deny));
+    }
+
+    #[test]
+    fn parse_config_defaults_line_ending_to_lf() {
+        assert_eq!(parse_config("", "x").unwrap().line_ending, LineEnding::Lf);
+    }
+
+    #[test]
+    fn parse_config_reads_crlf() {
+        let cfg = parse_config("line_ending = \"crlf\"", "x").unwrap();
+        assert_eq!(cfg.line_ending, LineEnding::Crlf);
+    }
+
+    #[test]
+    fn parse_config_rejects_unknown_line_ending() {
+        let err = parse_config("line_ending = \"mac\"", "x").unwrap_err();
+        assert!(err.contains("line_ending"), "{err}");
     }
 }

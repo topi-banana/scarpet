@@ -80,11 +80,12 @@ The style is configurable through a TOML file: `scarpet format` reads `scarpet-f
 
 ```toml
 # scarpet-fmt.toml
-indent = 4        # indentation width, in spaces
-max_width = 100   # line-length target before a group breaks
+indent = 4               # indentation width, in spaces
+max_width = 100          # line-length target before a group breaks
+line_ending = "lf"       # newline style: "lf" (Unix, default) or "crlf" (Windows)
 ```
 
-Unknown keys and `max_width = 0` are rejected. Beyond these knobs the layout is fixed. Highlights:
+Unknown keys, `max_width = 0`, and a `line_ending` other than `"lf"` or `"crlf"` are rejected. Beyond these knobs the layout is fixed. Highlights:
 
 - Binary operators are spaced (`a + b`, `a -> b`), except `:` (get), which is tight: `a:b`. Unary prefixes hug their operand: `-x`, `!x`, `...xs`.
 - `;` statement sequences are laid out one per line, each terminated with `;`. A parenthesized `;`-chain becomes an indented block.
