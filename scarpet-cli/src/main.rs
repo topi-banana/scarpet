@@ -116,6 +116,7 @@ fn parse_config(text: &str, name: &str) -> Result<Config, String> {
         indent_width: file.indent.unwrap_or(default.indent_width),
         max_width: file.max_width.unwrap_or(default.max_width),
         line_ending,
+        brace_style: default.brace_style,
     };
     if config.max_width == 0 {
         return Err(format!("{name}: max_width must be at least 1"));
