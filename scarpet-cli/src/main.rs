@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use ariadne::{Label, Report, ReportKind, Source};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use scarpet_fmt::{Config, FmtError, LineEnding, format_source};
+use scarpet_fmt::{BraceStyle, Config, FmtError, LineEnding, format_source};
 use scarpet_syntax::parser::ParseError;
 use serde::Deserialize;
 use similar::{ChangeTag, TextDiff};
@@ -74,6 +74,9 @@ struct ConfigFile {
     max_width: Option<usize>,
     /// Line ending for inserted breaks: `"lf"` (default) or `"crlf"`.
     line_ending: Option<String>,
+    /// Opening-delimiter placement for broken blocks: `"same_line"` (default)
+    /// or `"next_line"`.
+    brace_style: Option<String>,
 }
 
 /// Resolve the formatting [`Config`]. An explicit `--config` path must exist
@@ -112,11 +115,21 @@ fn parse_config(text: &str, name: &str) -> Result<Config, String> {
             ));
         }
     };
+    let brace_style = match file.brace_style.as_deref() {
+        None => default.brace_style,
+        Some("same_line") => BraceStyle::SameLine,
+        Some("next_line") => BraceStyle::NextLine,
+        Some(other) => {
+            return Err(format!(
+                "{name}: brace_style must be \"same_line\" or \"next_line\", got {other:?}"
+            ));
+        }
+    };
     let config = Config {
         indent_width: file.indent.unwrap_or(default.indent_width),
         max_width: file.max_width.unwrap_or(default.max_width),
         line_ending,
-        brace_style: default.brace_style,
+        brace_style,
     };
     if config.max_width == 0 {
         return Err(format!("{name}: max_width must be at least 1"));
@@ -343,5 +356,25 @@ mod tests {
     fn parse_config_rejects_unknown_line_ending() {
         let err = parse_config("line_ending = \"mac\"", "x").unwrap_err();
         assert!(err.contains("line_ending"), "{err}");
+    }
+
+    #[test]
+    fn parse_config_defaults_brace_style_to_same_line() {
+        assert_eq!(
+            parse_config("", "x").unwrap().brace_style,
+            BraceStyle::SameLine
+        );
+    }
+
+    #[test]
+    fn parse_config_reads_next_line() {
+        let cfg = parse_config("brace_style = \"next_line\"", "x").unwrap();
+        assert_eq!(cfg.brace_style, BraceStyle::NextLine);
+    }
+
+    #[test]
+    fn parse_config_rejects_unknown_brace_style() {
+        let err = parse_config("brace_style = \"allman\"", "x").unwrap_err();
+        assert!(err.contains("brace_style"), "{err}");
     }
 }
