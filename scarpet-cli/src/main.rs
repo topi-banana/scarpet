@@ -4,13 +4,8 @@ use std::process::ExitCode;
 
 use ariadne::{Label, Report, ReportKind, Source};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use rustyline::completion::Completer;
 use rustyline::error::ReadlineError;
-use rustyline::highlight::Highlighter;
-use rustyline::hint::Hinter;
-use rustyline::history::DefaultHistory;
-use rustyline::validate::{ValidationContext, ValidationResult, Validator};
-use rustyline::{Editor, EventHandler, Helper, KeyCode, KeyEvent, Modifiers};
+use rustyline::{DefaultEditor, EventHandler, KeyCode, KeyEvent, Modifiers};
 use scarpet_fmt::{BraceStyle, Config, FmtError, LineEnding, format_source};
 use scarpet_syntax::parser::{ParseError, has_open_delimiter, parse_source};
 use serde::Deserialize;
@@ -273,29 +268,35 @@ fn run_repl() -> ExitCode {
 /// command history. The history is kept only for the session — it is not
 /// written to disk.
 ///
-/// A submission may span several lines. The [`ScarpetHelper`] validator holds a
-/// submission open while its brackets are unbalanced, so a plain Enter inside an
-/// open `(`/`[`/`{` starts a new line and only submits once they close.
-/// Shift+Enter — and Alt+Enter, its fallback on terminals that send the same
-/// bytes for Enter and Shift+Enter — forces a newline even when the brackets
-/// already balance.
+/// A submission may span several lines, read one physical line at a time like
+/// Python's REPL. The first line uses the `scarpet> ` prompt; while the input
+/// gathered so far still has an unclosed `(`/`[`/`{`, each further line is read
+/// with a `.......| ` continuation prompt sized to line up under the first, and
+/// the submission is parsed only once the brackets balance. Shift+Enter — and
+/// Alt+Enter, its fallback on terminals that send the same bytes for Enter and
+/// Shift+Enter — inserts a newline within the line being edited, so input the
+/// bracket check can't tell is unfinished (such as a trailing `->`) can still be
+/// continued onto another line.
 ///
-/// Ctrl+C abandons the input in progress and prompts again; Ctrl+D (or end of
-/// input) exits.
+/// Ctrl+C abandons the submission in progress and prompts again; Ctrl+D (or end
+/// of input) exits.
 fn run_repl_interactive() -> ExitCode {
-    let mut rl: Editor<ScarpetHelper, DefaultHistory> = match Editor::new() {
+    // The first-line and continuation prompts. The continuation prompt is the
+    // same display width as `scarpet> ` so input starts in the same column on
+    // every line.
+    const PROMPT: &str = "scarpet> ";
+    const CONTINUATION: &str = ".......| ";
+
+    let mut rl = match DefaultEditor::new() {
         Ok(rl) => rl,
         Err(e) => {
             eprintln!("repl: {e}");
             return ExitCode::from(2);
         }
     };
-    // The helper's `Validator` keeps a submission open while its brackets are
-    // unbalanced, so a parenthesized block can span several lines.
-    rl.set_helper(Some(ScarpetHelper));
-    // Also bind Shift+Enter (and Alt+Enter, its fallback on terminals that send
-    // the same bytes for Enter and Shift+Enter) to insert a newline regardless,
-    // so a newline can be forced even when the brackets already balance.
+    // Bind Shift+Enter (and Alt+Enter, its fallback on terminals that send the
+    // same bytes for Enter and Shift+Enter) to insert a newline, so a line can
+    // be continued even when its brackets already balance.
     rl.bind_sequence(
         KeyEvent(KeyCode::Enter, Modifiers::SHIFT),
         EventHandler::Simple(rustyline::Cmd::Newline),
@@ -308,30 +309,47 @@ fn run_repl_interactive() -> ExitCode {
         "Scarpet REPL (parse-only). Enter submits (continuing while brackets are \
          open); Shift+Enter or Alt+Enter forces a newline; Ctrl+D exits."
     );
-    loop {
-        match rl.readline("scarpet> ") {
-            Ok(line) => {
-                // `rustyline` returns the line without its trailing newline.
-                // Blank submissions are ignored and kept out of the history,
-                // matching the piped path and Python's REPL.
-                if line.trim().is_empty() {
-                    continue;
+    // Each iteration of the outer loop reads one submission, joining physical
+    // lines with `\n` into `buf` until the brackets balance.
+    'submission: loop {
+        let mut buf = String::new();
+        loop {
+            let prompt = if buf.is_empty() { PROMPT } else { CONTINUATION };
+            match rl.readline(prompt) {
+                Ok(line) => {
+                    // `rustyline` returns the line without its trailing newline,
+                    // so reinsert one between continued lines.
+                    if !buf.is_empty() {
+                        buf.push('\n');
+                    }
+                    buf.push_str(&line);
+                    // Keep the submission open for another line while a bracket
+                    // is still unclosed; otherwise it is ready to parse.
+                    if input_incomplete(&buf) {
+                        continue;
+                    }
+                    break;
                 }
-                // Record every non-blank submission, valid or not, so the
-                // history mirrors exactly what was typed.
-                let _ = rl.add_history_entry(line.as_str());
-                if let Some(e) = check_line(&line) {
-                    report_parse_error("<repl>", &line, &e);
+                // Ctrl+C: drop the whole submission in progress, prompt afresh.
+                Err(ReadlineError::Interrupted) => continue 'submission,
+                // Ctrl+D or end of input: leave the REPL.
+                Err(ReadlineError::Eof) => return ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("repl: {e}");
+                    return ExitCode::from(2);
                 }
             }
-            // Ctrl+C: discard the current line and prompt again.
-            Err(ReadlineError::Interrupted) => continue,
-            // Ctrl+D or end of input: leave the REPL.
-            Err(ReadlineError::Eof) => return ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("repl: {e}");
-                return ExitCode::from(2);
-            }
+        }
+        // Blank submissions are ignored and kept out of the history, matching
+        // the piped path and Python's REPL.
+        if buf.trim().is_empty() {
+            continue;
+        }
+        // Record every non-blank submission, valid or not, so the history
+        // mirrors exactly what was typed.
+        let _ = rl.add_history_entry(buf.as_str());
+        if let Some(e) = check_line(&buf) {
+            report_parse_error("<repl>", &buf, &e);
         }
     }
 }
@@ -374,31 +392,6 @@ fn check_line(src: &str) -> Option<ParseError> {
         return None;
     }
     parse_source(src).err().map(|e| *e)
-}
-
-/// A `rustyline` helper whose only customization is multi-line continuation: its
-/// [`Validator`] holds a submission open while the input has unclosed brackets,
-/// so a block spanning several lines is entered as a single submission.
-/// Completion, hinting, and highlighting are left at their no-op defaults.
-struct ScarpetHelper;
-
-impl Completer for ScarpetHelper {
-    type Candidate = String;
-}
-impl Hinter for ScarpetHelper {
-    type Hint = String;
-}
-impl Highlighter for ScarpetHelper {}
-impl Helper for ScarpetHelper {}
-
-impl Validator for ScarpetHelper {
-    fn validate(&self, ctx: &mut ValidationContext) -> rustyline::Result<ValidationResult> {
-        if input_incomplete(ctx.input()) {
-            Ok(ValidationResult::Incomplete)
-        } else {
-            Ok(ValidationResult::Valid(None))
-        }
-    }
 }
 
 /// Whether `src` is an unfinished submission the REPL should keep open for more
@@ -645,5 +638,14 @@ mod tests {
         // A multi-line string is still held open by its enclosing bracket, so a
         // string can be continued onto the next line inside a call.
         assert!(input_incomplete("print('hello"));
+    }
+
+    #[test]
+    fn repl_parses_reassembled_multiline_submission() {
+        // The interactive loop joins continuation lines with '\n' before
+        // parsing, so a bracketed body split across several lines must parse as
+        // a single submission.
+        assert!(check_line("foo(\n  1,\n  2\n)").is_none());
+        assert!(check_line("[\n  1,\n  2\n]").is_none());
     }
 }
