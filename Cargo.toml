@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["scarpet-cli", "scarpet-fmt", "scarpet-syntax"]
+members = ["scarpet-cli", "scarpet-fmt", "scarpet-playground", "scarpet-syntax"]
 
 [workspace.dependencies]
 ariadne = { version = "0.6", features = ["auto-color"] }
