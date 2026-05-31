@@ -1,11 +1,13 @@
 //! `scarpet-playground`: a browser playground for the `scarpet` formatter and syntax tree.
 //!
 //! A two-pane editor — type Scarpet (`.sc`) source on the left, then run the formatter or
-//! dump the lossless syntax tree on the right with the buttons in the top-right. Everything
-//! runs in the browser via `wasm32`; there is no server round-trip.
+//! dump the lossless syntax tree on the right with the buttons in the top-right. The
+//! formatter's `Config` is editable from the options bar between the header and the panes.
+//! Everything runs in the browser via `wasm32`; there is no server round-trip.
 
+use scarpet_fmt::{BraceStyle, Config, LineEnding};
 use scarpet_syntax::parser::ParseError;
-use web_sys::HtmlTextAreaElement;
+use web_sys::{HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement};
 use yew::prelude::*;
 
 /// Which tool produced the current output.
@@ -32,6 +34,18 @@ enum Msg {
     Input(String),
     /// Run a tool over the current input.
     Run(Mode),
+    /// Set the formatter's indentation step, in spaces.
+    SetIndentWidth(usize),
+    /// Set the formatter's target line width.
+    SetMaxWidth(usize),
+    /// Set the comment-wrap width; `None` leaves comments unwrapped.
+    SetCommentWidth(Option<usize>),
+    /// Set the line ending the formatter emits for inserted breaks.
+    SetLineEnding(LineEnding),
+    /// Set where an opening delimiter sits on a broken block.
+    SetBraceStyle(BraceStyle),
+    /// A numeric control fired with an unparseable value; keep the current config.
+    Noop,
 }
 
 /// A small (deliberately unformatted) sample so the playground does something on first load.
@@ -52,6 +66,8 @@ struct App {
     diagnostics: Vec<String>,
     /// The tool that produced `output`, once one has run.
     mode: Option<Mode>,
+    /// The formatting style applied in [`Mode::Format`], edited from the options bar.
+    config: Config,
 }
 
 /// Render a parse error as a `start..end  message` headline plus an optional `help:` line.
@@ -72,18 +88,16 @@ impl App {
     /// Run `mode` over the current input, refreshing `output` and `diagnostics`.
     fn run(&mut self, mode: Mode) {
         match mode {
-            Mode::Format => {
-                match scarpet_fmt::format_source(&self.input, &scarpet_fmt::Config::default()) {
-                    Ok(formatted) => {
-                        self.output = formatted;
-                        self.diagnostics = Vec::new();
-                    }
-                    Err(scarpet_fmt::FmtError::Parse(err)) => {
-                        self.output = String::new();
-                        self.diagnostics = diagnostics_for(&err);
-                    }
+            Mode::Format => match scarpet_fmt::format_source(&self.input, &self.config) {
+                Ok(formatted) => {
+                    self.output = formatted;
+                    self.diagnostics = Vec::new();
                 }
-            }
+                Err(scarpet_fmt::FmtError::Parse(err)) => {
+                    self.output = String::new();
+                    self.diagnostics = diagnostics_for(&err);
+                }
+            },
             Mode::Syntax => match scarpet_syntax::parser::parse_source(&self.input) {
                 Ok(cst) => {
                     self.output = format!("{cst:#?}");
@@ -98,6 +112,15 @@ impl App {
         self.mode = Some(mode);
     }
 
+    /// Re-run the formatter in place after a config change, but only while the
+    /// Format view is showing. The syntax tree is config-independent, so there a
+    /// config change just updates the controls (it applies on the next Format).
+    fn reformat_if_showing(&mut self) {
+        if self.mode == Some(Mode::Format) {
+            self.run(Mode::Format);
+        }
+    }
+
     /// The diagnostics strip below the output, or nothing when the input parsed.
     fn view_diagnostics(&self) -> Html {
         if self.diagnostics.is_empty() {
@@ -107,6 +130,88 @@ impl App {
             <div class="max-h-40 shrink-0 overflow-auto border-t border-hairline bg-canvas px-4 py-2 font-mono text-xs text-error">
                 <div class="pb-1 font-medium">{ "Parse error" }</div>
                 { for self.diagnostics.iter().map(|d| html! { <div class="py-0.5">{ d }</div> }) }
+            </div>
+        }
+    }
+
+    /// The formatter-options bar between the header and the panes. Edits apply
+    /// live to the Format view; in the Syntax view they take effect on next Format.
+    fn view_options(&self, ctx: &Context<Self>) -> Html {
+        let link = ctx.link();
+
+        let on_indent = link.callback(|e: InputEvent| {
+            let input: HtmlInputElement = e.target_unchecked_into();
+            match input.value().parse::<usize>() {
+                Ok(v) => Msg::SetIndentWidth(v.clamp(1, 16)),
+                Err(_) => Msg::Noop,
+            }
+        });
+        let on_max = link.callback(|e: InputEvent| {
+            let input: HtmlInputElement = e.target_unchecked_into();
+            match input.value().parse::<usize>() {
+                Ok(v) => Msg::SetMaxWidth(v.max(1)),
+                Err(_) => Msg::Noop,
+            }
+        });
+        let on_comment = link.callback(|e: InputEvent| {
+            let input: HtmlInputElement = e.target_unchecked_into();
+            match input.value().parse::<usize>() {
+                Ok(0) => Msg::SetCommentWidth(None),
+                Ok(v) => Msg::SetCommentWidth(Some(v)),
+                Err(_) => Msg::Noop,
+            }
+        });
+        let on_line_ending = link.callback(|e: Event| {
+            let select: HtmlSelectElement = e.target_unchecked_into();
+            Msg::SetLineEnding(match select.value().as_str() {
+                "crlf" => LineEnding::Crlf,
+                _ => LineEnding::Lf,
+            })
+        });
+        let on_brace = link.callback(|e: Event| {
+            let select: HtmlSelectElement = e.target_unchecked_into();
+            Msg::SetBraceStyle(match select.value().as_str() {
+                "next" => BraceStyle::NextLine,
+                _ => BraceStyle::SameLine,
+            })
+        });
+
+        let bar = "flex flex-wrap items-center gap-x-5 gap-y-2 border-b border-hairline bg-canvas px-6 py-2";
+        let lbl = "flex items-center gap-2 font-mono text-xs uppercase tracking-wider text-mute";
+        let num = "w-14 rounded-md border border-hairline bg-canvas px-2 py-1 text-right font-mono text-xs normal-case text-ink outline-none focus:border-link";
+        let sel = "rounded-md border border-hairline bg-canvas px-2 py-1 font-mono text-xs normal-case text-ink outline-none focus:border-link";
+
+        html! {
+            <div class={bar}>
+                <label class={lbl}>
+                    { "Indent" }
+                    <input type="number" min="1" max="16" class={num}
+                        value={self.config.indent_width.to_string()} oninput={on_indent} />
+                </label>
+                <label class={lbl}>
+                    { "Width" }
+                    <input type="number" min="1" class={num}
+                        value={self.config.max_width.to_string()} oninput={on_max} />
+                </label>
+                <label class={lbl} title="0 leaves comments unwrapped">
+                    { "Comment" }
+                    <input type="number" min="0" class={num}
+                        value={self.config.comment_width.unwrap_or(0).to_string()} oninput={on_comment} />
+                </label>
+                <label class={lbl}>
+                    { "Endings" }
+                    <select class={sel} onchange={on_line_ending}>
+                        <option value="lf" selected={self.config.line_ending == LineEnding::Lf}>{ "LF" }</option>
+                        <option value="crlf" selected={self.config.line_ending == LineEnding::Crlf}>{ "CRLF" }</option>
+                    </select>
+                </label>
+                <label class={lbl}>
+                    { "Braces" }
+                    <select class={sel} onchange={on_brace}>
+                        <option value="same" selected={self.config.brace_style == BraceStyle::SameLine}>{ "Same line" }</option>
+                        <option value="next" selected={self.config.brace_style == BraceStyle::NextLine}>{ "Next line" }</option>
+                    </select>
+                </label>
             </div>
         }
     }
@@ -122,6 +227,7 @@ impl Component for App {
             output: String::new(),
             diagnostics: Vec::new(),
             mode: None,
+            config: Config::default(),
         };
         app.run(Mode::Format);
         app
@@ -139,6 +245,32 @@ impl Component for App {
                 self.run(mode);
                 true
             }
+            Msg::SetIndentWidth(w) => {
+                self.config.indent_width = w;
+                self.reformat_if_showing();
+                true
+            }
+            Msg::SetMaxWidth(w) => {
+                self.config.max_width = w;
+                self.reformat_if_showing();
+                true
+            }
+            Msg::SetCommentWidth(w) => {
+                self.config.comment_width = w;
+                self.reformat_if_showing();
+                true
+            }
+            Msg::SetLineEnding(le) => {
+                self.config.line_ending = le;
+                self.reformat_if_showing();
+                true
+            }
+            Msg::SetBraceStyle(bs) => {
+                self.config.brace_style = bs;
+                self.reformat_if_showing();
+                true
+            }
+            Msg::Noop => false,
         }
     }
 
@@ -177,6 +309,7 @@ impl Component for App {
                         </button>
                     </div>
                 </header>
+                { self.view_options(ctx) }
                 <main class="grid min-h-0 flex-1 grid-cols-1 md:grid-cols-2">
                     <section class="flex min-h-0 flex-col border-b border-hairline md:border-b-0 md:border-r">
                         <div class={label}>{ "Input" }</div>
