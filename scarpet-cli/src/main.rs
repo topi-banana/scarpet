@@ -4,8 +4,10 @@ use std::process::ExitCode;
 
 use ariadne::{Label, Report, ReportKind, Source};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use rustyline::error::ReadlineError;
+use rustyline::{DefaultEditor, EventHandler, KeyCode, KeyEvent, Modifiers};
 use scarpet_fmt::{BraceStyle, Config, FmtError, LineEnding, format_source};
-use scarpet_syntax::parser::{ParseError, parse_source};
+use scarpet_syntax::parser::{ParseError, has_open_delimiter, parse_source};
 use serde::Deserialize;
 use similar::{ChangeTag, TextDiff};
 
@@ -21,7 +23,7 @@ enum Cmd {
     /// Format Scarpet source.
     Format(FormatArgs),
     /// Start an interactive parse-only REPL: read a statement, report any
-    /// parse error, then prompt again. Exits on Ctrl+D or Ctrl+C.
+    /// parse error, then prompt again. Exits on Ctrl+D.
     Repl,
 }
 
@@ -244,40 +246,129 @@ fn format_stdin(check: bool, deny: &[DenyWarning], config: &Config) -> ExitCode 
     }
 }
 
-/// Run an interactive parse-only REPL. Reads one statement per line, parses it
-/// with [`parse_source`], and prints a diagnostic for any parse error — and
-/// nothing at all on success. There is no evaluator; this only checks that each
-/// entered statement is syntactically valid.
+/// Run an interactive parse-only REPL. Reads one statement per submission,
+/// parses it with [`parse_source`], and prints a diagnostic for any parse error
+/// — and nothing at all on success. There is no evaluator; this only checks
+/// that each entered statement is syntactically valid.
 ///
-/// The loop ends on end-of-input (Ctrl+D) or when interrupted (Ctrl+C, which
-/// terminates the process via the default SIGINT handler). The prompt and
-/// banner go to stderr and are suppressed when stdin is not a terminal (piped
-/// input), so a command like `echo '1+' | scarpet repl` emits only diagnostics.
+/// On a terminal, input is read through `rustyline` for line editing and an
+/// in-session command history; see [`run_repl_interactive`]. When stdin is not a
+/// terminal (piped or redirected input), it falls back to a plain line reader
+/// with no prompt or banner — so `echo '1+' | scarpet repl` emits only
+/// diagnostics; see [`run_repl_piped`].
 fn run_repl() -> ExitCode {
+    if std::io::stdin().is_terminal() {
+        run_repl_interactive()
+    } else {
+        run_repl_piped()
+    }
+}
+
+/// The terminal REPL, backed by `rustyline` for line editing and an up/down
+/// command history. The history is kept only for the session — it is not
+/// written to disk.
+///
+/// A submission may span several lines, read one physical line at a time like
+/// Python's REPL. The first line uses the `scarpet> ` prompt; while the input
+/// gathered so far still has an unclosed `(`/`[`/`{`, each further line is read
+/// with a `.......| ` continuation prompt sized to line up under the first, and
+/// the submission is parsed only once the brackets balance. Shift+Enter — and
+/// Alt+Enter, its fallback on terminals that send the same bytes for Enter and
+/// Shift+Enter — inserts a newline within the line being edited, so input the
+/// bracket check can't tell is unfinished (such as a trailing `->`) can still be
+/// continued onto another line.
+///
+/// Ctrl+C abandons the submission in progress and prompts again; Ctrl+D (or end
+/// of input) exits.
+fn run_repl_interactive() -> ExitCode {
+    // The first-line and continuation prompts. The continuation prompt is the
+    // same display width as `scarpet> ` so input starts in the same column on
+    // every line.
+    const PROMPT: &str = "scarpet> ";
+    const CONTINUATION: &str = ".......| ";
+
+    let mut rl = match DefaultEditor::new() {
+        Ok(rl) => rl,
+        Err(e) => {
+            eprintln!("repl: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    // Bind Shift+Enter (and Alt+Enter, its fallback on terminals that send the
+    // same bytes for Enter and Shift+Enter) to insert a newline, so a line can
+    // be continued even when its brackets already balance.
+    rl.bind_sequence(
+        KeyEvent(KeyCode::Enter, Modifiers::SHIFT),
+        EventHandler::Simple(rustyline::Cmd::Newline),
+    );
+    rl.bind_sequence(
+        KeyEvent(KeyCode::Enter, Modifiers::ALT),
+        EventHandler::Simple(rustyline::Cmd::Newline),
+    );
+    eprintln!(
+        "Scarpet REPL (parse-only). Enter submits (continuing while brackets are \
+         open); Shift+Enter or Alt+Enter forces a newline; Ctrl+D exits."
+    );
+    // Each iteration of the outer loop reads one submission, joining physical
+    // lines with `\n` into `buf` until the brackets balance.
+    'submission: loop {
+        let mut buf = String::new();
+        loop {
+            let prompt = if buf.is_empty() { PROMPT } else { CONTINUATION };
+            match rl.readline(prompt) {
+                Ok(line) => {
+                    // `rustyline` returns the line without its trailing newline,
+                    // so reinsert one between continued lines.
+                    if !buf.is_empty() {
+                        buf.push('\n');
+                    }
+                    buf.push_str(&line);
+                    // Keep the submission open for another line while a bracket
+                    // is still unclosed; otherwise it is ready to parse.
+                    if input_incomplete(&buf) {
+                        continue;
+                    }
+                    break;
+                }
+                // Ctrl+C: drop the whole submission in progress, prompt afresh.
+                Err(ReadlineError::Interrupted) => continue 'submission,
+                // Ctrl+D or end of input: leave the REPL.
+                Err(ReadlineError::Eof) => return ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("repl: {e}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        // Blank submissions are ignored and kept out of the history, matching
+        // the piped path and Python's REPL.
+        if buf.trim().is_empty() {
+            continue;
+        }
+        // Record every non-blank submission, valid or not, so the history
+        // mirrors exactly what was typed.
+        let _ = rl.add_history_entry(buf.as_str());
+        if let Some(e) = check_line(&buf) {
+            report_parse_error("<repl>", &buf, &e);
+        }
+    }
+}
+
+/// The non-terminal REPL: a plain line reader for piped or redirected stdin,
+/// with no prompt or banner. Reads one statement per line and reports parse
+/// errors, so `echo '1+' | scarpet repl` emits only diagnostics. Ends at
+/// end-of-input.
+fn run_repl_piped() -> ExitCode {
     use std::io::BufRead as _;
 
-    let interactive = std::io::stdin().is_terminal();
-    if interactive {
-        eprintln!("Scarpet REPL (parse-only). Press Ctrl+D or Ctrl+C to exit.");
-    }
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     let mut line = String::new();
     loop {
-        if interactive {
-            // stderr is unbuffered, so the prompt shows before `read_line`
-            // blocks — no explicit flush needed.
-            eprint!("scarpet> ");
-        }
         line.clear();
         match input.read_line(&mut line) {
-            // End of input (Ctrl+D): finish the prompt line and leave.
-            Ok(0) => {
-                if interactive {
-                    eprintln!();
-                }
-                return ExitCode::SUCCESS;
-            }
+            // End of input.
+            Ok(0) => return ExitCode::SUCCESS,
             Ok(_) => {
                 let src = line.trim_end_matches(['\n', '\r']);
                 if let Some(e) = check_line(src) {
@@ -301,6 +392,17 @@ fn check_line(src: &str) -> Option<ParseError> {
         return None;
     }
     parse_source(src).err().map(|e| *e)
+}
+
+/// Whether `src` is an unfinished submission the REPL should keep open for more
+/// input instead of parsing now: true while a `(`/`[`/`{` is still unclosed.
+/// Delegates to [`has_open_delimiter`], which runs the Scarpet lexer, so a
+/// bracket inside a `'…'` string or a `//` comment never counts. A surplus
+/// *closing* bracket is not treated as incomplete — the input is submitted so
+/// the parser can report it. Anything else that should span lines can still be
+/// continued with Shift+Enter / Alt+Enter.
+fn input_incomplete(src: &str) -> bool {
+    has_open_delimiter(src)
 }
 
 /// Render a parse error to stderr as a rustc-style ariadne diagnostic that
@@ -510,5 +612,40 @@ mod tests {
         assert!(check_line("1 +").is_some());
         assert!(check_line(")").is_some());
         assert!(check_line("print(").is_some());
+    }
+
+    #[test]
+    fn repl_continues_while_brackets_open() {
+        // An unclosed bracket keeps the submission open for another line.
+        assert!(input_incomplete("foo("));
+        assert!(input_incomplete("[1, 2,"));
+        assert!(input_incomplete("foo() -> ("));
+        // Balanced input is complete and ready to submit.
+        assert!(!input_incomplete("foo()"));
+        assert!(!input_incomplete("a = 5"));
+        assert!(!input_incomplete("(a + b) * [c]"));
+        // A surplus close is submitted, not held open, so the parser reports it.
+        assert!(!input_incomplete("a)"));
+    }
+
+    #[test]
+    fn repl_ignores_brackets_in_strings_and_comments() {
+        // A bracket inside a string literal doesn't count toward the depth.
+        assert!(!input_incomplete("print('(')"));
+        assert!(!input_incomplete("a = ')['"));
+        // Brackets after `//` are a comment and are ignored.
+        assert!(!input_incomplete("foo() // (open"));
+        // A multi-line string is still held open by its enclosing bracket, so a
+        // string can be continued onto the next line inside a call.
+        assert!(input_incomplete("print('hello"));
+    }
+
+    #[test]
+    fn repl_parses_reassembled_multiline_submission() {
+        // The interactive loop joins continuation lines with '\n' before
+        // parsing, so a bracketed body split across several lines must parse as
+        // a single submission.
+        assert!(check_line("foo(\n  1,\n  2\n)").is_none());
+        assert!(check_line("[\n  1,\n  2\n]").is_none());
     }
 }
