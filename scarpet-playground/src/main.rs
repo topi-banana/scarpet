@@ -1,11 +1,13 @@
 //! `scarpet-playground`: a browser playground for the `scarpet` formatter and syntax tree.
 //!
-//! A two-pane editor — type Scarpet (`.sc`) source on the left, then run the formatter or
-//! dump the lossless syntax tree on the right with the buttons in the top-right. The
-//! formatter's `Config` is editable from the options bar between the header and the panes.
+//! A two-pane editor — type Scarpet (`.sc`) source on the left, then run the formatter,
+//! dump the lossless syntax tree (CST), or lower it to the typed AST on the right with the
+//! buttons in the top-right. The formatter's `Config` is editable from the options bar
+//! between the header and the panes.
 //! Everything runs in the browser via `wasm32`; there is no server round-trip.
 
 use scarpet_fmt::{BraceStyle, Config, LineEnding};
+use scarpet_syntax::ast::Code;
 use scarpet_syntax::parser::ParseError;
 use web_sys::{HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement};
 use yew::prelude::*;
@@ -17,6 +19,8 @@ enum Mode {
     Format,
     /// `scarpet-syntax` lossless CST dump.
     Syntax,
+    /// `scarpet-syntax` typed AST dump — the CST lowered via `Code::try_from`.
+    Ast,
 }
 
 impl Mode {
@@ -25,6 +29,7 @@ impl Mode {
         match self {
             Mode::Format => "Formatted",
             Mode::Syntax => "Syntax tree",
+            Mode::Ast => "AST",
         }
     }
 }
@@ -49,7 +54,7 @@ enum Msg {
 }
 
 /// A small (deliberately unformatted) sample so the playground does something on first load.
-const SAMPLE: &str = "// Scarpet sample — hit Format or Syntax tree.
+const SAMPLE: &str = "// Scarpet sample — hit Format, Syntax tree, or AST.
 fib(n) -> if(n < 2, n, fib(n-1)+fib(n-2));
 sum = 0;
 loop(10, sum += fib(_) );
@@ -62,9 +67,11 @@ const BTN_BASE: &str = "inline-flex h-9 cursor-pointer items-center rounded-md p
 struct App {
     input: String,
     output: String,
-    /// Human-readable diagnostics: a parse error's headline plus an optional `help:` line.
+    /// Human-readable diagnostics: a parse error's headline plus an optional `help:` line,
+    /// or an AST-lowering error's message.
     diagnostics: Vec<String>,
-    /// Heading shown above [`diagnostics`](Self::diagnostics): the kind of error that produced them.
+    /// Heading shown above [`diagnostics`](Self::diagnostics): the kind of failure that
+    /// produced them ("Parse error" or "Lowering error").
     diagnostics_title: &'static str,
     /// The tool that produced `output`, once one has run.
     mode: Option<Mode>,
@@ -104,6 +111,24 @@ impl App {
                 }
                 Err(err) => self.report_parse(&err),
             },
+            // The AST is the CST lowered via `Code::try_from`, so it has two failure
+            // modes: a parse error (shared with the other tools) or a lowering error
+            // where a well-formed parse has no valid AST (e.g. `1 = 2`, no assignable
+            // target). The lowering error carries no span, just a message.
+            Mode::Ast => match scarpet_syntax::parser::parse_source(&self.input) {
+                Ok(cst) => match Code::try_from(&cst) {
+                    Ok(code) => {
+                        self.output = format!("{code:#?}");
+                        self.diagnostics = Vec::new();
+                    }
+                    Err(err) => {
+                        self.output = String::new();
+                        self.diagnostics = vec![err.to_string()];
+                        self.diagnostics_title = "Lowering error";
+                    }
+                },
+                Err(err) => self.report_parse(&err),
+            },
         }
         self.mode = Some(mode);
     }
@@ -116,8 +141,8 @@ impl App {
     }
 
     /// Re-run the formatter in place after a config change, but only while the
-    /// Format view is showing. The syntax tree is config-independent, so there a
-    /// config change just updates the controls (it applies on the next Format).
+    /// Format view is showing. The syntax tree and AST are config-independent, so
+    /// there a config change just updates the controls (it applies on the next Format).
     fn reformat_if_showing(&mut self) {
         if self.mode == Some(Mode::Format) {
             self.run(Mode::Format);
@@ -286,6 +311,7 @@ impl Component for App {
         });
         let on_format = link.callback(|_| Msg::Run(Mode::Format));
         let on_syntax = link.callback(|_| Msg::Run(Mode::Syntax));
+        let on_ast = link.callback(|_| Msg::Run(Mode::Ast));
 
         let output_title = self.mode.map_or("Output", Mode::output_title);
         let label = "border-b border-hairline bg-canvas px-4 py-2 font-mono text-xs font-medium uppercase tracking-wider text-mute";
@@ -304,6 +330,12 @@ impl Component for App {
                             class={classes!(BTN_BASE, "border", "border-hairline", "bg-canvas", "text-ink", "hover:bg-canvas-soft")}
                         >
                             { "Syntax tree" }
+                        </button>
+                        <button
+                            onclick={on_ast}
+                            class={classes!(BTN_BASE, "border", "border-hairline", "bg-canvas", "text-ink", "hover:bg-canvas-soft")}
+                        >
+                            { "AST" }
                         </button>
                         <button
                             onclick={on_format}
