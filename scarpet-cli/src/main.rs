@@ -7,6 +7,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use rustyline::error::ReadlineError;
 use rustyline::{DefaultEditor, EventHandler, KeyCode, KeyEvent, Modifiers};
 use scarpet_fmt::{BraceStyle, Config, FmtError, LineEnding, format_source};
+use scarpet_syntax::ast::{Code, LowerError};
 use scarpet_syntax::parser::{ParseError, has_open_delimiter, parse_source};
 use serde::Deserialize;
 use similar::{ChangeTag, TextDiff};
@@ -22,8 +23,8 @@ struct Cli {
 enum Cmd {
     /// Format Scarpet source.
     Format(FormatArgs),
-    /// Start an interactive parse-only REPL: read a statement, report any
-    /// parse error, then prompt again. Exits on Ctrl+D.
+    /// Start an interactive REPL: read a statement, print its AST (or a
+    /// parse / lowering diagnostic), then prompt again. Exits on Ctrl+D.
     Repl,
 }
 
@@ -246,16 +247,17 @@ fn format_stdin(check: bool, deny: &[DenyWarning], config: &Config) -> ExitCode 
     }
 }
 
-/// Run an interactive parse-only REPL. Reads one statement per submission,
-/// parses it with [`parse_source`], and prints a diagnostic for any parse error
-/// — and nothing at all on success. There is no evaluator; this only checks
-/// that each entered statement is syntactically valid.
+/// Run an interactive REPL. Reads one statement per submission, parses it with
+/// [`parse_source`], lowers the CST to a `scarpet-syntax` [`Code`] (statement
+/// sequence) via `Code::try_from`, and prints that AST (`{:#?}`) on success — or
+/// a rustc-style diagnostic for a parse or lowering error. There is no
+/// evaluator; this only builds and dumps the syntax tree.
 ///
 /// On a terminal, input is read through `rustyline` for line editing and an
 /// in-session command history; see [`run_repl_interactive`]. When stdin is not a
 /// terminal (piped or redirected input), it falls back to a plain line reader
-/// with no prompt or banner — so `echo '1+' | scarpet repl` emits only
-/// diagnostics; see [`run_repl_piped`].
+/// with no prompt or banner — so `echo 'a=5' | scarpet repl` emits just the AST
+/// (and `echo '1+' | scarpet repl` just the diagnostic); see [`run_repl_piped`].
 fn run_repl() -> ExitCode {
     if std::io::stdin().is_terminal() {
         run_repl_interactive()
@@ -306,8 +308,8 @@ fn run_repl_interactive() -> ExitCode {
         EventHandler::Simple(rustyline::Cmd::Newline),
     );
     eprintln!(
-        "Scarpet REPL (parse-only). Enter submits (continuing while brackets are \
-         open); Shift+Enter or Alt+Enter forces a newline; Ctrl+D exits."
+        "Scarpet REPL (parse + AST dump). Enter submits (continuing while brackets \
+         are open); Shift+Enter or Alt+Enter forces a newline; Ctrl+D exits."
     );
     // Each iteration of the outer loop reads one submission, joining physical
     // lines with `\n` into `buf` until the brackets balance.
@@ -348,16 +350,14 @@ fn run_repl_interactive() -> ExitCode {
         // Record every non-blank submission, valid or not, so the history
         // mirrors exactly what was typed.
         let _ = rl.add_history_entry(buf.as_str());
-        if let Some(e) = check_line(&buf) {
-            report_parse_error("<repl>", &buf, &e);
-        }
+        handle_submission("<repl>", &buf);
     }
 }
 
 /// The non-terminal REPL: a plain line reader for piped or redirected stdin,
-/// with no prompt or banner. Reads one statement per line and reports parse
-/// errors, so `echo '1+' | scarpet repl` emits only diagnostics. Ends at
-/// end-of-input.
+/// with no prompt or banner. Reads one statement per line, printing its AST on
+/// success and a diagnostic on a parse or lowering error — so `echo '1+' |
+/// scarpet repl` emits only the diagnostic. Ends at end-of-input.
 fn run_repl_piped() -> ExitCode {
     use std::io::BufRead as _;
 
@@ -371,9 +371,7 @@ fn run_repl_piped() -> ExitCode {
             Ok(0) => return ExitCode::SUCCESS,
             Ok(_) => {
                 let src = line.trim_end_matches(['\n', '\r']);
-                if let Some(e) = check_line(src) {
-                    report_parse_error("<repl>", src, &e);
-                }
+                handle_submission("<repl>", src);
             }
             Err(e) => {
                 eprintln!("repl: {e}");
@@ -383,15 +381,49 @@ fn run_repl_piped() -> ExitCode {
     }
 }
 
-/// Parse one REPL submission, returning its parse error if any. Blank
-/// (whitespace-only) lines are ignored — pressing Enter at an empty prompt does
-/// nothing, as in Python's REPL — so they report no error. The returned
-/// [`ParseError`] owns its data and does not borrow `src`.
-fn check_line(src: &str) -> Option<ParseError> {
+/// The outcome of checking one REPL submission.
+enum Checked<'s> {
+    /// Whitespace-only input — nothing to do.
+    Blank,
+    /// Parsed and lowered cleanly; the statement-sequence AST (borrowing `src`).
+    Ast(Code<'s>),
+    /// Failed to parse.
+    Parse(ParseError),
+    /// Parsed, but could not be lowered to an AST.
+    Lower(LowerError),
+}
+
+/// Check one REPL submission: parse it, then lower the CST to a [`Code`] (a
+/// `;`-separated statement sequence — the natural root for a submission, not the
+/// comma-level `Args`). Blank (whitespace-only) lines are ignored — pressing
+/// Enter at an empty prompt does nothing, as in Python's REPL. The
+/// [`ParseError`] / [`LowerError`] own their data; the [`Code`] AST borrows
+/// `src`'s identifiers and literals.
+fn check_line(src: &str) -> Checked<'_> {
     if src.trim().is_empty() {
-        return None;
+        return Checked::Blank;
     }
-    parse_source(src).err().map(|e| *e)
+    let cst = match parse_source(src) {
+        Ok(cst) => cst,
+        Err(e) => return Checked::Parse(*e),
+    };
+    match Code::try_from(&cst) {
+        Ok(code) => Checked::Ast(code),
+        Err(e) => Checked::Lower(e),
+    }
+}
+
+/// Check one REPL submission and report the outcome: print the lowered AST
+/// (`{:#?}`) to stdout on success, or a rustc-style diagnostic to stderr for a
+/// parse or lowering error. Blank submissions produce no output. `name` labels
+/// the source in diagnostics.
+fn handle_submission(name: &str, src: &str) {
+    match check_line(src) {
+        Checked::Blank => {}
+        Checked::Ast(ast) => println!("{ast:#?}"),
+        Checked::Parse(e) => report_parse_error(name, src, &e),
+        Checked::Lower(e) => report_lower_error(name, src, &e),
+    }
 }
 
 /// Whether `src` is an unfinished submission the REPL should keep open for more
@@ -422,6 +454,18 @@ fn report_parse_error(name: &str, src: &str, e: &ParseError) {
         report = report.with_help(help);
     }
     let _ = report.finish().eprint((name, Source::from(src)));
+}
+
+/// Render an AST-lowering error to stderr in the same rustc-style ariadne form
+/// as [`report_parse_error`]. A [`LowerError`] carries no source span (the CST
+/// has none), so the label spans the whole submission rather than one token.
+fn report_lower_error(name: &str, src: &str, e: &LowerError) {
+    let span = 0..src.len();
+    let _ = Report::build(ReportKind::Error, (name, span.clone()))
+        .with_message(e.to_string())
+        .with_label(Label::new((name, span)).with_message("cannot be lowered to an AST"))
+        .finish()
+        .eprint((name, Source::from(src)));
 }
 
 /// Print a rustfmt-style unified diff of `src` (the original) against
@@ -588,30 +632,41 @@ mod tests {
 
     #[test]
     fn repl_ignores_blank_lines() {
-        // Pressing Enter at an empty prompt must not report an error, even
-        // though an empty program does not parse.
-        assert!(check_line("").is_none());
-        assert!(check_line("   ").is_none());
-        assert!(check_line("\t  ").is_none());
+        // Pressing Enter at an empty prompt must do nothing, even though an
+        // empty program does not parse.
+        assert!(matches!(check_line(""), Checked::Blank));
+        assert!(matches!(check_line("   "), Checked::Blank));
+        assert!(matches!(check_line("\t  "), Checked::Blank));
     }
 
     #[test]
-    fn repl_accepts_valid_statements() {
-        assert!(check_line("print('Hello World!')").is_none());
-        assert!(check_line("a = 5").is_none());
-        assert!(check_line("foo(a, b) -> a + b").is_none());
+    fn repl_lowers_valid_statements() {
+        assert!(matches!(
+            check_line("print('Hello World!')"),
+            Checked::Ast(_)
+        ));
+        assert!(matches!(check_line("a = 5"), Checked::Ast(_)));
+        assert!(matches!(check_line("foo(a, b) -> a + b"), Checked::Ast(_)));
         // A lone trailing `;` is lenient, and several `;`-separated statements
         // on one line are a single valid program.
-        assert!(check_line("a = 5;").is_none());
-        assert!(check_line("a; b; c").is_none());
+        assert!(matches!(check_line("a = 5;"), Checked::Ast(_)));
+        assert!(matches!(check_line("a; b; c"), Checked::Ast(_)));
     }
 
     #[test]
     fn repl_reports_parse_errors() {
         // Incomplete input (ends mid-expression) and stray tokens both fail.
-        assert!(check_line("1 +").is_some());
-        assert!(check_line(")").is_some());
-        assert!(check_line("print(").is_some());
+        assert!(matches!(check_line("1 +"), Checked::Parse(_)));
+        assert!(matches!(check_line(")"), Checked::Parse(_)));
+        assert!(matches!(check_line("print("), Checked::Parse(_)));
+    }
+
+    #[test]
+    fn repl_reports_lowering_errors() {
+        // These parse, but cannot be lowered: assigning to a literal or to an
+        // operator expression is not a valid target.
+        assert!(matches!(check_line("1 = 2"), Checked::Lower(_)));
+        assert!(matches!(check_line("a + b = c"), Checked::Lower(_)));
     }
 
     #[test]
@@ -645,7 +700,7 @@ mod tests {
         // The interactive loop joins continuation lines with '\n' before
         // parsing, so a bracketed body split across several lines must parse as
         // a single submission.
-        assert!(check_line("foo(\n  1,\n  2\n)").is_none());
-        assert!(check_line("[\n  1,\n  2\n]").is_none());
+        assert!(matches!(check_line("foo(\n  1,\n  2\n)"), Checked::Ast(_)));
+        assert!(matches!(check_line("[\n  1,\n  2\n]"), Checked::Ast(_)));
     }
 }
