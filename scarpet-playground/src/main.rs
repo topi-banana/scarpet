@@ -64,6 +64,8 @@ struct App {
     output: String,
     /// Human-readable diagnostics: a parse error's headline plus an optional `help:` line.
     diagnostics: Vec<String>,
+    /// Heading shown above [`diagnostics`](Self::diagnostics): the kind of error that produced them.
+    diagnostics_title: &'static str,
     /// The tool that produced `output`, once one has run.
     mode: Option<Mode>,
     /// The formatting style applied in [`Mode::Format`], edited from the options bar.
@@ -93,23 +95,24 @@ impl App {
                     self.output = formatted;
                     self.diagnostics = Vec::new();
                 }
-                Err(scarpet_fmt::FmtError::Parse(err)) => {
-                    self.output = String::new();
-                    self.diagnostics = diagnostics_for(&err);
-                }
+                Err(scarpet_fmt::FmtError::Parse(err)) => self.report_parse(&err),
             },
             Mode::Syntax => match scarpet_syntax::parser::parse_source(&self.input) {
                 Ok(cst) => {
                     self.output = format!("{cst:#?}");
                     self.diagnostics = Vec::new();
                 }
-                Err(err) => {
-                    self.output = String::new();
-                    self.diagnostics = diagnostics_for(&err);
-                }
+                Err(err) => self.report_parse(&err),
             },
         }
         self.mode = Some(mode);
+    }
+
+    /// Record a parse error as the current diagnostics, clearing any stale output.
+    fn report_parse(&mut self, err: &ParseError) {
+        self.output = String::new();
+        self.diagnostics = diagnostics_for(err);
+        self.diagnostics_title = "Parse error";
     }
 
     /// Re-run the formatter in place after a config change, but only while the
@@ -128,7 +131,7 @@ impl App {
         }
         html! {
             <div class="max-h-40 shrink-0 overflow-auto border-t border-hairline bg-canvas px-4 py-2 font-mono text-xs text-error">
-                <div class="pb-1 font-medium">{ "Parse error" }</div>
+                <div class="pb-1 font-medium">{ self.diagnostics_title }</div>
                 { for self.diagnostics.iter().map(|d| html! { <div class="py-0.5">{ d }</div> }) }
             </div>
         }
@@ -226,6 +229,7 @@ impl Component for App {
             input: SAMPLE.to_string(),
             output: String::new(),
             diagnostics: Vec::new(),
+            diagnostics_title: "Parse error",
             mode: None,
             config: Config::default(),
         };
