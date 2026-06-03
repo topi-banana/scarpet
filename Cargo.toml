@@ -9,7 +9,7 @@ chumsky = { version = "0.11" }
 logos = { version = "0.15.1" }
 logosky = { version = "0.2" }
 rustyline = { version = "18" }
-similar = { version = "2" }
+similar = { version = "3" }
 scarpet-fmt = { path = "./scarpet-fmt" }
 scarpet-syntax = { path = "./scarpet-syntax" }
 serde = { version = "1", features = ["derive"] }
