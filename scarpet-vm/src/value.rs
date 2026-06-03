@@ -68,6 +68,36 @@ impl Value {
         Value::Double(f64::NAN)
     }
 
+    /// Converts a string literal (the source text of `Primary::Str`, with its
+    /// surrounding single quotes) into a `String` value. Strips the quotes and
+    /// expands escapes the way the original `Tokenizer` does: `\n`/`\t` become
+    /// newline/tab, and every other `\x` keeps `x` verbatim (so `\\` and `\'`
+    /// are a literal backslash and quote). The original rejects `\r`; lacking an
+    /// error channel we let it fall into that pass-through case.
+    pub fn from_string_literal(s: &str) -> Value {
+        let inner = s
+            .strip_prefix('\'')
+            .and_then(|s| s.strip_suffix('\''))
+            .unwrap_or(s);
+        let mut out = String::with_capacity(inner.len());
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                // `\\`, `\'`, and any other `\x` keep the second char as-is.
+                Some(other) => out.push(other),
+                // A trailing backslash; the lexer's string regex never emits one.
+                None => out.push('\\'),
+            }
+        }
+        Value::String(out)
+    }
+
     /// Truthiness in a boolean context. Corresponds to the original `getBoolean`.
     pub fn is_true(&self) -> bool {
         match self {

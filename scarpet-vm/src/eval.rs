@@ -4,7 +4,8 @@
 #![allow(unused_variables)]
 
 use scarpet_syntax::ast::{
-    Additive, Assign, Code, Compare, Equality, Expr, Get, Land, Lor, Mult, Power, Primary, Unary,
+    Additive, Args, Assign, Code, Compare, Equality, Expr, Get, Land, Lor, Mult, Power, Primary,
+    Unary,
 };
 
 use crate::{
@@ -165,12 +166,83 @@ impl<'src, 'state> Evalute<Primary<'src>> for ScarpetVm<'state> {
     fn push(&mut self, st: Primary<'src>) -> Result<ValueContainer, VmError> {
         match st {
             Primary::Number(v) => Ok(ValueContainer::new(Value::from_number_literal(v))),
-            Primary::Str(v) => todo!(),
-            Primary::Ident(v) => todo!(),
+            Primary::Str(v) => Ok(ValueContainer::new(Value::from_string_literal(v))),
+            // A bare variable reference reads the current binding; an unset name
+            // evaluates to `undef` (the original `strict`-config UndefValue).
+            Primary::Ident(name) => Ok(self
+                .var
+                .get(name)
+                .cloned()
+                .unwrap_or_else(ValueContainer::undef)),
             Primary::Call { name, args } => todo!(),
-            Primary::List(v) => todo!(),
+            // `[a, b, …]`: evaluate each comma-separated element to a value.
+            Primary::List(Args(codes)) => {
+                let mut items = Vec::with_capacity(codes.len());
+                for code in codes {
+                    items.push(self.push(code)?.lock()?.clone());
+                }
+                Ok(ValueContainer::new(Value::List(items)))
+            }
             Primary::Map(v) => todo!(),
-            Primary::Paren(v) => todo!(),
+            // `( … )`: evaluate the body and yield its last value.
+            Primary::Paren(Args(codes)) => {
+                let mut result = ValueContainer::null();
+                for code in codes {
+                    result = self.push(code)?;
+                }
+                Ok(result)
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use scarpet_syntax::parser::parse_source;
+
+    use super::*;
+    use crate::vm::GlobalState;
+
+    /// Parse, lower, and evaluate `src` in a fresh VM, returning its value.
+    fn eval(src: &str) -> Value {
+        let cst = parse_source(src).expect("parse");
+        let code = Code::try_from(&cst).expect("lower");
+        let mut global = GlobalState {};
+        let mut vm = global.create_new_vm();
+        vm.push(code).expect("eval").lock().expect("lock").clone()
+    }
+
+    #[test]
+    fn string_literal_strips_quotes() {
+        assert_eq!(eval("'hello'"), Value::String("hello".to_owned()));
+    }
+
+    #[test]
+    fn string_literal_expands_escapes() {
+        assert_eq!(eval(r"'a\nb'"), Value::String("a\nb".to_owned()));
+        assert_eq!(eval(r"'it\'s'"), Value::String("it's".to_owned()));
+    }
+
+    #[test]
+    fn ident_reads_an_assigned_variable() {
+        assert_eq!(eval("x = 42; x"), Value::Int(42));
+    }
+
+    #[test]
+    fn ident_unset_is_undef() {
+        assert_eq!(eval("missing"), Value::Undef);
+    }
+
+    #[test]
+    fn list_literal_collects_its_elements() {
+        assert_eq!(
+            eval("[1, 2, 3]"),
+            Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+        );
+    }
+
+    #[test]
+    fn paren_yields_its_inner_value() {
+        assert_eq!(eval("(1 + 2) * 3"), Value::Int(9));
     }
 }
