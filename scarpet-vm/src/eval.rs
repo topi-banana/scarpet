@@ -114,7 +114,7 @@ impl<'src, 'state> Evalute<Additive<'src>> for ScarpetVm<'state> {
     fn push(&mut self, st: Additive<'src>) -> Result<ValueContainer, VmError> {
         match st {
             Additive::Add { lhs, rhs } => self.push(*lhs)? + self.push(rhs)?,
-            Additive::Sub { lhs, rhs } => todo!(),
+            Additive::Sub { lhs, rhs } => self.push(*lhs)? - self.push(rhs)?,
             Additive::Mult(ost) => self.push(ost),
         }
     }
@@ -123,8 +123,8 @@ impl<'src, 'state> Evalute<Additive<'src>> for ScarpetVm<'state> {
 impl<'src, 'state> Evalute<Mult<'src>> for ScarpetVm<'state> {
     fn push(&mut self, st: Mult<'src>) -> Result<ValueContainer, VmError> {
         match st {
-            Mult::Mul { lhs, rhs } => todo!(),
-            Mult::Div { lhs, rhs } => todo!(),
+            Mult::Mul { lhs, rhs } => self.push(*lhs)? * self.push(rhs)?,
+            Mult::Div { lhs, rhs } => self.push(*lhs)? / self.push(rhs)?,
             Mult::Rem { lhs, rhs } => todo!(),
             Mult::Power(ost) => self.push(ost),
         }
