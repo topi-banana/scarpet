@@ -1128,6 +1128,7 @@ dependencies = [
  "rustyline",
  "scarpet-fmt",
  "scarpet-syntax",
+ "scarpet-vm",
  "serde",
  "similar",
  "toml",
@@ -1157,6 +1158,13 @@ dependencies = [
  "chumsky",
  "logos",
  "logosky",
+]
+
+[[package]]
+name = "scarpet-vm"
+version = "0.1.0"
+dependencies = [
+ "scarpet-syntax",
 ]
 
 [[package]]

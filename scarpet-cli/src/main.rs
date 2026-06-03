@@ -9,6 +9,7 @@ use rustyline::{DefaultEditor, EventHandler, KeyCode, KeyEvent, Modifiers};
 use scarpet_fmt::{BraceStyle, Config, FmtError, LineEnding, format_source};
 use scarpet_syntax::ast::{Code, LowerError};
 use scarpet_syntax::parser::{ParseError, has_open_delimiter, parse_source};
+use scarpet_vm::{Evalute, GlobalState};
 use serde::Deserialize;
 use similar::{ChangeTag, TextDiff};
 
@@ -420,7 +421,11 @@ fn check_line(src: &str) -> Checked<'_> {
 fn handle_submission(name: &str, src: &str) {
     match check_line(src) {
         Checked::Blank => {}
-        Checked::Ast(ast) => println!("{ast:#?}"),
+        Checked::Ast(ast) => {
+            let mut state = GlobalState {};
+            let mut vm = state.create_new_vm();
+            println!("{:?}", vm.push(ast).unwrap().lock().unwrap());
+        }
         Checked::Parse(e) => report_parse_error(name, src, &e),
         Checked::Lower(e) => report_lower_error(name, src, &e),
     }

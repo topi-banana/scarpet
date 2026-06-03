@@ -9,6 +9,7 @@ clap.workspace = true
 rustyline.workspace = true
 scarpet-fmt.workspace = true
 scarpet-syntax.workspace = true
+scarpet-vm.workspace = true
 serde.workspace = true
 similar.workspace = true
 toml.workspace = true
