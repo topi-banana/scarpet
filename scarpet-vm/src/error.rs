@@ -7,4 +7,8 @@ pub enum VmError {
     /// `PoisonError` whose guard borrows the lock for `'_`; we drop that detail
     /// and surface this variant instead.
     PoisonedLock,
+    /// fabric-carpet's `MapValue.compareTo` throws "Cannot compare with a map
+    /// value"; the relational operators (`<`, `<=`, `>`, `>=`) surface it here.
+    /// Map *equality* (`==` / `!=`) is structural, so it stays fine.
+    IncomparableMap,
 }

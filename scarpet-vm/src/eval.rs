@@ -3,6 +3,8 @@
 // implemented. Drop this allow once the evaluator is filled in.
 #![allow(unused_variables)]
 
+use std::cmp::Ordering;
+
 use scarpet_syntax::ast::{
     Additive, Args, Assign, Code, Compare, Equality, Expr, Get, Land, Lor, Mult, Power, Primary,
     Unary,
@@ -92,8 +94,14 @@ impl<'src, 'state> Evalute<Land<'src>> for ScarpetVm<'state> {
 impl<'src, 'state> Evalute<Equality<'src>> for ScarpetVm<'state> {
     fn push(&mut self, st: Equality<'src>) -> Result<ValueContainer, VmError> {
         match st {
-            Equality::Eq { lhs, rhs } => todo!(),
-            Equality::Ne { lhs, rhs } => todo!(),
+            Equality::Eq { lhs, rhs } => {
+                let (lhs, rhs) = (self.push(*lhs)?, self.push(rhs)?);
+                Ok(ValueContainer::bool(lhs.scarpet_eq(&rhs)?))
+            }
+            Equality::Ne { lhs, rhs } => {
+                let (lhs, rhs) = (self.push(*lhs)?, self.push(rhs)?);
+                Ok(ValueContainer::bool(!lhs.scarpet_eq(&rhs)?))
+            }
             Equality::Compare(ost) => self.push(ost),
         }
     }
@@ -102,10 +110,30 @@ impl<'src, 'state> Evalute<Equality<'src>> for ScarpetVm<'state> {
 impl<'src, 'state> Evalute<Compare<'src>> for ScarpetVm<'state> {
     fn push(&mut self, st: Compare<'src>) -> Result<ValueContainer, VmError> {
         match st {
-            Compare::Lt { lhs, rhs } => todo!(),
-            Compare::Le { lhs, rhs } => todo!(),
-            Compare::Gt { lhs, rhs } => todo!(),
-            Compare::Ge { lhs, rhs } => todo!(),
+            Compare::Lt { lhs, rhs } => {
+                let (lhs, rhs) = (self.push(*lhs)?, self.push(rhs)?);
+                Ok(ValueContainer::bool(
+                    lhs.scarpet_compare(&rhs)? == Ordering::Less,
+                ))
+            }
+            Compare::Le { lhs, rhs } => {
+                let (lhs, rhs) = (self.push(*lhs)?, self.push(rhs)?);
+                Ok(ValueContainer::bool(
+                    lhs.scarpet_compare(&rhs)? != Ordering::Greater,
+                ))
+            }
+            Compare::Gt { lhs, rhs } => {
+                let (lhs, rhs) = (self.push(*lhs)?, self.push(rhs)?);
+                Ok(ValueContainer::bool(
+                    lhs.scarpet_compare(&rhs)? == Ordering::Greater,
+                ))
+            }
+            Compare::Ge { lhs, rhs } => {
+                let (lhs, rhs) = (self.push(*lhs)?, self.push(rhs)?);
+                Ok(ValueContainer::bool(
+                    lhs.scarpet_compare(&rhs)? != Ordering::Less,
+                ))
+            }
             Compare::Additive(ost) => self.push(ost),
         }
     }
@@ -244,5 +272,60 @@ mod tests {
     #[test]
     fn paren_yields_its_inner_value() {
         assert_eq!(eval("(1 + 2) * 3"), Value::Int(9));
+    }
+
+    #[test]
+    fn equality_compares_values() {
+        assert_eq!(eval("1 == 1"), Value::Bool(true));
+        assert_eq!(eval("1 != 2"), Value::Bool(true));
+    }
+
+    /// `1 == 1.0` is true end-to-end (the literal `1.0` lowers to a `Double`).
+    #[test]
+    fn equality_treats_int_and_double_as_equal() {
+        assert_eq!(eval("1 == 1.0"), Value::Bool(true));
+    }
+
+    #[test]
+    fn relational_operators_compare_numbers() {
+        assert_eq!(eval("1 < 2"), Value::Bool(true));
+        assert_eq!(eval("2 <= 2"), Value::Bool(true));
+        assert_eq!(eval("3 > 2"), Value::Bool(true));
+        assert_eq!(eval("2 >= 3"), Value::Bool(false));
+    }
+
+    #[test]
+    fn relational_operators_compare_strings() {
+        assert_eq!(eval("'a' < 'b'"), Value::Bool(true));
+        assert_eq!(eval("'b' < 'a'"), Value::Bool(false));
+    }
+
+    #[test]
+    fn equality_and_order_on_lists() {
+        assert_eq!(eval("[1, 2] == [1, 2]"), Value::Bool(true));
+        assert_eq!(eval("[1] == [1.0]"), Value::Bool(true));
+        // Length-first ordering: the shorter list is smaller.
+        assert_eq!(eval("[2] < [1, 1]"), Value::Bool(true));
+    }
+
+    /// Additive binds tighter than equality, so this lowers as `(1 + 1) == 2`.
+    #[test]
+    fn additive_binds_tighter_than_equality() {
+        assert_eq!(eval("1 + 1 == 2"), Value::Bool(true));
+    }
+
+    /// Equality is left-associative: `1 == 2 == 0` is `(1 == 2) == 0`, i.e.
+    /// `false == 0`, and a `false` bool equals the number `0`, so it is true.
+    #[test]
+    fn equality_is_left_associative() {
+        assert_eq!(eval("1 == 2 == 0"), Value::Bool(true));
+    }
+
+    /// `null` currently lowers to an unset variable (`undef`), but undef and
+    /// null share comparison semantics, so these still hold.
+    #[test]
+    fn comparisons_on_null() {
+        assert_eq!(eval("null == null"), Value::Bool(true));
+        assert_eq!(eval("null < 1"), Value::Bool(true));
     }
 }
