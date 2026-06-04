@@ -18,4 +18,8 @@ pub enum VmError {
     /// The modulo operator `%` was given a zero divisor (the original `mod`
     /// raises an `ArithmeticException`).
     DivisionByZero,
+    /// A map literal / `m(...)` entry was a list whose length was not 2, so it
+    /// is not a key/value pair (the original `MapValue.put` throws "Map
+    /// constructor requires elements that have two items").
+    MapEntryNotPair,
 }
