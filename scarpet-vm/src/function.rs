@@ -14,13 +14,15 @@ use crate::{
 };
 
 /// A callable: a builtin (a unit struct such as [`Type`]) or a user-defined
-/// [`DefFunction`]. `call` receives the already-evaluated arguments plus the vm,
-/// which a builtin may ignore and a user function uses to evaluate its body.
+/// [`DefFunction`]. `call` receives the still-unevaluated argument [`Args`] plus
+/// the vm, and evaluates through the vm whichever arguments it needs: an ordinary
+/// function evaluates them all up front, while a special form like [`Call`] can
+/// evaluate them selectively.
 pub trait Function<'src> {
     fn call(
         &self,
         vm: &mut ScarpetVm<'_, 'src>,
-        args: Vec<ValueContainer>,
+        args: Args<'src>,
     ) -> Result<ValueContainer, VmError>;
 }
 
@@ -32,12 +34,15 @@ pub(crate) fn register_builtins(state: &mut GlobalState<'_>) {
     state.register("call", Rc::new(Call));
 }
 
-/// Unwrap the single argument of a one-arity builtin.
-fn arg1(mut args: Vec<ValueContainer>) -> Result<ValueContainer, VmError> {
+/// Evaluate the single argument of a one-arity builtin.
+fn arg1<'src>(
+    vm: &mut ScarpetVm<'_, 'src>,
+    Args(mut args): Args<'src>,
+) -> Result<ValueContainer, VmError> {
     if args.len() != 1 {
         return Err(VmError::WrongArgCount);
     }
-    Ok(args.pop().unwrap())
+    vm.push(args.pop().unwrap())
 }
 
 /// `type(x)` — the value's type name (the original `type`).
@@ -45,10 +50,10 @@ struct Type;
 impl<'src> Function<'src> for Type {
     fn call(
         &self,
-        _vm: &mut ScarpetVm<'_, 'src>,
-        args: Vec<ValueContainer>,
+        vm: &mut ScarpetVm<'_, 'src>,
+        args: Args<'src>,
     ) -> Result<ValueContainer, VmError> {
-        let name = arg1(args)?.lock()?.type_name();
+        let name = arg1(vm, args)?.lock()?.type_name();
         Ok(ValueContainer::string(name.to_owned()))
     }
 }
@@ -59,10 +64,10 @@ struct Str;
 impl<'src> Function<'src> for Str {
     fn call(
         &self,
-        _vm: &mut ScarpetVm<'_, 'src>,
-        args: Vec<ValueContainer>,
+        vm: &mut ScarpetVm<'_, 'src>,
+        args: Args<'src>,
     ) -> Result<ValueContainer, VmError> {
-        let s = arg1(args)?.lock()?.to_scarpet_string();
+        let s = arg1(vm, args)?.lock()?.to_scarpet_string();
         Ok(ValueContainer::string(s))
     }
 }
@@ -72,10 +77,10 @@ struct Print;
 impl<'src> Function<'src> for Print {
     fn call(
         &self,
-        _vm: &mut ScarpetVm<'_, 'src>,
-        args: Vec<ValueContainer>,
+        vm: &mut ScarpetVm<'_, 'src>,
+        args: Args<'src>,
     ) -> Result<ValueContainer, VmError> {
-        let value = arg1(args)?;
+        let value = arg1(vm, args)?;
         println!("{}", value.lock()?.to_scarpet_string());
         Ok(value)
     }
@@ -86,21 +91,22 @@ impl<'src> Function<'src> for Call {
     fn call(
         &self,
         vm: &mut ScarpetVm<'_, 'src>,
-        mut args: Vec<ValueContainer>,
+        args: Args<'src>,
     ) -> Result<ValueContainer, VmError> {
-        if args.is_empty() {
+        let Args(mut codes) = args;
+        if codes.is_empty() {
             return Err(VmError::WrongArgCount);
         }
         // The first argument names the function to call. The original `call`
         // also accepts a first-class function value, but this VM has no
         // function-value type yet, so only a string name resolves to a callable.
-        let Value::String(name) = args.remove(0).lock()?.clone() else {
+        let Value::String(name) = vm.push(codes.remove(0))?.lock()?.clone() else {
             return Err(VmError::UnknownFunction);
         };
         let Some(function) = vm.function(&name) else {
             return Err(VmError::UnknownFunction);
         };
-        function.call(vm, args)
+        function.call(vm, Args(codes))
     }
 }
 
@@ -126,9 +132,10 @@ impl<'src> Function<'src> for DefFunction<'src> {
     fn call(
         &self,
         vm: &mut ScarpetVm<'_, 'src>,
-        args: Vec<ValueContainer>,
+        args: Args<'src>,
     ) -> Result<ValueContainer, VmError> {
-        if args.len() != self.params.len() {
+        let Args(codes) = args;
+        if codes.len() != self.params.len() {
             return Err(VmError::WrongArgCount);
         }
         // A function body runs in its own VM over the same global state, with
@@ -136,9 +143,17 @@ impl<'src> Function<'src> for DefFunction<'src> {
         // without `outer` / `global`, which are not modelled yet. Each parameter
         // gets its own fresh slot holding a copy of the argument's value, so the
         // body cannot reach back and mutate a caller variable passed by name.
+        //
+        // The arguments are evaluated here, in the caller's scope, before the
+        // child exists: `inner` borrows `vm`, so `vm.push` is unavailable once
+        // it does.
+        let values = codes
+            .into_iter()
+            .map(|arg| Ok(vm.push(arg)?.lock()?.clone()))
+            .collect::<Result<Vec<Value>, VmError>>()?;
         let mut inner = vm.child();
-        for (name, arg) in self.params.iter().zip(args) {
-            *inner.get_var(name).lock()? = arg.lock()?.clone();
+        for (name, value) in self.params.iter().zip(values) {
+            *inner.get_var(name).lock()? = value;
         }
         inner.push((*self.body).clone())
     }

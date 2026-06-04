@@ -215,17 +215,13 @@ impl<'src, 'state> Evalute<Primary<'src>> for ScarpetVm<'state, 'src> {
             // A bare variable reference yields its binding, materialising an
             // unset name as `undef` (the original `strict`-config UndefValue).
             Primary::Ident(name) => Ok(self.get_var(name)),
-            // `name(args)`: evaluate each argument, then look the function up in
-            // the global table (builtin or user-defined) and call it.
-            Primary::Call { name, args } => {
-                let func = self.function(name).ok_or(VmError::UnknownFunction)?;
-                let Args(codes) = args;
-                let mut values = Vec::with_capacity(codes.len());
-                for code in codes {
-                    values.push(self.push(code)?);
-                }
-                func.call(self, values)
-            }
+            // `name(args)`: look the function up in the global table (builtin or
+            // user-defined) and hand it the still-unevaluated arguments — each
+            // callable evaluates its own args, so a special form can choose not to.
+            Primary::Call { name, args } => self
+                .function(name)
+                .ok_or(VmError::UnknownFunction)?
+                .call(self, args),
             // `[a, b, …]`: evaluate each comma-separated element to a value.
             Primary::List(Args(codes)) => {
                 let mut items = Vec::with_capacity(codes.len());
