@@ -22,4 +22,7 @@ pub enum VmError {
     /// is not a key/value pair (the original `MapValue.put` throws "Map
     /// constructor requires elements that have two items").
     MapEntryNotPair,
+    /// The right side of `~` against a string / number was not a valid regular
+    /// expression (the original `Value.in` throws "Incorrect matching pattern").
+    InvalidPattern,
 }

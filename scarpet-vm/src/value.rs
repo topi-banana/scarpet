@@ -4,6 +4,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use regex::Regex;
+
 use crate::error::VmError;
 
 /// Tolerance for treating a number as zero. Matches the value the original
@@ -373,6 +375,56 @@ impl Value {
             _ => Ok(Value::Null),
         }
     }
+
+    /// Scarpet `~` match (`left.in(right)`). On a `List` it is the index of the
+    /// first element equal to `right` (else null); on a `Map` it is the key
+    /// itself when present (else null); `null` / `undef` is always null. On a
+    /// string or number, `right` is compiled as a regex and searched against the
+    /// left's string form: no match is null, no capture groups yields the whole
+    /// match, one group yields that group, and several yield a list of the group
+    /// strings (the original `Value.in`). A bad pattern is `InvalidPattern`.
+    pub fn scarpet_match(&self, right: &Value) -> Result<Value, VmError> {
+        match self {
+            Value::List(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    if item.scarpet_eq(right) {
+                        return Ok(Value::Int(i as i64));
+                    }
+                }
+                Ok(Value::Null)
+            }
+            Value::Map(entries) => {
+                for (k, _) in entries {
+                    if k.scarpet_eq(right) {
+                        return Ok(right.clone());
+                    }
+                }
+                Ok(Value::Null)
+            }
+            // `NullValue.in` is overridden to always yield null (no regex).
+            Value::Undef | Value::Null => Ok(Value::Null),
+            // Strings and numbers match `right` as a regex on their string forms.
+            _ => {
+                let re =
+                    Regex::new(&right.to_scarpet_string()).map_err(|_| VmError::InvalidPattern)?;
+                let haystack = self.to_scarpet_string();
+                let Some(caps) = re.captures(&haystack) else {
+                    return Ok(Value::Null);
+                };
+                let group = |i: usize| {
+                    caps.get(i)
+                        .map_or(Value::Null, |m| Value::String(m.as_str().to_owned()))
+                };
+                // `caps.len()` counts group 0 (the whole match) plus the capture
+                // groups, mirroring the original `groupCount()` + 1.
+                match caps.len() - 1 {
+                    0 => Ok(group(0)),
+                    1 => Ok(group(1)),
+                    n => Ok(Value::List((1..=n).map(group).collect())),
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -449,6 +501,13 @@ impl ValueContainer {
         let base = self.lock()?.clone();
         let key = key.lock()?.clone();
         Ok(ValueContainer::new(base.scarpet_get(&key)?))
+    }
+    /// `~` match ([`Value::scarpet_match`]). Clones each side out of its lock
+    /// first, so `x ~ x` cannot deadlock.
+    pub fn scarpet_match(&self, right: &ValueContainer) -> Result<ValueContainer, VmError> {
+        let left = self.lock()?.clone();
+        let right = right.lock()?.clone();
+        Ok(ValueContainer::new(left.scarpet_match(&right)?))
     }
 }
 
@@ -1185,5 +1244,85 @@ mod tests {
         let list = ValueContainer::new(Value::List(vec![Value::Int(7), Value::Int(8)]));
         let got = list.scarpet_get(&ValueContainer::int(1)).unwrap();
         assert_eq!(*got.lock().unwrap(), Value::Int(8));
+    }
+
+    #[test]
+    fn scarpet_match_list_returns_index() {
+        let list = Value::List(vec![Value::Int(10), Value::Int(20), Value::Int(30)]);
+        assert_eq!(list.scarpet_match(&Value::Int(20)).unwrap(), Value::Int(1));
+        assert_eq!(list.scarpet_match(&Value::Int(99)).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn scarpet_match_map_returns_key_when_present() {
+        let map = Value::Map(vec![(Value::String("a".to_owned()), Value::Int(1))]);
+        assert_eq!(
+            map.scarpet_match(&Value::String("a".to_owned())).unwrap(),
+            Value::String("a".to_owned())
+        );
+        assert_eq!(
+            map.scarpet_match(&Value::String("z".to_owned())).unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn scarpet_match_string_regex_groups() {
+        let s = Value::String("a1b2".to_owned());
+        // No capture groups: the whole match.
+        assert_eq!(
+            Value::String("hello".to_owned())
+                .scarpet_match(&Value::String("l+".to_owned()))
+                .unwrap(),
+            Value::String("ll".to_owned())
+        );
+        // One group: that group.
+        assert_eq!(
+            s.scarpet_match(&Value::String("([a-z])".to_owned()))
+                .unwrap(),
+            Value::String("a".to_owned())
+        );
+        // Several groups: a list of the group strings.
+        assert_eq!(
+            s.scarpet_match(&Value::String("([a-z])([0-9])".to_owned()))
+                .unwrap(),
+            Value::List(vec![
+                Value::String("a".to_owned()),
+                Value::String("1".to_owned()),
+            ])
+        );
+        // No match: null.
+        assert_eq!(
+            Value::String("hello".to_owned())
+                .scarpet_match(&Value::String("z".to_owned()))
+                .unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn scarpet_match_null_is_always_null() {
+        assert_eq!(
+            Value::Null
+                .scarpet_match(&Value::String("x".to_owned()))
+                .unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn scarpet_match_invalid_pattern_errors() {
+        let s = Value::String("hello".to_owned());
+        assert!(matches!(
+            s.scarpet_match(&Value::String("(".to_owned())),
+            Err(VmError::InvalidPattern)
+        ));
+    }
+
+    #[test]
+    fn value_container_match_delegates() {
+        let list = ValueContainer::new(Value::List(vec![Value::Int(5), Value::Int(6)]));
+        let got = list.scarpet_match(&ValueContainer::int(6)).unwrap();
+        assert_eq!(*got.lock().unwrap(), Value::Int(1));
     }
 }

@@ -196,8 +196,7 @@ impl<'src, 'state> Evalute<Get<'src>> for ScarpetVm<'state> {
                 let key = self.push(key)?;
                 match op {
                     GetOp::Get => base.scarpet_get(&key),
-                    // `~` (match) needs regex for the string case; not yet done.
-                    GetOp::Match => todo!(),
+                    GetOp::Match => base.scarpet_match(&key),
                 }
             }
             Get::Primary(ost) => self.push(ost),
@@ -495,5 +494,46 @@ mod tests {
         let mut global = GlobalState {};
         let mut vm = global.create_new_vm();
         assert!(matches!(vm.push(code), Err(VmError::MapEntryNotPair)));
+    }
+
+    #[test]
+    fn match_finds_a_list_index() {
+        assert_eq!(eval("[10, 20, 30] ~ 20"), Value::Int(1));
+        // A missing element yields null.
+        assert_eq!(eval("[10, 20, 30] ~ 99"), Value::Null);
+    }
+
+    #[test]
+    fn match_tests_map_key_presence() {
+        assert_eq!(
+            eval("{'a' -> 1, 'b' -> 2} ~ 'a'"),
+            Value::String("a".to_owned())
+        );
+        assert_eq!(eval("{'a' -> 1} ~ 'z'"), Value::Null);
+    }
+
+    #[test]
+    fn match_runs_a_regex_on_a_string() {
+        // No capture groups: the whole match.
+        assert_eq!(eval("'hello' ~ 'l+'"), Value::String("ll".to_owned()));
+        // No match yields null.
+        assert_eq!(eval("'hello' ~ 'z'"), Value::Null);
+    }
+
+    #[test]
+    fn match_regex_capture_groups() {
+        // One group yields that group.
+        assert_eq!(
+            eval("'abc123' ~ '([a-z]+)'"),
+            Value::String("abc".to_owned())
+        );
+        // Several groups yield a list.
+        assert_eq!(
+            eval("'a1b2' ~ '([a-z])([0-9])'"),
+            Value::List(vec![
+                Value::String("a".to_owned()),
+                Value::String("1".to_owned()),
+            ])
+        );
     }
 }
