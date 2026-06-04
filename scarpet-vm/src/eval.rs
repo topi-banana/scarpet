@@ -56,11 +56,7 @@ impl<'src, 'state> Evalute<Assign<'src>> for ScarpetVm<'state, 'src> {
         match st {
             Assign::Set { target, op, value } => {
                 let var = match target {
-                    Assignable::Var(name) => self.var.get(name).cloned().unwrap_or_else(|| {
-                        let v = ValueContainer::null();
-                        self.var.insert(name.to_owned(), v.clone());
-                        v
-                    }),
+                    Assignable::Var(name) => self.get_var(name),
                     _ => todo!(),
                 };
                 let val = self.push(*value)?;
@@ -216,13 +212,9 @@ impl<'src, 'state> Evalute<Primary<'src>> for ScarpetVm<'state, 'src> {
         match st {
             Primary::Number(v) => Ok(ValueContainer::new(Value::from_number_literal(v))),
             Primary::Str(v) => Ok(ValueContainer::new(Value::from_string_literal(v))),
-            // A bare variable reference reads the current binding; an unset name
-            // evaluates to `undef` (the original `strict`-config UndefValue).
-            Primary::Ident(name) => Ok(self
-                .var
-                .get(name)
-                .cloned()
-                .unwrap_or_else(ValueContainer::undef)),
+            // A bare variable reference yields its binding, materialising an
+            // unset name as `undef` (the original `strict`-config UndefValue).
+            Primary::Ident(name) => Ok(self.get_var(name)),
             // `name(args)`: evaluate each argument, then look the function up in
             // the global table (builtin or user-defined) and call it.
             Primary::Call { name, args } => {

@@ -108,10 +108,12 @@ impl<'src> Function<'src> for DefFunction<'src> {
         }
         // A function body runs in its own VM over the same global state, with
         // only the parameters bound. Scarpet functions do not see caller locals
-        // without `outer` / `global`, which are not modelled yet.
+        // without `outer` / `global`, which are not modelled yet. Each parameter
+        // gets its own fresh slot holding a copy of the argument's value, so the
+        // body cannot reach back and mutate a caller variable passed by name.
         let mut inner = vm.child();
         for (name, arg) in self.params.iter().zip(args) {
-            inner.var.insert((*name).to_owned(), arg);
+            *inner.get_var(name).lock()? = arg.lock()?.clone();
         }
         inner.push((*self.body).clone())
     }

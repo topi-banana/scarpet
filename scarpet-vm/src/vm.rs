@@ -52,7 +52,7 @@ impl<'src> GlobalState<'src> {
 
 pub struct ScarpetVm<'state, 'src> {
     global: &'state mut GlobalState<'src>,
-    pub(crate) var: BTreeMap<String, ValueContainer>,
+    var: BTreeMap<String, ValueContainer>,
 }
 
 impl<'state, 'src> ScarpetVm<'state, 'src> {
@@ -80,5 +80,21 @@ impl<'state, 'src> ScarpetVm<'state, 'src> {
     /// Define (or redefine) a user function in the shared state.
     pub(crate) fn define(&mut self, name: &str, function: Rc<dyn Function<'src> + 'src>) {
         self.global.register(name, function);
+    }
+
+    /// The container bound to `name` in this VM's local scope, inserting a fresh
+    /// `undef` binding first if the name is not bound yet.
+    ///
+    /// The returned [`ValueContainer`] shares the stored slot, so reading it
+    /// sees the current value and writing through its `lock()` updates the
+    /// variable in place. Returning the slot itself (rather than an `Option`)
+    /// is what lets a bare name serve as an assignment target: an unset name
+    /// materialises as `undef` — the original `strict`-config UndefValue — and
+    /// is writable in the same step.
+    pub fn get_var(&mut self, name: &str) -> ValueContainer {
+        self.var
+            .entry(name.to_owned())
+            .or_insert_with(ValueContainer::undef)
+            .clone()
     }
 }
