@@ -154,7 +154,10 @@ impl<'src, 'state> Evalute<Mult<'src>> for ScarpetVm<'state> {
         match st {
             Mult::Mul { lhs, rhs } => self.push(*lhs)? * self.push(rhs)?,
             Mult::Div { lhs, rhs } => self.push(*lhs)? / self.push(rhs)?,
-            Mult::Rem { lhs, rhs } => todo!(),
+            Mult::Rem { lhs, rhs } => {
+                let (lhs, rhs) = (self.push(*lhs)?, self.push(rhs)?);
+                lhs.scarpet_rem(&rhs)
+            }
             Mult::Power(ost) => self.push(ost),
         }
     }
@@ -163,7 +166,10 @@ impl<'src, 'state> Evalute<Mult<'src>> for ScarpetVm<'state> {
 impl<'src, 'state> Evalute<Power<'src>> for ScarpetVm<'state> {
     fn push(&mut self, st: Power<'src>) -> Result<ValueContainer, VmError> {
         match st {
-            Power::Pow { base, exp } => todo!(),
+            Power::Pow { base, exp } => {
+                let (base, exp) = (self.push(base)?, self.push(*exp)?);
+                base.scarpet_pow(&exp)
+            }
             Power::Unary(ost) => self.push(ost),
         }
     }
@@ -172,9 +178,9 @@ impl<'src, 'state> Evalute<Power<'src>> for ScarpetVm<'state> {
 impl<'src, 'state> Evalute<Unary<'src>> for ScarpetVm<'state> {
     fn push(&mut self, st: Unary<'src>) -> Result<ValueContainer, VmError> {
         match st {
-            Unary::Neg(v) => todo!(),
-            Unary::Pos(v) => todo!(),
-            Unary::Not(v) => todo!(),
+            Unary::Neg(v) => self.push(*v)?.scarpet_neg(),
+            Unary::Pos(v) => self.push(*v)?.scarpet_pos(),
+            Unary::Not(v) => self.push(*v)?.scarpet_not(),
             Unary::Unpack(v) => todo!(),
             Unary::Get(ost) => self.push(ost),
         }
@@ -327,5 +333,38 @@ mod tests {
     fn comparisons_on_null() {
         assert_eq!(eval("null == null"), Value::Bool(true));
         assert_eq!(eval("null < 1"), Value::Bool(true));
+    }
+
+    #[test]
+    fn modulo_floors_with_divisor_sign() {
+        assert_eq!(eval("5 % 3"), Value::Int(2));
+        // `-5` is unary-negated first (binds tighter than `%`), then floorMod's
+        // sign follows the divisor `3`, so the result is +1.
+        assert_eq!(eval("-5 % 3"), Value::Int(1));
+    }
+
+    #[test]
+    fn power_is_right_associative_and_double() {
+        assert_eq!(eval("2 ^ 10"), Value::Double(1024.0));
+        // Right-associative: `2 ^ (3 ^ 2)` = `2 ^ 9` = 512.
+        assert_eq!(eval("2 ^ 3 ^ 2"), Value::Double(512.0));
+    }
+
+    #[test]
+    fn unary_minus_negates() {
+        assert_eq!(eval("-5"), Value::Int(-5));
+        assert_eq!(eval("-3.5"), Value::Double(-3.5));
+    }
+
+    #[test]
+    fn unary_plus_coerces_to_number() {
+        assert_eq!(eval("+5"), Value::Int(5));
+    }
+
+    #[test]
+    fn unary_not_negates_truthiness() {
+        assert_eq!(eval("!0"), Value::Bool(true));
+        assert_eq!(eval("!1"), Value::Bool(false));
+        assert_eq!(eval("!(1 == 2)"), Value::Bool(true));
     }
 }

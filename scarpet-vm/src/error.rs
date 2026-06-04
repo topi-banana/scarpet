@@ -11,4 +11,11 @@ pub enum VmError {
     /// value"; the relational operators (`<`, `<=`, `>`, `>=`) surface it here.
     /// Map *equality* (`==` / `!=`) is structural, so it stays fine.
     IncomparableMap,
+    /// An arithmetic operator that coerces to a number (`%`, `^`, unary `-` /
+    /// `+`) got a non-numeric operand. The original `NumericValue.asNumber`
+    /// throws "Operand has to be of a numeric type"; strings are not parsed.
+    ExpectedNumber,
+    /// The modulo operator `%` was given a zero divisor (the original `mod`
+    /// raises an `ArithmeticException`).
+    DivisionByZero,
 }
