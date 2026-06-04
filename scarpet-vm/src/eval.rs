@@ -189,8 +189,17 @@ impl<'src, 'state> Evalute<Unary<'src>> for ScarpetVm<'state> {
 
 impl<'src, 'state> Evalute<Get<'src>> for ScarpetVm<'state> {
     fn push(&mut self, st: Get<'src>) -> Result<ValueContainer, VmError> {
+        use scarpet_syntax::ast::GetOp;
         match st {
-            Get::Index { base, op, key } => todo!(),
+            Get::Index { base, op, key } => {
+                let base = self.push(*base)?;
+                let key = self.push(key)?;
+                match op {
+                    GetOp::Get => base.scarpet_get(&key),
+                    // `~` (match) needs regex for the string case; not yet done.
+                    GetOp::Match => todo!(),
+                }
+            }
             Get::Primary(ost) => self.push(ost),
         }
     }
@@ -366,5 +375,20 @@ mod tests {
         assert_eq!(eval("!0"), Value::Bool(true));
         assert_eq!(eval("!1"), Value::Bool(false));
         assert_eq!(eval("!(1 == 2)"), Value::Bool(true));
+    }
+
+    #[test]
+    fn element_access_indexes_a_list() {
+        assert_eq!(eval("[10, 20, 30]:0"), Value::Int(10));
+        assert_eq!(eval("[10, 20, 30]:2"), Value::Int(30));
+        // Out-of-range wraps (3 mod 3 = 0).
+        assert_eq!(eval("[10, 20, 30]:3"), Value::Int(10));
+        // A parenthesized negative index reaches from the end.
+        assert_eq!(eval("[10, 20, 30]:(-1)"), Value::Int(30));
+    }
+
+    #[test]
+    fn element_access_on_empty_list_is_null() {
+        assert_eq!(eval("[]:0"), Value::Null);
     }
 }

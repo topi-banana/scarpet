@@ -335,6 +335,44 @@ impl Value {
     pub fn scarpet_not(&self) -> Value {
         Value::Bool(!self.is_true())
     }
+
+    /// Scarpet `:` element access (`base.get(key)` via the original
+    /// `ContainerValueInterface`). Defined only on the container types: a `List`
+    /// indexes by a number coerced to a `long` — an empty list is `null`,
+    /// otherwise the index wraps modulo the length (the original
+    /// `ListValue.normalizeIndex`, so `-1` is the last element and out-of-range
+    /// indices cycle rather than fail); a `Map` looks the key up (absent →
+    /// `null`). Every other type is not a container, so `:` yields `null` — note
+    /// strings are NOT indexed by `:` in the original.
+    pub fn scarpet_get(&self, key: &Value) -> Result<Value, VmError> {
+        match self {
+            Value::List(items) => {
+                if items.is_empty() {
+                    return Ok(Value::Null);
+                }
+                let idx = match key.as_number()? {
+                    Value::Int(i) => i,
+                    // `getLong` truncates a double toward zero, like a `(long)` cast.
+                    Value::Double(d) => d as i64,
+                    // `as_number` only ever yields an `Int` or a `Double`.
+                    _ => return Ok(Value::Null),
+                };
+                // Wrap out-of-range / negative indices modulo the length.
+                let normalized = idx.rem_euclid(items.len() as i64) as usize;
+                Ok(items[normalized].clone())
+            }
+            Value::Map(entries) => {
+                for (k, v) in entries {
+                    if k.scarpet_eq(key) {
+                        return Ok(v.clone());
+                    }
+                }
+                Ok(Value::Null)
+            }
+            // Non-containers (string / number / null / bool) yield null.
+            _ => Ok(Value::Null),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -404,6 +442,13 @@ impl ValueContainer {
     /// Unary `!` ([`Value::scarpet_not`]).
     pub fn scarpet_not(&self) -> Result<ValueContainer, VmError> {
         Ok(ValueContainer::new(self.lock()?.scarpet_not()))
+    }
+    /// `:` element access ([`Value::scarpet_get`]). Clones each side out of its
+    /// lock first, so `x:x` cannot deadlock.
+    pub fn scarpet_get(&self, key: &ValueContainer) -> Result<ValueContainer, VmError> {
+        let base = self.lock()?.clone();
+        let key = key.lock()?.clone();
+        Ok(ValueContainer::new(base.scarpet_get(&key)?))
     }
 }
 
@@ -1048,5 +1093,97 @@ mod tests {
         assert_eq!(*rem.lock().unwrap(), Value::Int(2));
         let neg = ValueContainer::int(2).scarpet_neg().unwrap();
         assert_eq!(*neg.lock().unwrap(), Value::Int(-2));
+    }
+
+    #[test]
+    fn scarpet_get_list_indexes() {
+        let list = Value::List(vec![Value::Int(10), Value::Int(20), Value::Int(30)]);
+        assert_eq!(list.scarpet_get(&Value::Int(0)).unwrap(), Value::Int(10));
+        assert_eq!(list.scarpet_get(&Value::Int(2)).unwrap(), Value::Int(30));
+    }
+
+    /// Out-of-range and negative indices wrap modulo the length (`-1` is last).
+    #[test]
+    fn scarpet_get_list_wraps_index() {
+        let list = Value::List(vec![Value::Int(10), Value::Int(20), Value::Int(30)]);
+        assert_eq!(list.scarpet_get(&Value::Int(-1)).unwrap(), Value::Int(30));
+        assert_eq!(list.scarpet_get(&Value::Int(3)).unwrap(), Value::Int(10));
+        assert_eq!(list.scarpet_get(&Value::Int(-4)).unwrap(), Value::Int(30));
+    }
+
+    /// A double index truncates toward zero before wrapping.
+    #[test]
+    fn scarpet_get_list_truncates_double_index() {
+        let list = Value::List(vec![Value::Int(10), Value::Int(20), Value::Int(30)]);
+        assert_eq!(
+            list.scarpet_get(&Value::Double(1.9)).unwrap(),
+            Value::Int(20)
+        );
+    }
+
+    #[test]
+    fn scarpet_get_empty_list_is_null() {
+        assert_eq!(
+            Value::List(vec![]).scarpet_get(&Value::Int(0)).unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn scarpet_get_list_non_numeric_key_errors() {
+        let list = Value::List(vec![Value::Int(10)]);
+        assert!(matches!(
+            list.scarpet_get(&Value::String("x".to_owned())),
+            Err(VmError::ExpectedNumber)
+        ));
+    }
+
+    #[test]
+    fn scarpet_get_map_looks_up_key() {
+        let map = Value::Map(vec![
+            (Value::Int(1), Value::String("a".to_owned())),
+            (Value::String("k".to_owned()), Value::Int(99)),
+        ]);
+        assert_eq!(
+            map.scarpet_get(&Value::Int(1)).unwrap(),
+            Value::String("a".to_owned())
+        );
+        assert_eq!(
+            map.scarpet_get(&Value::String("k".to_owned())).unwrap(),
+            Value::Int(99)
+        );
+        // An absent key yields null.
+        assert_eq!(map.scarpet_get(&Value::Int(2)).unwrap(), Value::Null);
+        // Key matching uses scarpet_eq, so 1.0 finds the int key 1.
+        assert_eq!(
+            map.scarpet_get(&Value::Double(1.0)).unwrap(),
+            Value::String("a".to_owned())
+        );
+    }
+
+    /// `:` on a non-container (string / number / null) yields null.
+    #[test]
+    fn scarpet_get_non_container_is_null() {
+        assert_eq!(
+            Value::String("abc".to_owned())
+                .scarpet_get(&Value::Int(1))
+                .unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            Value::Int(5).scarpet_get(&Value::Int(0)).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            Value::Null.scarpet_get(&Value::Int(0)).unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn value_container_get_delegates() {
+        let list = ValueContainer::new(Value::List(vec![Value::Int(7), Value::Int(8)]));
+        let got = list.scarpet_get(&ValueContainer::int(1)).unwrap();
+        assert_eq!(*got.lock().unwrap(), Value::Int(8));
     }
 }
