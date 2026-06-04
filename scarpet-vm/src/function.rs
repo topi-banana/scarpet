@@ -106,16 +106,14 @@ impl<'src> Function<'src> for DefFunction<'src> {
         if args.len() != self.params.len() {
             return Err(VmError::WrongArgCount);
         }
-        // A function body runs in its own scope: swap the caller's variables out
-        // and restore them after. Scarpet functions do not see caller locals
+        // A function body runs in its own VM over the same global state, with
+        // only the parameters bound. Scarpet functions do not see caller locals
         // without `outer` / `global`, which are not modelled yet.
-        let saved = std::mem::take(&mut vm.var);
+        let mut inner = vm.child();
         for (name, arg) in self.params.iter().zip(args) {
-            vm.var.insert((*name).to_owned(), arg);
+            inner.var.insert((*name).to_owned(), arg);
         }
-        let result = vm.push((*self.body).clone());
-        vm.var = saved;
-        result
+        inner.push((*self.body).clone())
     }
 }
 

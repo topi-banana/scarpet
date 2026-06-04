@@ -63,6 +63,15 @@ impl<'state, 'src> ScarpetVm<'state, 'src> {
         }
     }
 
+    /// A fresh VM over the same [`GlobalState`] but with its own empty variable
+    /// scope. A user function body runs in one of these: it shares the function
+    /// table (so it can call anything the caller can, and its own `Def`s
+    /// persist) but does not inherit the caller's locals — Scarpet functions
+    /// only reach outer scopes through `outer` / `global`, not modelled yet.
+    pub(crate) fn child(&mut self) -> ScarpetVm<'_, 'src> {
+        self.global.create_new_vm()
+    }
+
     /// The function registered under `name`, if any (builtin or user-defined).
     pub(crate) fn function(&self, name: &str) -> Option<Rc<dyn Function<'src> + 'src>> {
         self.global.function(name)
