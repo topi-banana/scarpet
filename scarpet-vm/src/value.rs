@@ -186,10 +186,7 @@ impl ValueContainer {
         Self::new(Value::String(value))
     }
     pub fn lock(&self) -> Result<std::sync::MutexGuard<'_, Value>, VmError> {
-        match self.0.lock() {
-            Ok(val) => Ok(val),
-            Err(_) => todo!(),
-        }
+        self.0.lock().map_err(|_| VmError::PoisonedLock)
     }
 }
 
