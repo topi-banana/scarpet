@@ -9,7 +9,7 @@ use crate::{
     Value,
     error::VmError,
     eval::Evalute,
-    value::ValueContainer,
+    value::{RangeList, ValueContainer},
     vm::{GlobalState, ScarpetVm},
 };
 
@@ -33,6 +33,7 @@ pub(crate) fn register_builtins(state: &mut GlobalState<'_>) {
     state.register("print", Rc::new(Print));
     state.register("call", Rc::new(Call));
     state.register("if", Rc::new(If));
+    state.register("range", Rc::new(Range));
 }
 
 /// Evaluate the single argument of a one-arity builtin.
@@ -132,6 +133,39 @@ impl<'src> Function<'src> for If {
             return vm.push(expr);
         }
         Ok(ValueContainer::null())
+    }
+}
+
+/// `range(to)` / `range(from, to)` / `range(from, to, step)` — a lazy arithmetic
+/// progression (the original `range`, whose `type()` is "iterator"). `from`
+/// defaults to `0` and `step` to `1`, and `to` is exclusive. Each bound coerces
+/// to a number; the range stays integral unless a bound is fractional. A
+/// negative step counts down; a zero or wrong-way step is an empty range. The
+/// list is generated lazily — `range(1000000)` is a handful of numbers until
+/// something walks it.
+struct Range;
+impl<'src> Function<'src> for Range {
+    fn call(
+        &self,
+        vm: &mut ScarpetVm<'_, 'src>,
+        Args(codes): Args<'src>,
+    ) -> Result<ValueContainer, VmError> {
+        if codes.is_empty() || codes.len() > 3 {
+            return Err(VmError::WrongArgCount);
+        }
+        let nums = codes
+            .into_iter()
+            .map(|code| Ok(vm.push(code)?.lock()?.clone()))
+            .collect::<Result<Vec<Value>, VmError>>()?;
+        let (zero, one) = (Value::Int(0), Value::Int(1));
+        let range = match nums.as_slice() {
+            [to] => RangeList::new(&zero, to, &one),
+            [from, to] => RangeList::new(from, to, &one),
+            [from, to, step] => RangeList::new(from, to, step),
+            // The argument count is bounded to 1..=3 above.
+            _ => unreachable!(),
+        }?;
+        Ok(ValueContainer::new(Value::List(Box::new(range))))
     }
 }
 

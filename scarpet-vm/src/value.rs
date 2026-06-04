@@ -8,6 +8,10 @@ use regex::Regex;
 
 use crate::error::VmError;
 
+mod list;
+
+pub use list::{ListValue, RangeList};
+
 /// Tolerance for treating a number as zero. Matches the value the original
 /// `NumericValue` derives from `abs(32 * ((7 * 0.1) * 10 - 7))` (about 3.4e-14),
 /// used to absorb floating-point rounding error.
@@ -19,9 +23,13 @@ const EPSILON: f64 = 3.410_605_131_648_481e-14;
 /// fabric-carpet. This only models the language-core types that do not depend on
 /// Minecraft; for the name `type()` returns, see [`Value::type_name`].
 ///
+/// A lazy `iterator` such as `range` is not a separate variant: it is a
+/// [`List`](Value::List) over a lazy [`ListValue`] backing, since it behaves as
+/// a list and only `type()` ("iterator") tells the two apart — matching the
+/// original `AbstractListValue` hierarchy.
+///
 /// Types that exist in the original but are not carried here yet, because the VM
 /// lacks the machinery for them:
-/// - `iterator`: a lazy list such as `range` (`LazyListValue`)
 /// - `function`: a first-class function (`FunctionValue`)
 /// - `task`: a concurrent task (`ThreadValue`)
 ///
@@ -44,8 +52,11 @@ pub enum Value {
     Double(f64),
     /// A string (`StringValue`).
     String(String),
-    /// A list `[...]` / `l(...)` (`ListValue`).
-    List(Vec<Value>),
+    /// A list. Either a realised list `[...]` / `l(...)` (the original
+    /// `ListValue`) or a lazy one such as `range` (`LazyListValue`); both behave
+    /// as a list and only `type()` tells them apart. See [`ListValue`] for the
+    /// backing, and [`Value::list`] for the realised constructor.
+    List(Box<dyn ListValue>),
     /// A map `{...}` / `m(...)` (`MapValue`). The original is an unordered hash
     /// map, but since keys may be arbitrary values we keep it here simply as a
     /// sequence of key/value pairs.
@@ -53,6 +64,13 @@ pub enum Value {
 }
 
 impl Value {
+    /// A realised [`List`](Value::List) from its elements — the everyday list
+    /// constructor, wrapping the eager [`ArrayList`](list::ArrayList) backing. A
+    /// lazy list such as `range` wraps its own backing instead; see [`RangeList`].
+    pub fn list(items: Vec<Value>) -> Value {
+        Value::List(Box::new(list::ArrayList(items)))
+    }
+
     /// Converts a numeric literal (the source text of `Primary::Number`) into an
     /// `Int` or a `Double`: `Int` when it parses as an integer, `Double` for a
     /// fractional or exponent form.
@@ -124,7 +142,8 @@ impl Value {
             Value::Bool(_) => "bool",
             Value::Int(_) | Value::Double(_) => "number",
             Value::String(_) => "string",
-            Value::List(_) => "list",
+            // A realised list reports "list", a lazy one (a `range`) "iterator".
+            Value::List(items) => items.type_name(),
             Value::Map(_) => "map",
         }
     }
@@ -144,9 +163,9 @@ impl Value {
             Value::Double(d) => format!("{d}"),
             Value::String(s) => s.clone(),
             Value::List(items) => {
-                let inner = items
-                    .iter()
-                    .map(Value::to_scarpet_string)
+                let inner = (0..items.len())
+                    .filter_map(|i| items.get(i))
+                    .map(|item| item.to_scarpet_string())
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("[{inner}]")
@@ -186,8 +205,15 @@ impl Value {
                 }
             }
             // Lists compare structurally, recursing so `[1] == [1.0]` holds.
+            // Walking by index means a `range` and the equal list compare equal
+            // too, without draining (consuming) either side.
             (Value::List(a), Value::List(b)) => {
-                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.scarpet_eq(y))
+                a.len() == b.len()
+                    && (0..a.len()).all(|i| {
+                        a.get(i)
+                            .zip(b.get(i))
+                            .is_some_and(|(x, y)| x.scarpet_eq(&y))
+                    })
             }
             // Maps compare as an unordered set of key/value pairs.
             (Value::Map(a), Value::Map(b)) => maps_equal(a, b),
@@ -227,10 +253,12 @@ impl Value {
                     a.len().cmp(&b.len())
                 } else {
                     let mut ord = Ordering::Equal;
-                    for (x, y) in a.iter().zip(b.iter()) {
-                        ord = x.scarpet_compare(y)?;
-                        if ord != Ordering::Equal {
-                            break;
+                    for i in 0..a.len() {
+                        if let (Some(x), Some(y)) = (a.get(i), b.get(i)) {
+                            ord = x.scarpet_compare(&y)?;
+                            if ord != Ordering::Equal {
+                                break;
+                            }
                         }
                     }
                     ord
@@ -359,9 +387,12 @@ impl Value {
                     // `as_number` only ever yields an `Int` or a `Double`.
                     _ => return Ok(Value::Null),
                 };
-                // Wrap out-of-range / negative indices modulo the length.
+                // Wrap out-of-range / negative indices modulo the length. The
+                // normalised index is in range (the list is non-empty), so a
+                // lazy backing computes the element directly without realising
+                // its neighbours.
                 let normalized = idx.rem_euclid(items.len() as i64) as usize;
-                Ok(items[normalized].clone())
+                Ok(items.get(normalized).unwrap_or(Value::Null))
             }
             Value::Map(entries) => {
                 for (k, v) in entries {
@@ -386,8 +417,10 @@ impl Value {
     pub fn scarpet_match(&self, right: &Value) -> Result<Value, VmError> {
         match self {
             Value::List(items) => {
-                for (i, item) in items.iter().enumerate() {
-                    if item.scarpet_eq(right) {
+                for i in 0..items.len() {
+                    if let Some(item) = items.get(i)
+                        && item.scarpet_eq(right)
+                    {
                         return Ok(Value::Int(i as i64));
                     }
                 }
@@ -420,7 +453,7 @@ impl Value {
                 match caps.len() - 1 {
                     0 => Ok(group(0)),
                     1 => Ok(group(1)),
-                    n => Ok(Value::List((1..=n).map(group).collect())),
+                    n => Ok(Value::list((1..=n).map(group).collect())),
                 }
             }
         }
@@ -527,6 +560,7 @@ impl AddAssign for Value {
             (Value::String(a), Value::Double(b)) => Value::String(format!("{a}{b}")),
             (Value::String(a), Value::String(b)) => Value::String(format!("{a}{b}")),
             // Two lists of equal length add pairwise (the original `ListValue.add`).
+            // Each owned operand drains through `into_iter`, so a `range` works.
             (Value::List(a), Value::List(b)) if a.len() == b.len() => {
                 let summed = a
                     .into_iter()
@@ -536,7 +570,7 @@ impl AddAssign for Value {
                         item
                     })
                     .collect();
-                Value::List(summed)
+                Value::list(summed)
             }
             // A list plus a scalar adds the scalar to each element
             // (`[1, 2, 3] + 1` -> `[2, 3, 4]`).
@@ -548,7 +582,7 @@ impl AddAssign for Value {
                         item
                     })
                     .collect();
-                Value::List(summed)
+                Value::list(summed)
             }
             // Any other mix concatenates the two as text (the original
             // `Value.add`): `1 + [1, 2]` -> "1[1, 2]".
@@ -583,7 +617,7 @@ impl SubAssign for Value {
                         item
                     })
                     .collect();
-                Value::List(subbed)
+                Value::list(subbed)
             }
             (Value::List(items), rhs) => {
                 let subbed = items
@@ -593,7 +627,7 @@ impl SubAssign for Value {
                         item
                     })
                     .collect();
-                Value::List(subbed)
+                Value::list(subbed)
             }
             (lhs, rhs) => Value::String(
                 lhs.to_scarpet_string()
@@ -625,7 +659,7 @@ impl MulAssign for Value {
                         item
                     })
                     .collect();
-                Value::List(multiplied)
+                Value::list(multiplied)
             }
             // A list and a scalar, whichever side the list is on.
             (Value::List(items), scalar) | (scalar, Value::List(items)) => {
@@ -636,7 +670,7 @@ impl MulAssign for Value {
                         item
                     })
                     .collect();
-                Value::List(multiplied)
+                Value::list(multiplied)
             }
             (Value::String(s), Value::Int(n)) | (Value::Int(n), Value::String(s)) => {
                 Value::String(s.repeat(n.max(0) as usize))
@@ -672,7 +706,7 @@ impl DivAssign for Value {
                         item
                     })
                     .collect();
-                Value::List(divided)
+                Value::list(divided)
             }
             (Value::List(items), rhs) => {
                 let divided = items
@@ -682,7 +716,7 @@ impl DivAssign for Value {
                         item
                     })
                     .collect();
-                Value::List(divided)
+                Value::list(divided)
             }
             (Value::String(s), Value::Int(n)) => Value::String(string_head(&s, n as f64)),
             (Value::String(s), Value::Double(n)) => Value::String(string_head(&s, n)),
@@ -764,24 +798,24 @@ mod tests {
     /// `[1, 2, 3] + 1` adds the scalar to each element, yielding `[2, 3, 4]`.
     #[test]
     fn add_assign_adds_scalar_to_each_list_element() {
-        let mut list = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        let mut list = Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
         list += Value::Int(1);
 
         assert_eq!(
             list,
-            Value::List(vec![Value::Int(2), Value::Int(3), Value::Int(4)])
+            Value::list(vec![Value::Int(2), Value::Int(3), Value::Int(4)])
         );
     }
 
     /// Two lists of equal length add pairwise: `[1, 2, 3] + [10, 20, 30]` -> `[11, 22, 33]`.
     #[test]
     fn add_assign_adds_equal_length_lists_pairwise() {
-        let mut list = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
-        list += Value::List(vec![Value::Int(10), Value::Int(20), Value::Int(30)]);
+        let mut list = Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        list += Value::list(vec![Value::Int(10), Value::Int(20), Value::Int(30)]);
 
         assert_eq!(
             list,
-            Value::List(vec![Value::Int(11), Value::Int(22), Value::Int(33)])
+            Value::list(vec![Value::Int(11), Value::Int(22), Value::Int(33)])
         );
     }
 
@@ -789,7 +823,7 @@ mod tests {
     #[test]
     fn add_assign_falls_back_to_string_concatenation() {
         let mut n = Value::Int(1);
-        n += Value::List(vec![Value::Int(1), Value::Int(2)]);
+        n += Value::list(vec![Value::Int(1), Value::Int(2)]);
 
         assert_eq!(n, Value::String("1[1, 2]".to_owned()));
     }
@@ -816,7 +850,7 @@ mod tests {
     #[test]
     fn sub_assign_number_minus_list_keeps_number_text() {
         let mut n = Value::Int(1);
-        n -= Value::List(vec![Value::Int(1), Value::Int(2)]);
+        n -= Value::list(vec![Value::Int(1), Value::Int(2)]);
 
         assert_eq!(n, Value::String("1".to_owned()));
     }
@@ -824,10 +858,10 @@ mod tests {
     /// `[1, 2] * [1, 2]` multiplies pairwise: `[1, 4]`.
     #[test]
     fn mul_assign_multiplies_equal_length_lists_pairwise() {
-        let mut list = Value::List(vec![Value::Int(1), Value::Int(2)]);
-        list *= Value::List(vec![Value::Int(1), Value::Int(2)]);
+        let mut list = Value::list(vec![Value::Int(1), Value::Int(2)]);
+        list *= Value::list(vec![Value::Int(1), Value::Int(2)]);
 
-        assert_eq!(list, Value::List(vec![Value::Int(1), Value::Int(4)]));
+        assert_eq!(list, Value::list(vec![Value::Int(1), Value::Int(4)]));
     }
 
     /// `'hello' * 2` repeats the string, regardless of operand order.
@@ -863,7 +897,7 @@ mod tests {
     /// A list renders with `getString` semantics: `[1, 2]`, no quotes on elements.
     #[test]
     fn to_scarpet_string_renders_list_without_quotes() {
-        let list = Value::List(vec![Value::Int(1), Value::String("a".to_owned())]);
+        let list = Value::list(vec![Value::Int(1), Value::String("a".to_owned())]);
 
         assert_eq!(list.to_scarpet_string(), "[1, a]");
     }
@@ -917,12 +951,12 @@ mod tests {
     /// Lists compare element-wise, recursing into numeric equality (`[1] == [1.0]`).
     #[test]
     fn scarpet_eq_lists_recurse() {
-        let ints = Value::List(vec![Value::Int(1)]);
-        let doubles = Value::List(vec![Value::Double(1.0)]);
+        let ints = Value::list(vec![Value::Int(1)]);
+        let doubles = Value::list(vec![Value::Double(1.0)]);
         assert!(ints.scarpet_eq(&doubles));
 
-        let two = Value::List(vec![Value::Int(1), Value::Int(2)]);
-        let one = Value::List(vec![Value::Int(1)]);
+        let two = Value::list(vec![Value::Int(1), Value::Int(2)]);
+        let one = Value::list(vec![Value::Int(1)]);
         assert!(!two.scarpet_eq(&one));
     }
 
@@ -959,16 +993,16 @@ mod tests {
     /// element is larger (`[2] < [1, 1, 1]`).
     #[test]
     fn scarpet_compare_lists_by_length_first() {
-        let short = Value::List(vec![Value::Int(2)]);
-        let long = Value::List(vec![Value::Int(1), Value::Int(1), Value::Int(1)]);
+        let short = Value::list(vec![Value::Int(2)]);
+        let long = Value::list(vec![Value::Int(1), Value::Int(1), Value::Int(1)]);
         assert_eq!(short.scarpet_compare(&long).unwrap(), Ordering::Less);
     }
 
     /// Same-length lists fall back to the first differing element.
     #[test]
     fn scarpet_compare_lists_tie_break_by_element() {
-        let a = Value::List(vec![Value::Int(1), Value::Int(2)]);
-        let b = Value::List(vec![Value::Int(1), Value::Int(3)]);
+        let a = Value::list(vec![Value::Int(1), Value::Int(2)]);
+        let b = Value::list(vec![Value::Int(1), Value::Int(3)]);
         assert_eq!(a.scarpet_compare(&b).unwrap(), Ordering::Less);
     }
 
@@ -1004,8 +1038,8 @@ mod tests {
     /// The map error propagates out of a list comparison too.
     #[test]
     fn scarpet_compare_nested_map_propagates_error() {
-        let a = Value::List(vec![Value::Map(vec![])]);
-        let b = Value::List(vec![Value::Map(vec![])]);
+        let a = Value::list(vec![Value::Map(vec![])]);
+        let b = Value::list(vec![Value::Map(vec![])]);
         assert!(matches!(
             a.scarpet_compare(&b),
             Err(VmError::IncomparableMap)
@@ -1056,7 +1090,7 @@ mod tests {
             Err(VmError::ExpectedNumber)
         ));
         assert!(matches!(
-            Value::List(vec![]).scarpet_pos(),
+            Value::list(vec![]).scarpet_pos(),
             Err(VmError::ExpectedNumber)
         ));
     }
@@ -1156,7 +1190,7 @@ mod tests {
 
     #[test]
     fn scarpet_get_list_indexes() {
-        let list = Value::List(vec![Value::Int(10), Value::Int(20), Value::Int(30)]);
+        let list = Value::list(vec![Value::Int(10), Value::Int(20), Value::Int(30)]);
         assert_eq!(list.scarpet_get(&Value::Int(0)).unwrap(), Value::Int(10));
         assert_eq!(list.scarpet_get(&Value::Int(2)).unwrap(), Value::Int(30));
     }
@@ -1164,7 +1198,7 @@ mod tests {
     /// Out-of-range and negative indices wrap modulo the length (`-1` is last).
     #[test]
     fn scarpet_get_list_wraps_index() {
-        let list = Value::List(vec![Value::Int(10), Value::Int(20), Value::Int(30)]);
+        let list = Value::list(vec![Value::Int(10), Value::Int(20), Value::Int(30)]);
         assert_eq!(list.scarpet_get(&Value::Int(-1)).unwrap(), Value::Int(30));
         assert_eq!(list.scarpet_get(&Value::Int(3)).unwrap(), Value::Int(10));
         assert_eq!(list.scarpet_get(&Value::Int(-4)).unwrap(), Value::Int(30));
@@ -1173,7 +1207,7 @@ mod tests {
     /// A double index truncates toward zero before wrapping.
     #[test]
     fn scarpet_get_list_truncates_double_index() {
-        let list = Value::List(vec![Value::Int(10), Value::Int(20), Value::Int(30)]);
+        let list = Value::list(vec![Value::Int(10), Value::Int(20), Value::Int(30)]);
         assert_eq!(
             list.scarpet_get(&Value::Double(1.9)).unwrap(),
             Value::Int(20)
@@ -1183,14 +1217,14 @@ mod tests {
     #[test]
     fn scarpet_get_empty_list_is_null() {
         assert_eq!(
-            Value::List(vec![]).scarpet_get(&Value::Int(0)).unwrap(),
+            Value::list(vec![]).scarpet_get(&Value::Int(0)).unwrap(),
             Value::Null
         );
     }
 
     #[test]
     fn scarpet_get_list_non_numeric_key_errors() {
-        let list = Value::List(vec![Value::Int(10)]);
+        let list = Value::list(vec![Value::Int(10)]);
         assert!(matches!(
             list.scarpet_get(&Value::String("x".to_owned())),
             Err(VmError::ExpectedNumber)
@@ -1241,14 +1275,14 @@ mod tests {
 
     #[test]
     fn value_container_get_delegates() {
-        let list = ValueContainer::new(Value::List(vec![Value::Int(7), Value::Int(8)]));
+        let list = ValueContainer::new(Value::list(vec![Value::Int(7), Value::Int(8)]));
         let got = list.scarpet_get(&ValueContainer::int(1)).unwrap();
         assert_eq!(*got.lock().unwrap(), Value::Int(8));
     }
 
     #[test]
     fn scarpet_match_list_returns_index() {
-        let list = Value::List(vec![Value::Int(10), Value::Int(20), Value::Int(30)]);
+        let list = Value::list(vec![Value::Int(10), Value::Int(20), Value::Int(30)]);
         assert_eq!(list.scarpet_match(&Value::Int(20)).unwrap(), Value::Int(1));
         assert_eq!(list.scarpet_match(&Value::Int(99)).unwrap(), Value::Null);
     }
@@ -1286,7 +1320,7 @@ mod tests {
         assert_eq!(
             s.scarpet_match(&Value::String("([a-z])([0-9])".to_owned()))
                 .unwrap(),
-            Value::List(vec![
+            Value::list(vec![
                 Value::String("a".to_owned()),
                 Value::String("1".to_owned()),
             ])
@@ -1321,7 +1355,7 @@ mod tests {
 
     #[test]
     fn value_container_match_delegates() {
-        let list = ValueContainer::new(Value::List(vec![Value::Int(5), Value::Int(6)]));
+        let list = ValueContainer::new(Value::list(vec![Value::Int(5), Value::Int(6)]));
         let got = list.scarpet_match(&ValueContainer::int(6)).unwrap();
         assert_eq!(*got.lock().unwrap(), Value::Int(1));
     }

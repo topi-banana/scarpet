@@ -228,7 +228,7 @@ impl<'src, 'state> Evalute<Primary<'src>> for ScarpetVm<'state, 'src> {
                 for code in codes {
                     items.push(self.push(code)?.lock()?.clone());
                 }
-                Ok(ValueContainer::new(Value::List(items)))
+                Ok(ValueContainer::new(Value::list(items)))
             }
             // `{k -> v, …}`: each entry is evaluated in map context, where a
             // top-level `->` is a key/value pair (the original desugars `{…}` to
@@ -299,6 +299,15 @@ mod tests {
         vm.push(code).expect("eval").lock().expect("lock").clone()
     }
 
+    /// Like [`eval`], but expects evaluation to fail and returns the `VmError`.
+    fn eval_err(src: &str) -> VmError {
+        let cst = parse_source(src).expect("parse");
+        let code = Code::try_from(&cst).expect("lower");
+        let mut global = GlobalState::new();
+        let mut vm = global.create_new_vm();
+        vm.push(code).expect_err("expected an evaluation error")
+    }
+
     #[test]
     fn string_literal_strips_quotes() {
         assert_eq!(eval("'hello'"), Value::String("hello".to_owned()));
@@ -324,7 +333,7 @@ mod tests {
     fn list_literal_collects_its_elements() {
         assert_eq!(
             eval("[1, 2, 3]"),
-            Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+            Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
         );
     }
 
@@ -532,7 +541,7 @@ mod tests {
         // Several groups yield a list.
         assert_eq!(
             eval("'a1b2' ~ '([a-z])([0-9])'"),
-            Value::List(vec![
+            Value::list(vec![
                 Value::String("a".to_owned()),
                 Value::String("1".to_owned()),
             ])
@@ -581,5 +590,105 @@ mod tests {
         let mut global = GlobalState::new();
         let mut vm = global.create_new_vm();
         assert!(matches!(vm.push(code), Err(VmError::WrongArgCount)));
+    }
+
+    /// `range` reports its `type()` as "iterator", not "list" — a lazy list.
+    #[test]
+    fn range_is_an_iterator() {
+        assert_eq!(eval("type(range(5))"), Value::String("iterator".to_owned()));
+    }
+
+    /// `range(to)` counts from 0; the three forms match Python's `range`. It is
+    /// an iterator, but compares element-wise equal to the realised list.
+    #[test]
+    fn range_forms_yield_the_expected_elements() {
+        assert_eq!(
+            eval("range(5)"),
+            Value::list(vec![
+                Value::Int(0),
+                Value::Int(1),
+                Value::Int(2),
+                Value::Int(3),
+                Value::Int(4),
+            ])
+        );
+        assert_eq!(
+            eval("range(2, 6)"),
+            Value::list(vec![
+                Value::Int(2),
+                Value::Int(3),
+                Value::Int(4),
+                Value::Int(5),
+            ])
+        );
+        assert_eq!(
+            eval("range(0, 10, 2)"),
+            Value::list(vec![
+                Value::Int(0),
+                Value::Int(2),
+                Value::Int(4),
+                Value::Int(6),
+                Value::Int(8),
+            ])
+        );
+    }
+
+    /// A negative step counts down; a wrong-way or empty span yields no elements.
+    #[test]
+    fn range_negative_step_and_empty() {
+        assert_eq!(
+            eval("range(5, 0, -1)"),
+            Value::list(vec![
+                Value::Int(5),
+                Value::Int(4),
+                Value::Int(3),
+                Value::Int(2),
+                Value::Int(1),
+            ])
+        );
+        assert_eq!(eval("range(0)"), Value::list(vec![]));
+        assert_eq!(eval("range(5, 0)"), Value::list(vec![]));
+    }
+
+    /// A fractional bound promotes the whole range to doubles.
+    #[test]
+    fn range_with_fractional_step_is_double() {
+        assert_eq!(
+            eval("range(0, 1, 0.5)"),
+            Value::list(vec![Value::Double(0.0), Value::Double(0.5)])
+        );
+    }
+
+    /// A range behaves as a list everywhere it flows: `str`, `:` indexing
+    /// (wrapping like any list), `==`, and element-wise arithmetic.
+    #[test]
+    fn range_behaves_like_a_list() {
+        assert_eq!(eval("str(range(3))"), Value::String("[0, 1, 2]".to_owned()));
+        assert_eq!(eval("range(3):1"), Value::Int(1));
+        assert_eq!(eval("range(5):(-1)"), Value::Int(4));
+        assert_eq!(eval("range(3) == [0, 1, 2]"), Value::Bool(true));
+        assert_eq!(
+            eval("range(3) + 1"),
+            Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+        );
+    }
+
+    /// The list is lazy: a billion-element range is created and randomly indexed
+    /// (including from the end) without ever realising its elements.
+    #[test]
+    fn range_is_lazy() {
+        assert_eq!(eval("range(1000000000):5"), Value::Int(5));
+        assert_eq!(eval("range(1000000000):(-1)"), Value::Int(999999999));
+    }
+
+    /// `range` takes one to three arguments, each numeric.
+    #[test]
+    fn range_argument_errors() {
+        assert!(matches!(eval_err("range()"), VmError::WrongArgCount));
+        assert!(matches!(
+            eval_err("range(1, 2, 3, 4)"),
+            VmError::WrongArgCount
+        ));
+        assert!(matches!(eval_err("range('a')"), VmError::ExpectedNumber));
     }
 }
