@@ -6,6 +6,7 @@ use scarpet_syntax::ast::{
 };
 
 use crate::{
+    Value,
     error::VmError,
     eval::Evalute,
     value::ValueContainer,
@@ -28,6 +29,7 @@ pub(crate) fn register_builtins(state: &mut GlobalState<'_>) {
     state.register("type", Rc::new(Type));
     state.register("str", Rc::new(Str));
     state.register("print", Rc::new(Print));
+    state.register("call", Rc::new(Call));
 }
 
 /// Unwrap the single argument of a one-arity builtin.
@@ -76,6 +78,29 @@ impl<'src> Function<'src> for Print {
         let value = arg1(args)?;
         println!("{}", value.lock()?.to_scarpet_string());
         Ok(value)
+    }
+}
+
+struct Call;
+impl<'src> Function<'src> for Call {
+    fn call(
+        &self,
+        vm: &mut ScarpetVm<'_, 'src>,
+        mut args: Vec<ValueContainer>,
+    ) -> Result<ValueContainer, VmError> {
+        if args.is_empty() {
+            return Err(VmError::WrongArgCount);
+        }
+        // The first argument names the function to call. The original `call`
+        // also accepts a first-class function value, but this VM has no
+        // function-value type yet, so only a string name resolves to a callable.
+        let Value::String(name) = args.remove(0).lock()?.clone() else {
+            return Err(VmError::UnknownFunction);
+        };
+        let Some(function) = vm.function(&name) else {
+            return Err(VmError::UnknownFunction);
+        };
+        function.call(vm, args)
     }
 }
 
