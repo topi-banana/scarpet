@@ -9,7 +9,7 @@ use rustyline::{DefaultEditor, EventHandler, KeyCode, KeyEvent, Modifiers};
 use scarpet_fmt::{BraceStyle, Config, FmtError, LineEnding, format_source};
 use scarpet_syntax::ast::{Code, LowerError};
 use scarpet_syntax::parser::{ParseError, has_open_delimiter, parse_source};
-use scarpet_vm::{Evalute, GlobalState};
+use scarpet_vm::{Evalute, GlobalState, ScarpetVm};
 use serde::Deserialize;
 use similar::{ChangeTag, TextDiff};
 
@@ -24,8 +24,10 @@ struct Cli {
 enum Cmd {
     /// Format Scarpet source.
     Format(FormatArgs),
-    /// Start an interactive REPL: read a statement, print its AST (or a
-    /// parse / lowering diagnostic), then prompt again. Exits on Ctrl+D.
+    /// Start an interactive REPL: read a statement, evaluate it in a session VM
+    /// whose variables and function definitions persist across submissions, and
+    /// print the resulting value (or a parse / lowering / evaluation
+    /// diagnostic), then prompt again. Exits on Ctrl+D.
     Repl,
 }
 
@@ -250,15 +252,17 @@ fn format_stdin(check: bool, deny: &[DenyWarning], config: &Config) -> ExitCode 
 
 /// Run an interactive REPL. Reads one statement per submission, parses it with
 /// [`parse_source`], lowers the CST to a `scarpet-syntax` [`Code`] (statement
-/// sequence) via `Code::try_from`, and prints that AST (`{:#?}`) on success — or
-/// a rustc-style diagnostic for a parse or lowering error. There is no
-/// evaluator; this only builds and dumps the syntax tree.
+/// sequence) via `Code::try_from`, then evaluates it in a session VM and prints
+/// the resulting value — or a rustc-style diagnostic for a parse, lowering, or
+/// evaluation error. The VM is created once per session, so variables and
+/// function definitions persist from one submission to the next.
 ///
 /// On a terminal, input is read through `rustyline` for line editing and an
 /// in-session command history; see [`run_repl_interactive`]. When stdin is not a
 /// terminal (piped or redirected input), it falls back to a plain line reader
-/// with no prompt or banner — so `echo 'a=5' | scarpet repl` emits just the AST
-/// (and `echo '1+' | scarpet repl` just the diagnostic); see [`run_repl_piped`].
+/// with no prompt or banner — so `echo 'a=5' | scarpet repl` emits just the
+/// value (and `echo '1+' | scarpet repl` just the diagnostic); see
+/// [`run_repl_piped`].
 fn run_repl() -> ExitCode {
     if std::io::stdin().is_terminal() {
         run_repl_interactive()
@@ -309,9 +313,15 @@ fn run_repl_interactive() -> ExitCode {
         EventHandler::Simple(rustyline::Cmd::Newline),
     );
     eprintln!(
-        "Scarpet REPL (parse + AST dump). Enter submits (continuing while brackets \
+        "Scarpet REPL. Enter submits (continuing while brackets \
          are open); Shift+Enter or Alt+Enter forces a newline; Ctrl+D exits."
     );
+    // One VM for the whole session, so a variable or function defined in one
+    // submission is visible to the next. The VM (and any function it defines)
+    // borrows its source for `'src`; each submission is leaked to `'static`
+    // below so a single session-long source lifetime works out.
+    let mut global: GlobalState<'static> = GlobalState::new();
+    let mut vm = global.create_new_vm();
     // Each iteration of the outer loop reads one submission, joining physical
     // lines with `\n` into `buf` until the brackets balance.
     'submission: loop {
@@ -351,16 +361,26 @@ fn run_repl_interactive() -> ExitCode {
         // Record every non-blank submission, valid or not, so the history
         // mirrors exactly what was typed.
         let _ = rl.add_history_entry(buf.as_str());
-        handle_submission("<repl>", &buf);
+        // Leak this submission to `'static` so the session VM can borrow it
+        // (and anything it defines from it) for the rest of the run.
+        let src: &'static str = Box::leak(buf.into_boxed_str());
+        handle_submission(&mut vm, "<repl>", src);
     }
 }
 
 /// The non-terminal REPL: a plain line reader for piped or redirected stdin,
-/// with no prompt or banner. Reads one statement per line, printing its AST on
-/// success and a diagnostic on a parse or lowering error — so `echo '1+' |
-/// scarpet repl` emits only the diagnostic. Ends at end-of-input.
+/// with no prompt or banner. Reads one statement per line, evaluating it in the
+/// session VM and printing the resulting value on success, or a diagnostic on a
+/// parse, lowering, or evaluation error — so `echo '1+' | scarpet repl` emits
+/// only the diagnostic. Like the interactive path, one VM serves the whole
+/// session, so definitions persist line to line. Ends at end-of-input.
 fn run_repl_piped() -> ExitCode {
     use std::io::BufRead as _;
+
+    // One VM for the whole session (see [`run_repl_interactive`]): each line is
+    // leaked to `'static` so the VM can borrow it for the rest of the run.
+    let mut global: GlobalState<'static> = GlobalState::new();
+    let mut vm = global.create_new_vm();
 
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
@@ -371,8 +391,12 @@ fn run_repl_piped() -> ExitCode {
             // End of input.
             Ok(0) => return ExitCode::SUCCESS,
             Ok(_) => {
-                let src = line.trim_end_matches(['\n', '\r']);
-                handle_submission("<repl>", src);
+                // Drop the trailing newline, then take ownership of the line so
+                // it can be leaked to `'static` for the session VM to borrow.
+                let len = line.trim_end_matches(['\n', '\r']).len();
+                line.truncate(len);
+                let src: &'static str = Box::leak(std::mem::take(&mut line).into_boxed_str());
+                handle_submission(&mut vm, "<repl>", src);
             }
             Err(e) => {
                 eprintln!("repl: {e}");
@@ -414,18 +438,25 @@ fn check_line(src: &str) -> Checked<'_> {
     }
 }
 
-/// Check one REPL submission and report the outcome: print the lowered AST
-/// (`{:#?}`) to stdout on success, or a rustc-style diagnostic to stderr for a
-/// parse or lowering error. Blank submissions produce no output. `name` labels
-/// the source in diagnostics.
-fn handle_submission(name: &str, src: &str) {
+/// Check one REPL submission and report the outcome: evaluate it in `vm` — the
+/// session VM, so any variable or function it sets persists to later
+/// submissions — and print the resulting value to stdout, or a rustc-style
+/// diagnostic to stderr for a parse, lowering, or evaluation error. An
+/// evaluation error leaves the VM intact rather than ending the session. Blank
+/// submissions produce no output. `name` labels the source in diagnostics.
+fn handle_submission(vm: &mut ScarpetVm<'_, 'static>, name: &str, src: &'static str) {
     match check_line(src) {
         Checked::Blank => {}
-        Checked::Ast(ast) => {
-            let mut state = GlobalState::new();
-            let mut vm = state.create_new_vm();
-            println!("{:?}", vm.push(ast).unwrap().lock().unwrap());
-        }
+        // Evaluate in the session VM and print the value (still its `Debug`
+        // form). A `VmError` — or a poisoned value lock — is reported without
+        // tearing the REPL down, so the next prompt still has the same VM.
+        Checked::Ast(ast) => match vm.push(ast) {
+            Ok(value) => match value.lock() {
+                Ok(v) => println!("{v:?}"),
+                Err(e) => eprintln!("repl: {e:?}"),
+            },
+            Err(e) => eprintln!("repl: {e:?}"),
+        },
         Checked::Parse(e) => report_parse_error(name, src, &e),
         Checked::Lower(e) => report_lower_error(name, src, &e),
     }
