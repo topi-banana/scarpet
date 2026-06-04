@@ -422,7 +422,7 @@ fn handle_submission(name: &str, src: &str) {
     match check_line(src) {
         Checked::Blank => {}
         Checked::Ast(ast) => {
-            let mut state = GlobalState {};
+            let mut state = GlobalState::new();
             let mut vm = state.create_new_vm();
             println!("{:?}", vm.push(ast).unwrap().lock().unwrap());
         }

@@ -3,7 +3,7 @@
 // implemented. Drop this allow once the evaluator is filled in.
 #![allow(unused_variables)]
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, rc::Rc};
 
 use scarpet_syntax::ast::{
     Additive, Args, Assign, Code, Compare, Equality, Expr, Get, Land, Lor, Mult, Power, Primary,
@@ -12,6 +12,7 @@ use scarpet_syntax::ast::{
 
 use crate::{
     error::VmError,
+    function::DefFunction,
     value::{Value, ValueContainer},
     vm::ScarpetVm,
 };
@@ -20,7 +21,7 @@ pub trait Evalute<T> {
     fn push(&mut self, st: T) -> Result<ValueContainer, VmError>;
 }
 
-impl<'src, 'state> Evalute<Code<'src>> for ScarpetVm<'state> {
+impl<'src, 'state> Evalute<Code<'src>> for ScarpetVm<'state, 'src> {
     fn push(&mut self, Code(mut sts): Code<'src>) -> Result<ValueContainer, VmError> {
         let last = sts.pop();
         for st in sts {
@@ -34,16 +35,22 @@ impl<'src, 'state> Evalute<Code<'src>> for ScarpetVm<'state> {
     }
 }
 
-impl<'src, 'state> Evalute<Expr<'src>> for ScarpetVm<'state> {
+impl<'src, 'state> Evalute<Expr<'src>> for ScarpetVm<'state, 'src> {
     fn push(&mut self, st: Expr<'src>) -> Result<ValueContainer, VmError> {
         match st {
+            Expr::Def { name, params, body } => {
+                let func = DefFunction::new(&params, body).ok_or(VmError::UnsupportedParameter)?;
+                self.define(name, Rc::new(func));
+                Ok(ValueContainer::string(name.to_owned()))
+            }
             Expr::Assign(ost) => self.push(ost),
-            _ => todo!(),
+            // A bare `->` outside a map (a lambda) is not modelled yet.
+            Expr::Arrow { .. } => todo!(),
         }
     }
 }
 
-impl<'src, 'state> Evalute<Assign<'src>> for ScarpetVm<'state> {
+impl<'src, 'state> Evalute<Assign<'src>> for ScarpetVm<'state, 'src> {
     fn push(&mut self, st: Assign<'src>) -> Result<ValueContainer, VmError> {
         use scarpet_syntax::ast::{AssignOp, Assignable};
         match st {
@@ -69,7 +76,7 @@ impl<'src, 'state> Evalute<Assign<'src>> for ScarpetVm<'state> {
     }
 }
 
-impl<'src, 'state> Evalute<Lor<'src>> for ScarpetVm<'state> {
+impl<'src, 'state> Evalute<Lor<'src>> for ScarpetVm<'state, 'src> {
     fn push(&mut self, st: Lor<'src>) -> Result<ValueContainer, VmError> {
         match st {
             Lor::Or { lhs, rhs } => Ok(ValueContainer::bool(
@@ -80,7 +87,7 @@ impl<'src, 'state> Evalute<Lor<'src>> for ScarpetVm<'state> {
     }
 }
 
-impl<'src, 'state> Evalute<Land<'src>> for ScarpetVm<'state> {
+impl<'src, 'state> Evalute<Land<'src>> for ScarpetVm<'state, 'src> {
     fn push(&mut self, st: Land<'src>) -> Result<ValueContainer, VmError> {
         match st {
             Land::And { lhs, rhs } => Ok(ValueContainer::bool(
@@ -91,7 +98,7 @@ impl<'src, 'state> Evalute<Land<'src>> for ScarpetVm<'state> {
     }
 }
 
-impl<'src, 'state> Evalute<Equality<'src>> for ScarpetVm<'state> {
+impl<'src, 'state> Evalute<Equality<'src>> for ScarpetVm<'state, 'src> {
     fn push(&mut self, st: Equality<'src>) -> Result<ValueContainer, VmError> {
         match st {
             Equality::Eq { lhs, rhs } => {
@@ -107,7 +114,7 @@ impl<'src, 'state> Evalute<Equality<'src>> for ScarpetVm<'state> {
     }
 }
 
-impl<'src, 'state> Evalute<Compare<'src>> for ScarpetVm<'state> {
+impl<'src, 'state> Evalute<Compare<'src>> for ScarpetVm<'state, 'src> {
     fn push(&mut self, st: Compare<'src>) -> Result<ValueContainer, VmError> {
         match st {
             Compare::Lt { lhs, rhs } => {
@@ -139,7 +146,7 @@ impl<'src, 'state> Evalute<Compare<'src>> for ScarpetVm<'state> {
     }
 }
 
-impl<'src, 'state> Evalute<Additive<'src>> for ScarpetVm<'state> {
+impl<'src, 'state> Evalute<Additive<'src>> for ScarpetVm<'state, 'src> {
     fn push(&mut self, st: Additive<'src>) -> Result<ValueContainer, VmError> {
         match st {
             Additive::Add { lhs, rhs } => self.push(*lhs)? + self.push(rhs)?,
@@ -149,7 +156,7 @@ impl<'src, 'state> Evalute<Additive<'src>> for ScarpetVm<'state> {
     }
 }
 
-impl<'src, 'state> Evalute<Mult<'src>> for ScarpetVm<'state> {
+impl<'src, 'state> Evalute<Mult<'src>> for ScarpetVm<'state, 'src> {
     fn push(&mut self, st: Mult<'src>) -> Result<ValueContainer, VmError> {
         match st {
             Mult::Mul { lhs, rhs } => self.push(*lhs)? * self.push(rhs)?,
@@ -163,7 +170,7 @@ impl<'src, 'state> Evalute<Mult<'src>> for ScarpetVm<'state> {
     }
 }
 
-impl<'src, 'state> Evalute<Power<'src>> for ScarpetVm<'state> {
+impl<'src, 'state> Evalute<Power<'src>> for ScarpetVm<'state, 'src> {
     fn push(&mut self, st: Power<'src>) -> Result<ValueContainer, VmError> {
         match st {
             Power::Pow { base, exp } => {
@@ -175,7 +182,7 @@ impl<'src, 'state> Evalute<Power<'src>> for ScarpetVm<'state> {
     }
 }
 
-impl<'src, 'state> Evalute<Unary<'src>> for ScarpetVm<'state> {
+impl<'src, 'state> Evalute<Unary<'src>> for ScarpetVm<'state, 'src> {
     fn push(&mut self, st: Unary<'src>) -> Result<ValueContainer, VmError> {
         match st {
             Unary::Neg(v) => self.push(*v)?.scarpet_neg(),
@@ -187,7 +194,7 @@ impl<'src, 'state> Evalute<Unary<'src>> for ScarpetVm<'state> {
     }
 }
 
-impl<'src, 'state> Evalute<Get<'src>> for ScarpetVm<'state> {
+impl<'src, 'state> Evalute<Get<'src>> for ScarpetVm<'state, 'src> {
     fn push(&mut self, st: Get<'src>) -> Result<ValueContainer, VmError> {
         use scarpet_syntax::ast::GetOp;
         match st {
@@ -204,7 +211,7 @@ impl<'src, 'state> Evalute<Get<'src>> for ScarpetVm<'state> {
     }
 }
 
-impl<'src, 'state> Evalute<Primary<'src>> for ScarpetVm<'state> {
+impl<'src, 'state> Evalute<Primary<'src>> for ScarpetVm<'state, 'src> {
     fn push(&mut self, st: Primary<'src>) -> Result<ValueContainer, VmError> {
         match st {
             Primary::Number(v) => Ok(ValueContainer::new(Value::from_number_literal(v))),
@@ -216,7 +223,17 @@ impl<'src, 'state> Evalute<Primary<'src>> for ScarpetVm<'state> {
                 .get(name)
                 .cloned()
                 .unwrap_or_else(ValueContainer::undef)),
-            Primary::Call { name, args } => todo!(),
+            // `name(args)`: evaluate each argument, then look the function up in
+            // the global table (builtin or user-defined) and call it.
+            Primary::Call { name, args } => {
+                let func = self.function(name).ok_or(VmError::UnknownFunction)?;
+                let Args(codes) = args;
+                let mut values = Vec::with_capacity(codes.len());
+                for code in codes {
+                    values.push(self.push(code)?);
+                }
+                func.call(self, values)
+            }
             // `[a, b, …]`: evaluate each comma-separated element to a value.
             Primary::List(Args(codes)) => {
                 let mut items = Vec::with_capacity(codes.len());
@@ -251,16 +268,13 @@ impl<'src, 'state> Evalute<Primary<'src>> for ScarpetVm<'state> {
     }
 }
 
-impl<'state> ScarpetVm<'state> {
+impl<'state, 'src> ScarpetVm<'state, 'src> {
     /// Evaluate one entry of a map literal (`{…}` / `m(…)`) into a key/value
     /// pair. In map context a top-level `->` is not a lambda but a pair (the
     /// original evaluates these args in `MAPDEF` context). Otherwise the entry
     /// is a value handled like `MapValue.put`: a 2-element list is a pair, any
     /// other list is an error, and a non-list becomes a key with a null value.
-    fn eval_map_entry<'src>(
-        &mut self,
-        Code(mut exprs): Code<'src>,
-    ) -> Result<(Value, Value), VmError> {
+    fn eval_map_entry(&mut self, Code(mut exprs): Code<'src>) -> Result<(Value, Value), VmError> {
         if exprs.len() == 1 && matches!(exprs.first(), Some(Expr::Arrow { .. })) {
             let Some(Expr::Arrow { lhs, body }) = exprs.pop() else {
                 unreachable!()
@@ -292,7 +306,7 @@ mod tests {
     fn eval(src: &str) -> Value {
         let cst = parse_source(src).expect("parse");
         let code = Code::try_from(&cst).expect("lower");
-        let mut global = GlobalState {};
+        let mut global = GlobalState::new();
         let mut vm = global.create_new_vm();
         vm.push(code).expect("eval").lock().expect("lock").clone()
     }
@@ -491,7 +505,7 @@ mod tests {
     fn map_entry_wrong_length_list_is_an_error() {
         let cst = parse_source("{[1, 2, 3]}").expect("parse");
         let code = Code::try_from(&cst).expect("lower");
-        let mut global = GlobalState {};
+        let mut global = GlobalState::new();
         let mut vm = global.create_new_vm();
         assert!(matches!(vm.push(code), Err(VmError::MapEntryNotPair)));
     }
@@ -535,5 +549,49 @@ mod tests {
                 Value::String("1".to_owned()),
             ])
         );
+    }
+
+    #[test]
+    fn builtin_type_and_str() {
+        assert_eq!(eval("type(5)"), Value::String("number".to_owned()));
+        assert_eq!(eval("type('hi')"), Value::String("string".to_owned()));
+        assert_eq!(eval("str([1, 2])"), Value::String("[1, 2]".to_owned()));
+    }
+
+    /// `print` writes to stdout (not checked here) and returns its argument.
+    #[test]
+    fn builtin_print_returns_its_argument() {
+        assert_eq!(eval("print('hi')"), Value::String("hi".to_owned()));
+    }
+
+    #[test]
+    fn user_function_definition_and_call() {
+        assert_eq!(eval("f(x) -> x * 2; f(5)"), Value::Int(10));
+        assert_eq!(eval("add(x, y) -> x + y; add(3, 4)"), Value::Int(7));
+    }
+
+    /// A function body runs in its own scope, so a caller local is not visible
+    /// inside it (it reads as undef).
+    #[test]
+    fn function_body_has_its_own_scope() {
+        assert_eq!(eval("a = 10; f() -> a; f()"), Value::Undef);
+    }
+
+    #[test]
+    fn unknown_function_is_an_error() {
+        let cst = parse_source("nope(1)").expect("parse");
+        let code = Code::try_from(&cst).expect("lower");
+        let mut global = GlobalState::new();
+        let mut vm = global.create_new_vm();
+        assert!(matches!(vm.push(code), Err(VmError::UnknownFunction)));
+    }
+
+    #[test]
+    fn wrong_argument_count_is_an_error() {
+        let cst = parse_source("f(x) -> x; f(1, 2)").expect("parse");
+        let code = Code::try_from(&cst).expect("lower");
+        let mut global = GlobalState::new();
+        let mut vm = global.create_new_vm();
+        assert!(matches!(vm.push(code), Err(VmError::WrongArgCount)));
     }
 }

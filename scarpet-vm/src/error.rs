@@ -25,4 +25,12 @@ pub enum VmError {
     /// The right side of `~` against a string / number was not a valid regular
     /// expression (the original `Value.in` throws "Incorrect matching pattern").
     InvalidPattern,
+    /// A call named a function that is neither a builtin nor user-defined.
+    UnknownFunction,
+    /// A function was called with the wrong number of arguments for its
+    /// parameter list.
+    WrongArgCount,
+    /// A function definition used a parameter that is not a plain variable
+    /// (literal patterns, `...rest`, `outer(x)` are not modelled yet).
+    UnsupportedParameter,
 }
