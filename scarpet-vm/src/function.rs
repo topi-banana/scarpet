@@ -32,6 +32,7 @@ pub(crate) fn register_builtins(state: &mut GlobalState<'_>) {
     state.register("str", Rc::new(Str));
     state.register("print", Rc::new(Print));
     state.register("call", Rc::new(Call));
+    state.register("if", Rc::new(If));
 }
 
 /// Evaluate the single argument of a one-arity builtin.
@@ -107,6 +108,30 @@ impl<'src> Function<'src> for Call {
             return Err(VmError::UnknownFunction);
         };
         function.call(vm, Args(codes))
+    }
+}
+
+struct If;
+impl<'src> Function<'src> for If {
+    fn call(
+        &self,
+        vm: &mut ScarpetVm<'_, 'src>,
+        Args(mut args): Args<'src>,
+    ) -> Result<ValueContainer, VmError> {
+        args.reverse();
+        let Some(res) = args.pop() else {
+            return Err(VmError::WrongArgCount);
+        };
+        let if_true = args.pop();
+        let if_false = args.pop();
+        if vm.push(res)?.lock()?.is_true() {
+            if let Some(expr) = if_true {
+                return vm.push(expr);
+            }
+        } else if let Some(expr) = if_false {
+            return vm.push(expr);
+        }
+        Ok(ValueContainer::null())
     }
 }
 
