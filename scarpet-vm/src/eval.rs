@@ -415,22 +415,34 @@ impl<'state, 'src> ScarpetVm<'state, 'src> {
     /// `l(a, b) = …`). The value must be a list; its elements bind to the pattern
     /// elements by position, with a `...rest` binder collecting the leftover
     /// middle into a fresh list. Sub-patterns recurse through [`assign`](Self::assign),
-    /// so a nested `[[a], b]` works. Only `=` destructures; the result is `true`,
-    /// as in the original.
+    /// so a nested `[[a], b]` works. A compound `+=` reads the pattern as an
+    /// r-value first (`[a, b] += v` is `[a, b] = [a, b] + v`); `<>` is rejected.
+    /// Yields `true`, as in the original.
     fn destructure(
         &mut self,
         Patterns { before, rest }: Patterns<'src>,
         op: AssignOp,
         value: ValueContainer,
     ) -> Result<ValueContainer, VmError> {
-        if op != AssignOp::Assign {
-            // `+=` / `<>` over a list pattern would mean reading the pattern as an
-            // r-value, applying the operator, then destructuring the result (the
-            // original delegates `+=` to `+`). That r-value read of a pattern is
-            // not wired up — and a list-pattern `<>` has no two-place reading — so
-            // only `=` destructures for now.
-            todo!("destructuring assignment supports only `=`");
-        }
+        // Pick the value to bind. `=` binds the RHS directly; `+=` reads the
+        // pattern as an r-value list and adds the RHS into it first (the original
+        // delegates `+=` to `+`, then destructures — `Value`'s `AddAssign` covers
+        // both list-pairwise and scalar-broadcast). `<>` would need the RHS as a
+        // *pattern of places*, which is gone once it has been evaluated to an
+        // ordinary value, so it is rejected.
+        let value = match op {
+            AssignOp::Assign => value,
+            AssignOp::Add => {
+                if rest.is_some() {
+                    // A rest pattern has no well-defined r-value to add into.
+                    return Err(VmError::NotAssignable);
+                }
+                let mut sum = self.eval_before_as_list(&before)?;
+                sum += value.lock()?.clone();
+                ValueContainer::new(sum)
+            }
+            AssignOp::Swap => return Err(VmError::NotAssignable),
+        };
         let Value::List(list) = value.lock()?.clone() else {
             return Err(VmError::ExpectedList);
         };
@@ -480,21 +492,64 @@ impl<'state, 'src> ScarpetVm<'state, 'src> {
             return Err(VmError::WrongArgCount);
         }
         let arg = args.before.into_iter().next().unwrap();
-        let value = self.eval_pattern(arg)?;
-        let name = value.lock()?.to_scarpet_string();
-        Ok(name)
+        Ok(self.eval_assignable(&arg)?.to_scarpet_string())
     }
 
-    /// Evaluate a pattern element as an ordinary value rather than a place — used
-    /// for a target argument that names something (the `expr` in `var(expr)`). A
-    /// computed `Expr` evaluates its expression; a bare `Var` reads its binding.
-    fn eval_pattern(&mut self, pat: Assignable<'src>) -> Result<ValueContainer, VmError> {
+    /// Evaluate an [`Assignable`] as an ordinary r-value rather than resolving it
+    /// to a place — used where a target shape names or reads something (the
+    /// argument of `var(expr)`, or the pattern read back by a compound `[a] += …`).
+    /// Each variant mirrors how the equivalent expression reads: a `Var` reads its
+    /// binding, an `Index` reads the element, a list / `l(...)` collects its
+    /// elements, and an `Expr` evaluates its expression. A `...rest` pattern has no
+    /// r-value form, and an l-value-returning call is not modelled — both error.
+    fn eval_assignable(&mut self, pat: &Assignable<'src>) -> Result<Value, VmError> {
         match pat {
-            Assignable::Expr(assign) => self.push(*assign),
-            Assignable::Var(name) => Ok(self.get_var(name)),
-            // Other shapes as a `var` argument are unusual; not modelled yet.
-            _ => todo!("non-trivial var() argument"),
+            Assignable::Var(name) => Ok(self.get_var(name).lock()?.clone()),
+            Assignable::Expr(assign) => Ok(self.push(assign.as_ref().clone())?.lock()?.clone()),
+            Assignable::List(Patterns { before, rest }) => {
+                if rest.is_some() {
+                    return Err(VmError::NotAssignable);
+                }
+                self.eval_before_as_list(before)
+            }
+            Assignable::Index { base, op, key } => {
+                let base = self.eval_assignable(base)?;
+                let key = self.push(key.clone())?.lock()?.clone();
+                match op {
+                    GetOp::Get => base.scarpet_get(&key),
+                    GetOp::Match => base.scarpet_match(&key),
+                }
+            }
+            // `var(expr)` reads the dynamically named variable; `l(...)` is a list.
+            Assignable::Call { name: "var", args } => {
+                let name = self.eval_var_name(args.clone())?;
+                Ok(self.get_var(&name).lock()?.clone())
+            }
+            Assignable::Call {
+                name: "l",
+                args: Patterns { before, rest },
+            } => {
+                if rest.is_some() {
+                    return Err(VmError::NotAssignable);
+                }
+                self.eval_before_as_list(before)
+            }
+            // An l-value-returning call has no plain r-value reading here.
+            Assignable::Call { .. } => Err(VmError::NotAssignable),
         }
+    }
+
+    /// Evaluate a list of pattern elements into a realised [`Value::list`] — the
+    /// r-value of a `[a, b, …]` / `l(a, b, …)` pattern, used by [`eval_assignable`]
+    /// and by the compound `[a, b] += …` path.
+    ///
+    /// [`eval_assignable`]: Self::eval_assignable
+    fn eval_before_as_list(&mut self, before: &[Assignable<'src>]) -> Result<Value, VmError> {
+        let items = before
+            .iter()
+            .map(|pat| self.eval_assignable(pat))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Value::list(items))
     }
 }
 
@@ -1172,5 +1227,58 @@ mod tests {
             eval_err("if(1, a, b) = 5"),
             VmError::NotAssignable
         ));
+    }
+
+    /// `[a, b] += [1, 2]` reads the pattern as an r-value and adds element-wise.
+    #[test]
+    fn compound_destructure_adds_pairwise() {
+        assert_eq!(
+            eval("a = 10; b = 20; [a, b] += [1, 2]; [a, b]"),
+            Value::list(vec![Value::Int(11), Value::Int(22)])
+        );
+    }
+
+    /// A scalar right-hand side broadcasts to every element (`[a, b] += 5`).
+    #[test]
+    fn compound_destructure_adds_scalar_to_each() {
+        assert_eq!(
+            eval("a = 10; b = 20; [a, b] += 5; [a, b]"),
+            Value::list(vec![Value::Int(15), Value::Int(25)])
+        );
+    }
+
+    /// `l(a, b) += …` behaves like the `[a, b]` form.
+    #[test]
+    fn compound_destructure_through_l_constructor() {
+        assert_eq!(
+            eval("a = 1; b = 2; l(a, b) += [10, 20]; [a, b]"),
+            Value::list(vec![Value::Int(11), Value::Int(22)])
+        );
+    }
+
+    /// `<>` over a list pattern needs the right side as places, which are lost
+    /// once it is an ordinary value, so it is rejected.
+    #[test]
+    fn swap_destructure_is_rejected() {
+        assert!(matches!(
+            eval_err("a = 1; b = 2; c = 3; d = 4; [a, b] <> [c, d]"),
+            VmError::NotAssignable
+        ));
+    }
+
+    /// A compound assignment into a rest pattern has no r-value form.
+    #[test]
+    fn compound_destructure_with_rest_is_rejected() {
+        assert!(matches!(
+            eval_err("[a, ...rest] += [1, 2]"),
+            VmError::NotAssignable
+        ));
+    }
+
+    /// A `var(...)` argument may itself be a container read (`var(m:0)`), which
+    /// the r-value evaluator now handles.
+    #[test]
+    fn var_name_from_a_container_read() {
+        assert_eq!(eval("m = ['x', 'y']; var(m:0) = 7; x"), Value::Int(7));
     }
 }
