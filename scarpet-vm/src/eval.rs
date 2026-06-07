@@ -6,8 +6,8 @@
 use std::{cmp::Ordering, rc::Rc};
 
 use scarpet_syntax::ast::{
-    Additive, Args, Assign, Code, Compare, Equality, Expr, Get, Land, Lor, Mult, Power, Primary,
-    Unary,
+    Additive, Args, Assign, AssignOp, Assignable, Code, Compare, Equality, Expr, Get, Land, Lor,
+    Mult, Patterns, Power, Primary, RestPat, Unary,
 };
 
 use crate::{
@@ -52,86 +52,13 @@ impl<'src, 'state> Evalute<Expr<'src>> for ScarpetVm<'state, 'src> {
 
 impl<'src, 'state> Evalute<Assign<'src>> for ScarpetVm<'state, 'src> {
     fn push(&mut self, st: Assign<'src>) -> Result<ValueContainer, VmError> {
-        use scarpet_syntax::ast::{AssignOp, Assignable};
         match st {
             Assign::Set { target, op, value } => {
-                // Resolve `target` to a single mutable place — a shared
-                // `ValueContainer` slot — then apply `op` to it in place below.
-                // This "one l-value place" model suffices for a bare variable,
-                // but most `Assignable` shapes do not reduce to one pre-existing
-                // place; each `todo!()` sketches what it needs instead.
-                //
-                // The shape to grow into is a recursive resolver that, given an
-                // `Assignable` and the evaluated right-hand value, either
-                //   (a) resolves to a single place and applies `op` — `Var`,
-                //       `var(expr)`, `base:key` — or
-                //   (b) destructures the value across several sub-targets —
-                //       `[a, b]`, `l(a, b)`.
-                // The uniform `op` step below only fits case (a): a destructure
-                // is `=`-only (the original delegates `+=` to `+` first, then
-                // binds), and `<>` over a destructure is undefined.
-                let var = match target {
-                    Assignable::Var(name) => self.get_var(name),
-
-                    // TODO(assign:list) `[a, b] = [1, 2]`, `[a, ...rest] = [1, 2, 3]`.
-                    // A list pattern is multi-value, not a single place. Evaluate
-                    // the value to a `Value::List`, bind each `before` element to
-                    // the matching element, and (when present) collect the
-                    // leftovers into `rest.binder` as a fresh list. Recurse so
-                    // nested patterns (`[[a], b]`) reuse this same resolver per
-                    // element. Arity: with no rest the lengths must match exactly
-                    // — the original raises "Too many values to unpack" when the
-                    // value list is longer and "Too few" when shorter (two new
-                    // `VmError` variants). A non-list value is an error. `=` only.
-                    Assignable::List(_patterns) => todo!("destructuring list assignment"),
-
-                    // TODO(assign:call) two shapes share this arm:
-                    //   * `var(expr) = …` — a dynamic variable: evaluate the one
-                    //     argument, coerce it to a string, and resolve through
-                    //     `get_var(name)`. This *is* a single place, so once the
-                    //     name is known it can flow through the `op` step below.
-                    //   * `l(a, b) = …` — `l(...)` is a list constructor, the same
-                    //     l-value as the `[a, b]` destructure above.
-                    // Dispatch on `name`: "var" → dynamic place, "l" → reuse the
-                    // list-destructure path. Any other call (`if(c, a, b) = …`, an
-                    // l-value-returning function) stays unsupported for now. `args`
-                    // is a `Patterns`; `var` expects exactly one computed argument
-                    // (an `Assignable::Expr`).
-                    Assignable::Call { name: _, args: _ } => todo!("call-shaped assignment target"),
-
-                    // TODO(assign:index) `x:0 = 5`, `m:'k' = v` — container
-                    // mutation (the original `LContainerValue` → `container.put`).
-                    // The read path `scarpet_get` returns a *clone*, so this needs
-                    // a separate write path:
-                    //   1. resolve `base` to its actual place (recurse through
-                    //      `Var` / `var(...)` / nested `Index`) — not a clone, so
-                    //      the mutation stays visible;
-                    //   2. lock that place and mutate the `Value` inside via a new
-                    //      `Value::scarpet_put(&mut self, key, value)`: list index
-                    //      set (normalize the index like `scarpet_get`) or map key
-                    //      insert-or-update.
-                    // The `ListValue` trait is read-only today, so it needs a
-                    // `set(index, value)` primitive (immutable lazy lists such as
-                    // `range` must error). `~` as an l-value is unusual — likely
-                    // unsupported. The original yields the assigned value, not the
-                    // container.
-                    Assignable::Index { .. } => todo!("indexed container assignment"),
-
-                    // `Expr` is a computed / literal pattern element. Lowering
-                    // never emits it as a *direct* target (`lower_assignable(_,
-                    // false)`), so it can only surface nested inside a destructure
-                    // — where it is not a valid l-value.
-                    // TODO(assign:expr) surface a `NotAssignable`-style error once
-                    // destructuring recurses into this resolver.
-                    Assignable::Expr(_) => todo!("computed target is not assignable"),
-                };
-                let val = self.push(*value)?;
-                match op {
-                    AssignOp::Assign => *var.lock()? = val.lock()?.clone(),
-                    AssignOp::Add => *var.lock()? += val.lock()?.clone(),
-                    AssignOp::Swap => std::mem::swap(&mut *var.lock()?, &mut *val.lock()?),
-                }
-                Ok(var.clone())
+                // The right-hand side is evaluated once, in the current scope,
+                // before binding; `assign` then routes it to the target — a single
+                // place for `op` to update, or a destructure to spread across.
+                let value = self.push(*value)?;
+                self.assign(target, op, value)
             }
             Assign::Lor(ost) => self.push(ost),
         }
@@ -348,6 +275,146 @@ impl<'state, 'src> ScarpetVm<'state, 'src> {
             }
             Value::List(_) => Err(VmError::MapEntryNotPair),
             other => Ok((other, Value::Null)),
+        }
+    }
+
+    /// Carry out `target <op> value` — the body of an [`Assign::Set`]. The two
+    /// target shapes need different handling: a *destructuring* list pattern
+    /// (`[a, b]`, `l(a, b)`) spreads `value` across several sub-targets and is
+    /// `=`-only, while a *single place* (`Var`, `var(expr)`, and eventually
+    /// `base:key`) resolves to one shared slot that `op` updates in place.
+    fn assign(
+        &mut self,
+        target: Assignable<'src>,
+        op: AssignOp,
+        value: ValueContainer,
+    ) -> Result<ValueContainer, VmError> {
+        match target {
+            // `[a, b] = …` and `l(a, b) = …` are the same list-constructor l-value.
+            Assignable::List(patterns) => self.destructure(patterns, op, value),
+            Assignable::Call { name: "l", args } => self.destructure(args, op, value),
+            // Everything else resolves to a single mutable place, which `op` writes
+            // through; the slot itself is the assignment's value (so `b = a = 1`
+            // reads `a`'s slot for `b`).
+            target => {
+                let place = self.resolve_place(target)?;
+                match op {
+                    AssignOp::Assign => *place.lock()? = value.lock()?.clone(),
+                    AssignOp::Add => *place.lock()? += value.lock()?.clone(),
+                    AssignOp::Swap => std::mem::swap(&mut *place.lock()?, &mut *value.lock()?),
+                }
+                Ok(place)
+            }
+        }
+    }
+
+    /// Resolve a single-place assignment target to its shared [`ValueContainer`]
+    /// slot: the local slot for a bare `Var`, or the dynamically named slot for
+    /// `var(expr)` (whose argument evaluates to the variable name). Writing
+    /// through the returned slot updates the binding in place.
+    fn resolve_place(&mut self, target: Assignable<'src>) -> Result<ValueContainer, VmError> {
+        match target {
+            Assignable::Var(name) => Ok(self.get_var(name)),
+            // `var(expr)` names a variable dynamically — `var('x' + i) = …`.
+            Assignable::Call { name: "var", args } => {
+                let name = self.eval_var_name(args)?;
+                Ok(self.get_var(&name))
+            }
+            // TODO(assign:index) container element assignment (`x:0 = 5`,
+            // `m:'k' = v`) still needs an in-place write path: resolve `base` to
+            // its place, then mutate the `Value` inside via a new
+            // `Value::scarpet_put` (the read path `scarpet_get` only clones). The
+            // `ListValue` trait is read-only today, so it needs a `set` primitive.
+            Assignable::Index { .. } => todo!("indexed container assignment"),
+            // Any other call would be an l-value-returning function (`if(c, a, b)`),
+            // not modelled yet; `l(…)` is handled as a destructure before here.
+            Assignable::Call { .. } => todo!("call-shaped assignment target"),
+            // A list pattern is multi-value (handled in `assign`), and a computed
+            // `Expr` element — the `1` in `[a, 1] = …` — is not a valid l-value.
+            Assignable::List(_) | Assignable::Expr(_) => Err(VmError::NotAssignable),
+        }
+    }
+
+    /// Spread `value` across a destructuring list pattern (`[a, b] = …`,
+    /// `l(a, b) = …`). The value must be a list; its elements bind to the pattern
+    /// elements by position, with a `...rest` binder collecting the leftover
+    /// middle into a fresh list. Sub-patterns recurse through [`assign`](Self::assign),
+    /// so a nested `[[a], b]` works. Only `=` destructures; the result is `true`,
+    /// as in the original.
+    fn destructure(
+        &mut self,
+        Patterns { before, rest }: Patterns<'src>,
+        op: AssignOp,
+        value: ValueContainer,
+    ) -> Result<ValueContainer, VmError> {
+        if op != AssignOp::Assign {
+            // `+=` / `<>` over a list pattern follow the original's operator
+            // delegation, not modelled yet.
+            todo!("destructuring assignment supports only `=`");
+        }
+        let Value::List(list) = value.lock()?.clone() else {
+            return Err(VmError::ExpectedList);
+        };
+        let mut items: Vec<Value> = list.into_iter().collect();
+        match rest {
+            // No rest binder: the lengths must match exactly.
+            None => {
+                match items.len().cmp(&before.len()) {
+                    Ordering::Greater => return Err(VmError::TooManyValuesToUnpack),
+                    Ordering::Less => return Err(VmError::TooFewValuesToUnpack),
+                    Ordering::Equal => {}
+                }
+                for (pat, item) in before.into_iter().zip(items) {
+                    self.assign(pat, AssignOp::Assign, ValueContainer::new(item))?;
+                }
+            }
+            // `[a, ...rest, b]`: bind `before` from the front and `after` from the
+            // back, and collect the middle into the rest binder as a new list.
+            Some(RestPat { binder, after }) => {
+                let fixed = before.len() + after.len();
+                if items.len() < fixed {
+                    return Err(VmError::TooFewValuesToUnpack);
+                }
+                let tail = items.split_off(items.len() - after.len());
+                let middle = items.split_off(before.len());
+                for (pat, item) in before.into_iter().zip(items) {
+                    self.assign(pat, AssignOp::Assign, ValueContainer::new(item))?;
+                }
+                self.assign(
+                    *binder,
+                    AssignOp::Assign,
+                    ValueContainer::new(Value::list(middle)),
+                )?;
+                for (pat, item) in after.into_iter().zip(tail) {
+                    self.assign(pat, AssignOp::Assign, ValueContainer::new(item))?;
+                }
+            }
+        }
+        Ok(ValueContainer::bool(true))
+    }
+
+    /// Evaluate the single argument of a dynamic `var(expr)` target to the name
+    /// of the variable it selects: `var` takes one argument, and its value's
+    /// string form is the name (so `var('x' + i)` and `var(key)` both work).
+    fn eval_var_name(&mut self, args: Patterns<'src>) -> Result<String, VmError> {
+        if args.rest.is_some() || args.before.len() != 1 {
+            return Err(VmError::WrongArgCount);
+        }
+        let arg = args.before.into_iter().next().unwrap();
+        let value = self.eval_pattern(arg)?;
+        let name = value.lock()?.to_scarpet_string();
+        Ok(name)
+    }
+
+    /// Evaluate a pattern element as an ordinary value rather than a place — used
+    /// for a target argument that names something (the `expr` in `var(expr)`). A
+    /// computed `Expr` evaluates its expression; a bare `Var` reads its binding.
+    fn eval_pattern(&mut self, pat: Assignable<'src>) -> Result<ValueContainer, VmError> {
+        match pat {
+            Assignable::Expr(assign) => self.push(*assign),
+            Assignable::Var(name) => Ok(self.get_var(name)),
+            // Other shapes as a `var` argument are unusual; not modelled yet.
+            _ => todo!("non-trivial var() argument"),
         }
     }
 }
@@ -759,5 +826,99 @@ mod tests {
             VmError::WrongArgCount
         ));
         assert!(matches!(eval_err("range('a')"), VmError::ExpectedNumber));
+    }
+
+    /// `[a, b] = [1, 2]` binds each element of the pattern to the matching value.
+    #[test]
+    fn destructure_list_binds_each_element() {
+        assert_eq!(eval("[a, b] = [10, 20]; a + b"), Value::Int(30));
+    }
+
+    /// A destructuring assignment yields `true` (the original's result), not the
+    /// list — distinct from a single-place assignment, which yields the value.
+    #[test]
+    fn destructure_yields_true() {
+        assert_eq!(eval("[a] = [1]"), Value::Bool(true));
+    }
+
+    /// `l(a, b)` is the same list-constructor l-value as `[a, b]`.
+    #[test]
+    fn destructure_l_constructor() {
+        assert_eq!(eval("l(a, b) = [1, 2]; a + b"), Value::Int(3));
+    }
+
+    /// A nested list pattern destructures element-wise (`[[a], b]`).
+    #[test]
+    fn destructure_nested_list() {
+        assert_eq!(eval("[[a], b] = [[1], 2]; a + b"), Value::Int(3));
+    }
+
+    /// `...rest` collects the leftover elements after the fixed ones into a list.
+    #[test]
+    fn destructure_rest_collects_the_tail() {
+        assert_eq!(
+            eval("[a, ...rest] = [1, 2, 3, 4]; rest"),
+            Value::list(vec![Value::Int(2), Value::Int(3), Value::Int(4)])
+        );
+    }
+
+    /// A rest binder between fixed elements binds `before` from the front and
+    /// `after` from the back, leaving the middle for the rest.
+    #[test]
+    fn destructure_rest_between_fixed_elements() {
+        assert_eq!(
+            eval("[first, ...mid, last] = [1, 2, 3, 4, 5]; mid"),
+            Value::list(vec![Value::Int(2), Value::Int(3), Value::Int(4)])
+        );
+    }
+
+    /// Without a rest binder the lengths must match exactly.
+    #[test]
+    fn destructure_arity_mismatch_is_an_error() {
+        assert!(matches!(
+            eval_err("[a] = [1, 2]"),
+            VmError::TooManyValuesToUnpack
+        ));
+        assert!(matches!(
+            eval_err("[a, b] = [1]"),
+            VmError::TooFewValuesToUnpack
+        ));
+    }
+
+    /// Destructuring a non-list value cannot be unpacked.
+    #[test]
+    fn destructure_non_list_is_an_error() {
+        assert!(matches!(eval_err("[a] = 5"), VmError::ExpectedList));
+    }
+
+    /// A literal in a destructuring pattern is not an assignable target.
+    #[test]
+    fn destructure_literal_target_is_an_error() {
+        assert!(matches!(
+            eval_err("[a, 1] = [1, 2]"),
+            VmError::NotAssignable
+        ));
+    }
+
+    /// `var('test') = 7` binds the variable named by the string. It is a single
+    /// place, so it yields the assigned value, and the plain name reads it back.
+    #[test]
+    fn var_assigns_a_dynamically_named_variable() {
+        assert_eq!(eval("var('test') = 7"), Value::Int(7));
+        assert_eq!(eval("var('test') = 7; test"), Value::Int(7));
+    }
+
+    /// `var(name)` takes the variable name from the *value* of its argument, so a
+    /// bare variable argument names the variable its value spells.
+    #[test]
+    fn var_name_comes_from_the_argument_value() {
+        assert_eq!(eval("k = 'foo'; var(k) = 9; foo"), Value::Int(9));
+    }
+
+    /// The `var` argument is an arbitrary expression: `var('x' + i)` selects the
+    /// variable whose name is the computed string.
+    #[test]
+    fn var_name_can_be_computed() {
+        assert_eq!(eval("i = 1; var('x' + i) = 5; x1"), Value::Int(5));
     }
 }

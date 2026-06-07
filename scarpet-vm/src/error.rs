@@ -33,4 +33,17 @@ pub enum VmError {
     /// A function definition used a parameter that is not a plain variable
     /// (literal patterns, `...rest`, `outer(x)` are not modelled yet).
     UnsupportedParameter,
+    /// The right-hand side of a destructuring assignment (`[a, b] = …`) was not a
+    /// list, so it cannot be unpacked.
+    ExpectedList,
+    /// A destructuring assignment had more values than its pattern could bind
+    /// (the original `=` raises "Too many values to unpack").
+    TooManyValuesToUnpack,
+    /// A destructuring assignment had fewer values than its pattern required (the
+    /// original `=` raises "Too few values to unpack").
+    TooFewValuesToUnpack,
+    /// An assignment target that cannot be assigned to: a literal or computed
+    /// element in a destructuring pattern (`[a, 1] = …`), where the original
+    /// `assertAssignable` throws.
+    NotAssignable,
 }
