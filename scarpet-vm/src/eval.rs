@@ -329,9 +329,10 @@ impl<'state, 'src> ScarpetVm<'state, 'src> {
             // `assign_index` flattens a `base:key` chain down to its root before
             // resolving, so an `Index` never reaches here as a place on its own.
             Assignable::Index { .. } => Err(VmError::NotAssignable),
-            // Any other call would be an l-value-returning function (`if(c, a, b)`),
-            // not modelled yet; `l(…)` is handled as a destructure before here.
-            Assignable::Call { .. } => todo!("call-shaped assignment target"),
+            // A call other than `var(...)` / `l(...)` would be an l-value-returning
+            // function (`if(c, a, b) = …`), which needs the callee to take part in
+            // assignment — not modelled, so it is not a valid target.
+            Assignable::Call { .. } => Err(VmError::NotAssignable),
             // A list pattern is multi-value (handled in `assign`), and a computed
             // `Expr` element — the `1` in `[a, 1] = …` — is not a valid l-value.
             Assignable::List(_) | Assignable::Expr(_) => Err(VmError::NotAssignable),
@@ -355,8 +356,9 @@ impl<'state, 'src> ScarpetVm<'state, 'src> {
         op: AssignOp,
         value: ValueContainer,
     ) -> Result<ValueContainer, VmError> {
+        // `~` (Match) is a search operator, not a writable container address.
         if get_op != GetOp::Get {
-            todo!("`~` is not an assignment target");
+            return Err(VmError::NotAssignable);
         }
         // Flatten `root:k0:…:kn` into the root l-value and the key path
         // `[k0, …, kn]`. Keys are gathered innermost-first, then reversed.
@@ -372,7 +374,8 @@ impl<'state, 'src> ScarpetVm<'state, 'src> {
                     keys.push(self.push(key)?.lock()?.clone());
                     current = *base;
                 }
-                Assignable::Index { .. } => todo!("`~` is not an assignment target"),
+                // A `~` anywhere along the path is not a writable address either.
+                Assignable::Index { .. } => return Err(VmError::NotAssignable),
                 other => break other,
             }
         };
@@ -396,9 +399,13 @@ impl<'state, 'src> ScarpetVm<'state, 'src> {
                 element += new;
                 element
             }
-            // Swapping an element with another l-value needs two places at once;
-            // not modelled yet.
-            AssignOp::Swap => todo!("`<>` on a container element"),
+            // `c:k <> v` swaps the element with the l-value `v`: the element takes
+            // `v`'s value (through the common `scarpet_put` below) while `v` takes
+            // the element's old value in place, through its shared slot.
+            AssignOp::Swap => {
+                let old = container.scarpet_get(last)?;
+                std::mem::replace(&mut *value.lock()?, old)
+            }
         };
         container.scarpet_put(last, stored.clone())?;
         Ok(ValueContainer::new(stored))
@@ -417,8 +424,11 @@ impl<'state, 'src> ScarpetVm<'state, 'src> {
         value: ValueContainer,
     ) -> Result<ValueContainer, VmError> {
         if op != AssignOp::Assign {
-            // `+=` / `<>` over a list pattern follow the original's operator
-            // delegation, not modelled yet.
+            // `+=` / `<>` over a list pattern would mean reading the pattern as an
+            // r-value, applying the operator, then destructuring the result (the
+            // original delegates `+=` to `+`). That r-value read of a pattern is
+            // not wired up — and a list-pattern `<>` has no two-place reading — so
+            // only `=` destructures for now.
             todo!("destructuring assignment supports only `=`");
         }
         let Value::List(list) = value.lock()?.clone() else {
@@ -1121,6 +1131,46 @@ mod tests {
         assert!(matches!(
             eval_err("x = [range(3)]; x:0:0 = 9"),
             VmError::ImmutableList
+        ));
+    }
+
+    /// `a <> b` exchanges two variables' values through their shared slots.
+    #[test]
+    fn swap_exchanges_two_variables() {
+        assert_eq!(
+            eval("a = 1; b = 2; a <> b; [a, b]"),
+            Value::list(vec![Value::Int(2), Value::Int(1)])
+        );
+    }
+
+    /// `x:0 <> y` swaps a container element with a variable: the element takes the
+    /// variable's value and the variable takes the element's old value.
+    #[test]
+    fn swap_exchanges_a_container_element_with_a_variable() {
+        assert_eq!(
+            eval("x = [1, 2, 3]; y = 9; x:0 <> y; [x, y]"),
+            Value::list(vec![
+                Value::list(vec![Value::Int(9), Value::Int(2), Value::Int(3)]),
+                Value::Int(1),
+            ])
+        );
+    }
+
+    /// `~` is a match operator, not a writable address, so it cannot be assigned.
+    #[test]
+    fn match_operator_is_not_an_assignment_target() {
+        assert!(matches!(
+            eval_err("x = [1, 2]; x ~ 1 = 9"),
+            VmError::NotAssignable
+        ));
+    }
+
+    /// An l-value-returning function call (`if(...) = …`) is not a supported target.
+    #[test]
+    fn lvalue_returning_call_is_not_a_target() {
+        assert!(matches!(
+            eval_err("if(1, a, b) = 5"),
+            VmError::NotAssignable
         ));
     }
 }
