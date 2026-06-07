@@ -12,7 +12,7 @@ members = [
 ariadne = { version = "0.6", features = ["auto-color"] }
 clap = { version = "4.6.1", features = ["derive"] }
 chumsky = { version = "0.11" }
-logos = { version = "0.15.1" }
+logos = { version = "0.16.1" }
 logosky = { version = "0.2" }
 regex = { version = "1" }
 rustyline = { version = "18" }
