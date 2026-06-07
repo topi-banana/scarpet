@@ -4,26 +4,34 @@
 
 *[English](README.md) | 日本語*
 
-Minecraft の [Carpet](https://github.com/gnembon/fabric-carpet) Mod に組み込まれているスクリプト言語 [Scarpet](https://github.com/gnembon/fabric-carpet/blob/master/docs/scarpet/Documentation.md) のための Rust 製ツール群です。Scarpet スクリプト（`.sc` ファイル）はゲーム内アプリやサーバー拡張を記述するために使われます。本リポジトリはそれらを対象とした字句解析器、トリビア（コメント・改行）を保持する構文解析器、そしてコードフォーマッタを提供します。
+Minecraft の [Carpet](https://github.com/gnembon/fabric-carpet) Mod に組み込まれているスクリプト言語 [Scarpet](https://github.com/gnembon/fabric-carpet/blob/master/docs/scarpet/Documentation.md) のための Rust 製ツール群です。Scarpet スクリプト（`.sc` ファイル）はゲーム内アプリやサーバー拡張を記述するために使われます。本リポジトリはそれらを対象とした字句解析器、トリビア（コメント・改行）を保持する構文解析器、コードフォーマッタ、そして実験的な評価器を提供します。
 
-> **ステータス:** 初期段階。構文解析器は式の文法全体をカバーし、実在する 220 ファイルのコーパスの 98.6% を解析できます。フォーマッタはそのコーパスを非破壊的に往復処理できます。API は未安定です。
+> **ステータス:** 初期段階。構文解析器は式の文法全体をカバーし、実在する 220 ファイルのコーパスの 98.6% を解析できます。フォーマッタはそのコーパスを非破壊的に往復処理できます。ツリーウォーキング評価器（`scarpet-vm`）は初期プロトタイプで、CLI の `repl` から利用できます。API は未安定です。
 
 ## ワークスペース構成
 
-3 つのクレートとテストコーパスからなる Cargo ワークスペースです。
+4 つのクレートとテストコーパスからなる Cargo ワークスペースです。
 
 | クレート | 内容 |
 | --- | --- |
 | [`scarpet-syntax`](scarpet-syntax) | 字句解析器（[`logos`](https://crates.io/crates/logos)）と構文解析器（[`logosky`](https://crates.io/crates/logosky) 経由の [`chumsky`](https://crates.io/crates/chumsky)）。コメントと改行を保持した CST を生成します。`wasm32` 向けにもビルドできます。 |
 | [`scarpet-fmt`](scarpet-fmt) | コードフォーマッタ。CST を Wadler/Lindig 流のプリティプリント用 IR に変換し、設定可能なスタイルで描画します。 |
-| [`scarpet-cli`](scarpet-cli) | `clap` ベースのコマンドラインフロントエンド（`scarpet`）。現在は `format` を提供します。 |
+| [`scarpet-vm`](scarpet-vm) | ツリーウォーキング評価器。初期プロトタイプです。CST を AST に変換して評価します。値・演算子・代入と分割代入・ユーザー定義関数、およびいくつかの組み込み関数（`type`・`str`・`print`・`call`・`if`・`range`）に対応します。 |
+| [`scarpet-cli`](scarpet-cli) | `clap` ベースのコマンドラインフロントエンド（`scarpet`）。`format` と対話的な `repl` を提供します。 |
 | [`example/`](example) | コミュニティ製 Scarpet スクリプトの git サブモジュール群。解析・整形のコーパスとして使用します。 |
 
-データは一方向に流れます。
+構文フロントエンドを 2 つのパイプラインが共有します。整形は一方向かつ非破壊的です。
 
 ```
 ソース (.sc) → 字句解析 → 構文解析 → CST（トリビア付き）→ fmt lower → Doc IR → 整形済みテキスト
                                        └─ scarpet-syntax ─┘   └──────── scarpet-fmt ────────┘
+```
+
+評価（実験的）は同じ CST を AST に変換して走査します。
+
+```
+ソース (.sc) → 字句解析 → 構文解析 → CST → AST lower → 評価 → 値
+                                       └─ scarpet-syntax ─┘ └─ scarpet-vm ─┘
 ```
 
 ## はじめに
@@ -119,6 +127,29 @@ foo() ->
 ```
 
 フォーマッタは**非破壊的**（出力を再解析すると構造的に同一の木が得られる）かつ**冪等**（2 回整形しても 1 回と同じ）です。いずれの性質も CI でコーパス全体に対して、両方の brace スタイルで検証されています。
+
+### REPL（実験的）
+
+`scarpet repl` は、プロトタイプ評価器 `scarpet-vm` を用いた対話的な read–eval–print ループを起動します。入力ごとに構文解析・AST への変換・評価を行い、変数や関数定義はセッションをまたいで保持されます。評価結果の値を表示し、構文解析・変換・評価のいずれかでエラーが起きた場合は rustc 風の診断を表示します。
+
+```sh
+cargo run -p scarpet-cli -- repl
+```
+
+```
+scarpet> 1 + 2 * 3
+Single(Int(7))
+scarpet> a = [1, 2, 3]
+Single(List(ArrayList([Int(1), Int(2), Int(3)])))
+scarpet> foo(x) -> x * x
+Single(String("foo"))
+scarpet> foo(4)
+Single(Int(16))
+```
+
+入力は複数行にまたがれます。括弧が閉じていない間は入力を継続し、Shift+Enter（または Alt+Enter）で改行を挿入できます。Enter で送信、Ctrl+C で入力中の送信を破棄、Ctrl+D で終了します。端末以外からの入力ではプロンプトとバナーを省略し、1 行につき 1 文を読み取ります。そのため `echo 'a = 5; a + 1' | scarpet repl` は値だけを表示します。
+
+評価器は初期プロトタイプです。算術、比較・等価、単項演算子と `match`、要素アクセス、リスト・マップリテラル、代入と分割代入、ユーザー定義関数、および `type`・`str`・`print`・`call`・`if`・`range` の組み込み関数に対応します。値は現状 `Debug` 形式で表示され、Scarpet の標準ライブラリの多くは未実装です。
 
 ## コーパス
 

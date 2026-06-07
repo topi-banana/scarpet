@@ -1,0 +1,8 @@
+[package]
+name = "scarpet-vm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+regex = { workspace = true }
+scarpet-syntax = { workspace = true }

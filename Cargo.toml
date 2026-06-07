@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["scarpet-cli", "scarpet-fmt", "scarpet-playground", "scarpet-syntax"]
+members = [
+  "scarpet-cli",
+  "scarpet-fmt",
+  "scarpet-playground",
+  "scarpet-syntax",
+  "scarpet-vm",
+]
 
 [workspace.dependencies]
 ariadne = { version = "0.6", features = ["auto-color"] }
@@ -8,9 +14,11 @@ clap = { version = "4.6.1", features = ["derive"] }
 chumsky = { version = "0.11" }
 logos = { version = "0.15.1" }
 logosky = { version = "0.2" }
+regex = { version = "1" }
 rustyline = { version = "18" }
 similar = { version = "3" }
 scarpet-fmt = { path = "./scarpet-fmt" }
 scarpet-syntax = { path = "./scarpet-syntax" }
+scarpet-vm = { path = "./scarpet-vm" }
 serde = { version = "1", features = ["derive"] }
 toml = { version = "1" }

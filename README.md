@@ -4,26 +4,34 @@
 
 *English | [日本語](README_jp.md)*
 
-Rust tooling for [Scarpet](https://github.com/gnembon/fabric-carpet/blob/master/docs/scarpet/Documentation.md), the scripting language embedded in the [Carpet](https://github.com/gnembon/fabric-carpet) mod for Minecraft. Scarpet scripts (`.sc` files) drive in-game apps and server extensions; this repository provides a lexer, a trivia-preserving parser, and a code formatter for them.
+Rust tooling for [Scarpet](https://github.com/gnembon/fabric-carpet/blob/master/docs/scarpet/Documentation.md), the scripting language embedded in the [Carpet](https://github.com/gnembon/fabric-carpet) mod for Minecraft. Scarpet scripts (`.sc` files) drive in-game apps and server extensions; this repository provides a lexer, a trivia-preserving parser, a code formatter, and an experimental evaluator for them.
 
-> **Status:** early. The parser covers the full expression grammar and parses 98.6% of a 220-file real-world corpus; the formatter round-trips that corpus non-destructively. APIs are unstable.
+> **Status:** early. The parser covers the full expression grammar and parses 98.6% of a 220-file real-world corpus; the formatter round-trips that corpus non-destructively. A tree-walking evaluator (`scarpet-vm`) is an early prototype, driven through the CLI's `repl`. APIs are unstable.
 
 ## Workspace layout
 
-This is a Cargo workspace of three crates plus a test corpus:
+This is a Cargo workspace of four crates plus a test corpus:
 
 | Crate | What it is |
 | --- | --- |
 | [`scarpet-syntax`](scarpet-syntax) | Lexer ([`logos`](https://crates.io/crates/logos)) and parser ([`chumsky`](https://crates.io/crates/chumsky) via [`logosky`](https://crates.io/crates/logosky)) producing a CST that preserves comments and line breaks. Also builds for `wasm32`. |
 | [`scarpet-fmt`](scarpet-fmt) | Code formatter. Lowers the CST to a Wadler/Lindig pretty-printing IR and renders it at a configurable style. |
-| [`scarpet-cli`](scarpet-cli) | Command-line front end (`scarpet`), built on `clap`. Currently exposes `format`. |
+| [`scarpet-vm`](scarpet-vm) | Tree-walking evaluator — an early prototype. Lowers the CST to an AST and evaluates it: values, operators, assignment and destructuring, user-defined functions, and a few builtins (`type`, `str`, `print`, `call`, `if`, `range`). |
+| [`scarpet-cli`](scarpet-cli) | Command-line front end (`scarpet`), built on `clap`. Exposes `format` and an interactive `repl`. |
 | [`example/`](example) | Git submodules of community Scarpet scripts, used as a parse/format corpus. |
 
-Data flows in one direction:
+Two pipelines share the syntax front end. Formatting is one-directional and non-destructive:
 
 ```
 source (.sc) → lexer → parser → CST (with trivia) → fmt lower → Doc IR → formatted text
                                   └─ scarpet-syntax ─┘   └──────── scarpet-fmt ────────┘
+```
+
+Evaluation (experimental) lowers the same CST to an AST and walks it:
+
+```
+source (.sc) → lexer → parser → CST → AST lower → evaluate → value
+                                  └─ scarpet-syntax ─┘ └─ scarpet-vm ─┘
 ```
 
 ## Getting started
@@ -119,6 +127,29 @@ foo() ->
 ```
 
 The formatter is **non-destructive** (re-parsing its output yields a structurally identical tree) and **idempotent** (formatting twice is the same as once). Both properties are enforced against the whole corpus in CI — under both brace styles.
+
+### The REPL (experimental)
+
+`scarpet repl` starts an interactive read–eval–print loop backed by `scarpet-vm`, the prototype evaluator. Each submission is parsed, lowered to an AST, and evaluated in a session VM whose variables and function definitions persist across submissions; the resulting value is printed, or a rustc-style diagnostic on a parse, lowering, or evaluation error.
+
+```sh
+cargo run -p scarpet-cli -- repl
+```
+
+```
+scarpet> 1 + 2 * 3
+Single(Int(7))
+scarpet> a = [1, 2, 3]
+Single(List(ArrayList([Int(1), Int(2), Int(3)])))
+scarpet> foo(x) -> x * x
+Single(String("foo"))
+scarpet> foo(4)
+Single(Int(16))
+```
+
+A submission can span several lines: it stays open while a bracket is unclosed, and Shift+Enter (or Alt+Enter) forces a newline. Enter submits, Ctrl+C abandons the current submission, and Ctrl+D exits. With non-terminal input the prompt and banner are dropped and one statement is read per line, so `echo 'a = 5; a + 1' | scarpet repl` prints just the value.
+
+The evaluator is an early prototype: it covers arithmetic, comparison and equality, unary and `match` operators, element access, list and map literals, assignment and destructuring, user-defined functions, and the `type`, `str`, `print`, `call`, `if`, and `range` builtins. Values currently print in their `Debug` form, and much of Scarpet's standard library is not yet implemented.
 
 ## The corpus
 

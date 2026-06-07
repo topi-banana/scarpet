@@ -21,11 +21,12 @@
 //! - `~` `:` → [`Get`]
 //! - atoms, calls, `[...]`, `{...}`, `(...)` → [`Primary`]
 //!
-//! Lowering is fallible only where an [`Assignable`] is required — the left of
-//! `=`/`+=`/`<>` — so `1 = 2` or `a + b = c` yields [`LowerError`] rather than a
-//! silently wrong tree. Function parameters, by contrast, are general
-//! expressions (Scarpet dispatches on literal patterns like `f('add', x) -> …`),
-//! so they never constrain to an assignable.
+//! Lowering is fallible where an [`Assignable`] / [`Patterns`] is required — the
+//! left of `=`/`+=`/`<>`, function parameters, and call-target arguments — so
+//! `1 = 2` or `a + b = c` yields [`LowerError`] rather than a silently wrong
+//! tree. Parameters and call-target arguments are a [`Patterns`]: they admit
+//! literal / computed elements (an [`Assignable::Expr`], for value dispatch like
+//! `f('add', x) -> …`) yet constrain `...rest` to at most one per level.
 //!
 //! Every borrowed `&'s str` points back into the original source, exactly as in
 //! the [`Cst`]; lowering allocates only the `Vec`/`Box` spine.
@@ -53,13 +54,13 @@ pub enum Expr<'s> {
     /// `name(params) -> body` — a function definition (the left of `->` is a
     /// call). The anonymous form `_(x) -> …` is just `name == "_"`.
     ///
-    /// `params` are general expressions, not [`Assignable`]s: besides plain
-    /// binders (`a`), rest binders (`...rest`), and `outer(x)` captures, Scarpet
-    /// allows *literal pattern* parameters for value dispatch (`f('add', x) ->
-    /// …`, `f(1) -> …`). It is the evaluator that classifies each by shape.
+    /// `params` are a [`Patterns`]: plain binders (`a`), `outer(x)` captures (an
+    /// [`Assignable::Call`]), *literal pattern* parameters for value dispatch
+    /// (`f('add', x) -> …`, an [`Assignable::Expr`]), and at most one rest binder
+    /// (`...rest`). It is the evaluator that classifies each by shape.
     Def {
         name: &'s str,
-        params: Args<'s>,
+        params: Patterns<'s>,
         body: Box<Expr<'s>>,
     },
     /// `lhs -> body` where `lhs` is not a call — a map entry (`'k' -> v`) or
@@ -97,17 +98,46 @@ pub enum AssignOp {
     Swap,
 }
 
-/// The left-hand side of an assignment (`=`, `+=`, `<>`). Beyond the bare
-/// variable and destructuring list, this covers the target shapes that occur in
-/// real Scarpet: indexed targets (`x:0`, `m:'k'`, `obj~'f'`), rest binders in a
-/// destructure (`[a, ...rest]`), and call-shaped targets (`l(a, b)`,
-/// `var('x' + i)`, `if(cond, a, b)`).
+/// A `,`-separated pattern list: a function's parameters, the elements of a
+/// destructuring list (`[a, b, c]`), and the arguments of a call-shaped target
+/// (`l(a, b)`). The rest binder `...x` may appear **at most once** at this
+/// level — it lives in [`Patterns::rest`] rather than as a repeatable element,
+/// so a second `...` at the same level is unrepresentable (lowering reports
+/// [`LowerError::MultipleRest`]). Nested lists / calls each carry their own
+/// [`Patterns`], so a rest inside a nested destructure is a different level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Patterns<'s> {
+    /// The pattern elements before the rest binder — or all of them, when there
+    /// is no rest.
+    pub before: Vec<Assignable<'s>>,
+    /// The rest binder `...x` and the elements after it, when a rest is present.
+    pub rest: Option<RestPat<'s>>,
+}
+
+/// The rest binder `...x` of a [`Patterns`], together with any pattern elements
+/// that follow it (the `b` in `[a, ...x, b]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestPat<'s> {
+    /// The pattern bound by `...` (the `x` in `...x`).
+    pub binder: Box<Assignable<'s>>,
+    /// Pattern elements after the rest binder.
+    pub after: Vec<Assignable<'s>>,
+}
+
+/// A single pattern: the left-hand side of an assignment (`=`, `+=`, `<>`) and,
+/// more generally, one element of a [`Patterns`] list. Beyond the bare variable
+/// and destructuring list, this covers the shapes that occur in real Scarpet:
+/// indexed targets (`x:0`, `m:'k'`, `obj~'f'`), call-shaped targets (`l(a, b)`,
+/// `var('x' + i)`, `if(cond, a, b)`), and — only in a pattern position, never as
+/// a direct assignment target — computed elements ([`Assignable::Expr`]). The
+/// rest binder `...x` is not a variant here; it is carried by [`Patterns`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Assignable<'s> {
     /// A plain variable: `x`.
     Var(&'s str),
-    /// A destructuring list: `[a, b, c]`.
-    List(Vec<Assignable<'s>>),
+    /// A destructuring list: `[a, b, c]`. Its elements are a [`Patterns`], so a
+    /// nested rest (`[a, ...rest]`) is constrained at that level.
+    List(Patterns<'s>),
     /// An indexed target: `base:key` (`op == Get`) or `base~key` (`op == Match`).
     /// The key is a [`Primary`] (the grammar only allows a primary there).
     Index {
@@ -115,14 +145,18 @@ pub enum Assignable<'s> {
         op: GetOp,
         key: Primary<'s>,
     },
-    /// A rest binder / spread target: `...rest`.
-    Rest(Box<Assignable<'s>>),
     /// A call-shaped target: a destructuring constructor (`l(a, b)`), a
     /// dynamic-variable access (`var('x' + i)`), or an l-value-returning call
-    /// (`if(cond, a, b)`). The arguments are general expressions — the parser
-    /// cannot tell a binder from a computed name — so the evaluator interprets
-    /// them per the called function.
-    Call { name: &'s str, args: Args<'s> },
+    /// (`if(cond, a, b)`). The arguments are a [`Patterns`]; a computed argument
+    /// (a literal or an expression) lowers to [`Assignable::Expr`], which the
+    /// evaluator interprets per the called function.
+    Call { name: &'s str, args: Patterns<'s> },
+    /// A computed pattern element: a literal used for value dispatch (`'add'` in
+    /// `f('add', x)`) or an expression that names / selects a target (`'g' + s`
+    /// in `var('g' + s)`, `cond` in `if(cond, a, b)`). Valid only in a pattern
+    /// position — never as the direct left side of `=`/`+=`/`<>`, so `1 = 2`
+    /// stays a [`LowerError`].
+    Expr(Box<Assign<'s>>),
 }
 
 /// Logical or (`||`). Left-associative.
@@ -308,6 +342,9 @@ pub enum LowerError {
     /// accepts a tighter level (e.g. a bare `,`/`;` chain where a primary was
     /// due). Indicates a malformed or hand-built CST. The text names the kind.
     Unexpected(&'static str),
+    /// More than one rest binder (`...x`) appeared at the same level of a
+    /// pattern list — only one is allowed per [`Patterns`].
+    MultipleRest,
 }
 
 impl std::fmt::Display for LowerError {
@@ -318,6 +355,9 @@ impl std::fmt::Display for LowerError {
             }
             LowerError::Unexpected(what) => {
                 write!(f, "unexpected {what} where an expression was required")
+            }
+            LowerError::MultipleRest => {
+                write!(f, "multiple rest binders (`...`) at the same level")
             }
         }
     }
@@ -426,7 +466,7 @@ impl<'a, 's> TryFrom<&'a Cst<'s>> for Expr<'s> {
             if let CstKind::Call { callee, args } = &lhs.kind {
                 Ok(Expr::Def {
                     name: ident_of(callee)?,
-                    params: Args::try_from(args.as_slice())?,
+                    params: lower_patterns(args)?,
                     body,
                 })
             } else {
@@ -463,56 +503,75 @@ impl<'a, 's> TryFrom<&'a Cst<'s>> for Assign<'s> {
             unreachable!("matched a Binary assign op above")
         };
         Ok(Assign::Set {
-            target: Assignable::try_from(lhs.as_ref())?,
+            target: lower_assignable(lhs.as_ref(), false)?,
             op,
             value: Box::new(Assign::try_from(rhs.as_ref())?),
         })
     }
 }
 
-/// A node coerced into an [`Assignable`], or [`LowerError::NotAssignable`].
-impl<'a, 's> TryFrom<&'a Cst<'s>> for Assignable<'s> {
-    type Error = LowerError;
-    fn try_from(cst: &'a Cst<'s>) -> Result<Self, LowerError> {
-        match &cst.kind {
-            CstKind::Ident(s) => Ok(Assignable::Var(s)),
-            CstKind::List(items) => Ok(Assignable::List(assignable_items(items)?)),
-            CstKind::Call { callee, args } => Ok(Assignable::Call {
-                name: ident_of(callee)?,
-                args: Args::try_from(args.as_slice())?,
-            }),
-            CstKind::Binary {
-                op: op @ (BinOp::Get | BinOp::Match),
-                lhs,
-                rhs,
-            } => Ok(Assignable::Index {
-                base: Box::new(Assignable::try_from(lhs.as_ref())?),
-                op: get_op(*op),
-                key: Primary::try_from(rhs.as_ref())?,
-            }),
-            CstKind::Unary {
-                op: UnaryOp::Unpack,
-                operand,
-            } => Ok(Assignable::Rest(Box::new(Assignable::try_from(
-                operand.as_ref(),
-            )?))),
-            other => Err(LowerError::NotAssignable(describe(other))),
-        }
+/// Lower a CST node to a single [`Assignable`] pattern. `allow_expr` selects the
+/// fallback: in a pattern position (function params, call-target args) a literal
+/// or computed expression becomes an [`Assignable::Expr`]; as a direct
+/// assignment target it is instead a [`LowerError::NotAssignable`], so `1 = 2`
+/// and `a + b = c` stay errors. Not a `TryFrom` impl, since the mode flag does
+/// not fit that trait's shape.
+fn lower_assignable<'s>(cst: &Cst<'s>, allow_expr: bool) -> Result<Assignable<'s>, LowerError> {
+    match &cst.kind {
+        CstKind::Ident(s) => Ok(Assignable::Var(s)),
+        CstKind::List(items) => Ok(Assignable::List(lower_patterns(items)?)),
+        CstKind::Call { callee, args } => Ok(Assignable::Call {
+            name: ident_of(callee)?,
+            args: lower_patterns(args)?,
+        }),
+        CstKind::Binary {
+            op: op @ (BinOp::Get | BinOp::Match),
+            lhs,
+            rhs,
+        } => Ok(Assignable::Index {
+            base: Box::new(lower_assignable(lhs, allow_expr)?),
+            op: get_op(*op),
+            key: Primary::try_from(rhs.as_ref())?,
+        }),
+        _ if allow_expr => Ok(Assignable::Expr(Box::new(Assign::try_from(cst)?))),
+        other => Err(LowerError::NotAssignable(describe(other))),
     }
 }
 
-/// Lower the elements of a `[...]` destructuring target to [`Assignable`]s,
-/// dropping phantom `Empty` slots. A free helper, not a `TryFrom` impl: the
-/// orphan rule forbids implementing the foreign `TryFrom` for `Vec`.
-fn assignable_items<'s>(items: &[Cst<'s>]) -> Result<Vec<Assignable<'s>>, LowerError> {
-    let mut out = Vec::with_capacity(items.len());
+/// Lower the `,`-separated elements of a pattern position — a `[...]`
+/// destructure, a call target's args, or a function's params — into a
+/// [`Patterns`], dropping phantom `Empty` slots. A `...x` element becomes the
+/// rest binder; a second one at this level is a [`LowerError::MultipleRest`].
+/// Elements after the rest go into [`RestPat::after`]. Each element is lowered
+/// with `allow_expr = true`, so literal / computed patterns are admitted.
+fn lower_patterns<'s>(items: &[Cst<'s>]) -> Result<Patterns<'s>, LowerError> {
+    let mut before = Vec::new();
+    let mut rest: Option<RestPat<'s>> = None;
     for item in items {
         if matches!(item.kind, CstKind::Empty) {
             continue;
         }
-        out.push(Assignable::try_from(item)?);
+        if let CstKind::Unary {
+            op: UnaryOp::Unpack,
+            operand,
+        } = &item.kind
+        {
+            if rest.is_some() {
+                return Err(LowerError::MultipleRest);
+            }
+            rest = Some(RestPat {
+                binder: Box::new(lower_assignable(operand, true)?),
+                after: Vec::new(),
+            });
+        } else {
+            let pat = lower_assignable(item, true)?;
+            match &mut rest {
+                None => before.push(pat),
+                Some(r) => r.after.push(pat),
+            }
+        }
     }
-    Ok(out)
+    Ok(Patterns { before, rest })
 }
 
 /// `lor` (`||`; left-associative).
@@ -838,6 +897,19 @@ mod tests {
         p
     }
 
+    /// Descend a bare [`Assign`] (no assignment op) to its [`Primary`] — the
+    /// `Assign` counterpart of `prim_of_expr`, for inspecting the expression
+    /// wrapped in an [`Assignable::Expr`].
+    fn assign_prim<'a, 's>(a: &'a Assign<'s>) -> &'a Primary<'s> {
+        let Assign::Lor(Lor::Land(Land::Equality(Equality::Compare(Compare::Additive(
+            Additive::Mult(Mult::Power(Power::Unary(Unary::Get(Get::Primary(p))))),
+        ))))) = a
+        else {
+            panic!("not a bare primary assign: {a:?}");
+        };
+        p
+    }
+
     // --- Code root (statement-sequence) --------------------------------------
 
     #[test]
@@ -1012,11 +1084,12 @@ mod tests {
             panic!("expected a Def");
         };
         assert_eq!(*name, "foo");
-        // params are general expressions; here two bare identifiers.
-        let Args(codes) = params;
-        assert_eq!(codes.len(), 2);
-        assert_eq!(prim_of_expr(&codes[0].0[0]), &Primary::Ident("a"));
-        assert_eq!(prim_of_expr(&codes[1].0[0]), &Primary::Ident("b"));
+        // params are a Patterns: two plain binders, no rest.
+        assert_eq!(
+            params.before,
+            vec![Assignable::Var("a"), Assignable::Var("b")]
+        );
+        assert!(params.rest.is_none());
         // body is `a + b`
         as_additive(body);
     }
@@ -1028,47 +1101,53 @@ mod tests {
             panic!("expected a Def");
         };
         assert_eq!(*name, "_");
-        assert_eq!(params.0.len(), 1);
+        assert_eq!(params.before, vec![Assignable::Var("x")]);
+        assert!(params.rest.is_none());
     }
 
     #[test]
-    fn rest_parameter_is_an_unpack_expression() {
-        // `...rest` is a parameter expression, lowered as a unary unpack.
+    fn rest_parameter_lands_in_the_rest_slot() {
+        // `...rest` is the pattern list's rest binder, not a repeatable element.
         let a = ast("f(a, ...rest) -> rest");
         let Expr::Def { params, .. } = only_expr(&a) else {
             panic!("expected a Def");
         };
-        assert_eq!(params.0.len(), 2);
-        assert!(matches!(
-            as_unary(&params.0[1].0[0]),
-            Unary::Unpack(inner) if matches!(inner.as_ref(), Unary::Get(Get::Primary(Primary::Ident("rest")))),
-        ));
+        assert_eq!(params.before, vec![Assignable::Var("a")]);
+        let rest = params.rest.as_ref().expect("expected a rest binder");
+        assert_eq!(*rest.binder, Assignable::Var("rest"));
+        assert!(rest.after.is_empty());
     }
 
     #[test]
     fn literal_pattern_parameter_lowers() {
         // Scarpet dispatches on literal parameters: `f('add', x) -> …`. The
-        // string parameter is a plain expression, not an assignable.
+        // string parameter is a computed pattern (`Assignable::Expr`).
         let a = ast("f('add', x) -> x");
         let Expr::Def { params, .. } = only_expr(&a) else {
             panic!("expected a Def");
         };
-        assert_eq!(params.0.len(), 2);
-        assert_eq!(prim_of_expr(&params.0[0].0[0]), &Primary::Str("'add'"));
+        assert_eq!(params.before.len(), 2);
+        let Assignable::Expr(e) = &params.before[0] else {
+            panic!("expected a computed pattern");
+        };
+        assert_eq!(assign_prim(e), &Primary::Str("'add'"));
+        assert_eq!(params.before[1], Assignable::Var("x"));
+        assert!(params.rest.is_none());
     }
 
     #[test]
-    fn outer_capture_parameter_lowers_to_a_call_expression() {
+    fn outer_capture_parameter_lowers_to_a_call_pattern() {
         let a = ast("_(outer(x)) -> x");
         let Expr::Def { params, .. } = only_expr(&a) else {
             panic!("expected a Def");
         };
-        assert_eq!(params.0.len(), 1);
-        let Primary::Call { name, args } = prim_of_expr(&params.0[0].0[0]) else {
-            panic!("expected outer(...) call");
+        assert_eq!(params.before.len(), 1);
+        let Assignable::Call { name, args } = &params.before[0] else {
+            panic!("expected outer(...) as a call pattern");
         };
         assert_eq!(*name, "outer");
-        assert_eq!(args.0.len(), 1);
+        assert_eq!(args.before, vec![Assignable::Var("x")]);
+        assert!(args.rest.is_none());
     }
 
     #[test]
@@ -1145,14 +1224,17 @@ mod tests {
         };
         assert_eq!(
             target,
-            &Assignable::List(vec![Assignable::Var("a"), Assignable::Var("b")])
+            &Assignable::List(Patterns {
+                before: vec![Assignable::Var("a"), Assignable::Var("b")],
+                rest: None,
+            })
         );
     }
 
     #[test]
     fn destructuring_call_assignment_target() {
         // `l(x, y, z) = pos()` — the `l(...)` list-constructor destructure.
-        // Call-target args are general expressions (here three identifiers).
+        // Call-target args are patterns (here three plain binders).
         let a = ast("l(x, y, z) = p");
         let Expr::Assign(Assign::Set { target, .. }) = only_expr(&a) else {
             panic!("expected a Set");
@@ -1161,14 +1243,21 @@ mod tests {
             panic!("expected a call target");
         };
         assert_eq!(*name, "l");
-        assert_eq!(args.0.len(), 3);
-        assert_eq!(prim_of_expr(&args.0[1].0[0]), &Primary::Ident("y"));
+        assert_eq!(
+            args.before,
+            vec![
+                Assignable::Var("x"),
+                Assignable::Var("y"),
+                Assignable::Var("z")
+            ]
+        );
+        assert!(args.rest.is_none());
     }
 
     #[test]
     fn lvalue_returning_call_assignment_targets() {
         // `var(<expr>) = …` assigns to a dynamically-named variable; the
-        // computed name is an arbitrary expression, not an assignable.
+        // computed name is an expression, lowered to `Assignable::Expr`.
         let a = ast("var('global_' + s) = 1");
         let Expr::Assign(Assign::Set { target, .. }) = only_expr(&a) else {
             panic!("expected a Set");
@@ -1177,7 +1266,9 @@ mod tests {
             panic!("expected a call target");
         };
         assert_eq!(*name, "var");
-        assert_eq!(args.0.len(), 1);
+        assert_eq!(args.before.len(), 1);
+        assert!(matches!(args.before[0], Assignable::Expr(_)));
+        assert!(args.rest.is_none());
 
         // `if(cond, a, b) = …` assigns through an l-value-selecting call.
         let a = ast("if(c, a, b) = 1");
@@ -1188,7 +1279,53 @@ mod tests {
             panic!("expected a call target");
         };
         assert_eq!(*name, "if");
-        assert_eq!(args.0.len(), 3);
+        assert_eq!(
+            args.before,
+            vec![
+                Assignable::Var("c"),
+                Assignable::Var("a"),
+                Assignable::Var("b")
+            ]
+        );
+    }
+
+    #[test]
+    fn rest_binder_keeps_trailing_patterns() {
+        // `[a, ...r, b] = t` — a non-trailing rest carries the elements after it.
+        let a = ast("[a, ...r, b] = t");
+        let Expr::Assign(Assign::Set { target, .. }) = only_expr(&a) else {
+            panic!("expected a Set");
+        };
+        let Assignable::List(pats) = target else {
+            panic!("expected a list target");
+        };
+        assert_eq!(pats.before, vec![Assignable::Var("a")]);
+        let rest = pats.rest.as_ref().expect("expected a rest binder");
+        assert_eq!(*rest.binder, Assignable::Var("r"));
+        assert_eq!(rest.after, vec![Assignable::Var("b")]);
+    }
+
+    #[test]
+    fn rest_binder_in_a_call_target() {
+        // `l(a, ...rest) = t` — a rest binder inside a call-shaped target.
+        let a = ast("l(a, ...rest) = t");
+        let Expr::Assign(Assign::Set { target, .. }) = only_expr(&a) else {
+            panic!("expected a Set");
+        };
+        let Assignable::Call { name, args } = target else {
+            panic!("expected a call target");
+        };
+        assert_eq!(*name, "l");
+        assert_eq!(args.before, vec![Assignable::Var("a")]);
+        let rest = args.rest.as_ref().expect("expected a rest binder");
+        assert_eq!(*rest.binder, Assignable::Var("rest"));
+        assert!(rest.after.is_empty());
+    }
+
+    #[test]
+    fn multiple_rest_binders_are_an_error() {
+        // Two `...` at the same level cannot be represented.
+        assert_eq!(lower_err("f(...a, ...b) -> 0"), LowerError::MultipleRest);
     }
 
     // --- primaries: call / list / map ----------------------------------------
