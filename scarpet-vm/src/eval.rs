@@ -6,8 +6,8 @@
 use std::{cmp::Ordering, rc::Rc};
 
 use scarpet_syntax::ast::{
-    Additive, Args, Assign, AssignOp, Assignable, Code, Compare, Equality, Expr, Get, Land, Lor,
-    Mult, Patterns, Power, Primary, RestPat, Unary,
+    Additive, Args, Assign, AssignOp, Assignable, Code, Compare, Equality, Expr, Get, GetOp, Land,
+    Lor, Mult, Patterns, Power, Primary, RestPat, Unary,
 };
 
 use crate::{
@@ -188,7 +188,6 @@ impl<'src, 'state> Evalute<Unary<'src>> for ScarpetVm<'state, 'src> {
 
 impl<'src, 'state> Evalute<Get<'src>> for ScarpetVm<'state, 'src> {
     fn push(&mut self, st: Get<'src>) -> Result<ValueContainer, VmError> {
-        use scarpet_syntax::ast::GetOp;
         match st {
             Get::Index { base, op, key } => {
                 let base = self.push(*base)?;
@@ -293,6 +292,13 @@ impl<'state, 'src> ScarpetVm<'state, 'src> {
             // `[a, b] = …` and `l(a, b) = …` are the same list-constructor l-value.
             Assignable::List(patterns) => self.destructure(patterns, op, value),
             Assignable::Call { name: "l", args } => self.destructure(args, op, value),
+            // `base:key = …` writes into a container element in place, rather than
+            // rebinding a variable slot.
+            Assignable::Index {
+                base,
+                op: get_op,
+                key,
+            } => self.assign_index(*base, get_op, key, op, value),
             // Everything else resolves to a single mutable place, which `op` writes
             // through; the slot itself is the assignment's value (so `b = a = 1`
             // reads `a`'s slot for `b`).
@@ -320,12 +326,12 @@ impl<'state, 'src> ScarpetVm<'state, 'src> {
                 let name = self.eval_var_name(args)?;
                 Ok(self.get_var(&name))
             }
-            // TODO(assign:index) container element assignment (`x:0 = 5`,
-            // `m:'k' = v`) still needs an in-place write path: resolve `base` to
-            // its place, then mutate the `Value` inside via a new
-            // `Value::scarpet_put` (the read path `scarpet_get` only clones). The
-            // `ListValue` trait is read-only today, so it needs a `set` primitive.
-            Assignable::Index { .. } => todo!("indexed container assignment"),
+            // A single-level `base:key = …` is handled by `assign_index`, which
+            // resolves a `Var` / `var(...)` base through here. A *nested* base
+            // (`x:0:1 = …`) would have to resolve to the inner container by
+            // reference, but the read path clones, so it is not wired up yet.
+            // TODO(assign:index-nested) reach the inner container by reference.
+            Assignable::Index { .. } => todo!("nested container assignment"),
             // Any other call would be an l-value-returning function (`if(c, a, b)`),
             // not modelled yet; `l(…)` is handled as a destructure before here.
             Assignable::Call { .. } => todo!("call-shaped assignment target"),
@@ -333,6 +339,42 @@ impl<'state, 'src> ScarpetVm<'state, 'src> {
             // `Expr` element — the `1` in `[a, 1] = …` — is not a valid l-value.
             Assignable::List(_) | Assignable::Expr(_) => Err(VmError::NotAssignable),
         }
+    }
+
+    /// Carry out `base:key <op> value` — assignment into a container element (the
+    /// original `LContainerValue` → `container.put`). `base` resolves to its place
+    /// and the element inside is replaced through [`Value::scarpet_put`], so the
+    /// write is visible through the variable. A compound `+=` reads the current
+    /// element first. Only `:` (`GetOp::Get`) addresses a writable element; `~` is
+    /// a match operator, not a target. Yields the stored value, as the original does.
+    fn assign_index(
+        &mut self,
+        base: Assignable<'src>,
+        get_op: GetOp,
+        key: Primary<'src>,
+        op: AssignOp,
+        value: ValueContainer,
+    ) -> Result<ValueContainer, VmError> {
+        if get_op != GetOp::Get {
+            todo!("`~` is not an assignment target");
+        }
+        let container = self.resolve_place(base)?;
+        let key = self.push(key)?.lock()?.clone();
+        let mut target = container.lock()?;
+        let stored = match op {
+            AssignOp::Assign => value.lock()?.clone(),
+            // `x:k += v` is `x:k = x:k + v`: read the current element, then add.
+            AssignOp::Add => {
+                let mut current = target.scarpet_get(&key)?;
+                current += value.lock()?.clone();
+                current
+            }
+            // Swapping an element with another l-value needs two places at once;
+            // not modelled yet.
+            AssignOp::Swap => todo!("`<>` on a container element"),
+        };
+        target.scarpet_put(&key, stored.clone())?;
+        Ok(ValueContainer::new(stored))
     }
 
     /// Spread `value` across a destructuring list pattern (`[a, b] = …`,
@@ -920,5 +962,82 @@ mod tests {
     #[test]
     fn var_name_can_be_computed() {
         assert_eq!(eval("i = 1; var('x' + i) = 5; x1"), Value::Int(5));
+    }
+
+    /// `x:0 = 9` replaces a list element in place, visible through the variable.
+    #[test]
+    fn element_assign_replaces_a_list_element() {
+        assert_eq!(
+            eval("x = [1, 2, 3]; x:0 = 9; x"),
+            Value::list(vec![Value::Int(9), Value::Int(2), Value::Int(3)])
+        );
+    }
+
+    /// An element assignment yields the stored value (not `true`, unlike a
+    /// destructure).
+    #[test]
+    fn element_assign_yields_the_stored_value() {
+        assert_eq!(eval("x = [1, 2, 3]; x:0 = 9"), Value::Int(9));
+    }
+
+    /// The index wraps modulo the length, like `:` reading does.
+    #[test]
+    fn element_assign_wraps_the_index() {
+        // `3 mod 3 == 0` writes the first element.
+        assert_eq!(
+            eval("x = [1, 2, 3]; x:3 = 9; x"),
+            Value::list(vec![Value::Int(9), Value::Int(2), Value::Int(3)])
+        );
+        // A parenthesised negative index reaches from the end.
+        assert_eq!(
+            eval("x = [1, 2, 3]; x:(-1) = 9; x"),
+            Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(9)])
+        );
+    }
+
+    /// On a map, an existing key is updated and a new key is inserted.
+    #[test]
+    fn element_assign_updates_and_inserts_map_keys() {
+        assert_eq!(eval("m = {'a' -> 1}; m:'a' = 9; m:'a'"), Value::Int(9));
+        assert_eq!(eval("m = {'a' -> 1}; m:'b' = 2; m:'b'"), Value::Int(2));
+    }
+
+    /// A compound `+=` reads the current element, then writes the sum back.
+    #[test]
+    fn element_compound_add_updates_in_place() {
+        assert_eq!(eval("x = [1, 2, 3]; x:0 += 10; x:0"), Value::Int(11));
+    }
+
+    /// The base may itself be a dynamic `var(...)` target.
+    #[test]
+    fn element_assign_through_a_dynamic_var_base() {
+        assert_eq!(
+            eval("m = {'a' -> 1}; var('m'):'a' = 9; m:'a'"),
+            Value::Int(9)
+        );
+    }
+
+    /// Writing into a non-container (a number) is an error.
+    #[test]
+    fn element_assign_into_non_container_is_an_error() {
+        assert!(matches!(eval_err("x = 5; x:0 = 1"), VmError::NotAContainer));
+    }
+
+    /// Writing into a lazy, immutable list (a `range`) is an error.
+    #[test]
+    fn element_assign_into_immutable_list_is_an_error() {
+        assert!(matches!(
+            eval_err("r = range(3); r:0 = 9"),
+            VmError::ImmutableList
+        ));
+    }
+
+    /// An empty list has no slot to write — the index cannot wrap.
+    #[test]
+    fn element_assign_into_empty_list_is_an_error() {
+        assert!(matches!(
+            eval_err("x = []; x:0 = 1"),
+            VmError::IndexOutOfRange
+        ));
     }
 }

@@ -43,6 +43,13 @@ pub trait ListValue: Debug + Send + Sync {
     /// so a [`RangeList`] can answer in O(1) without realising its neighbours.
     fn get(&self, index: usize) -> Option<Value>;
 
+    /// Replace the element at an already in-range `index`, returning whether the
+    /// write landed. A realised [`ArrayList`] updates in place and returns `true`;
+    /// a lazy backing such as a [`RangeList`] is immutable and returns `false`
+    /// (the caller turns that into an error). Callers normalise the index against
+    /// [`len`](ListValue::len) first, exactly as for [`get`](ListValue::get).
+    fn set(&mut self, index: usize, value: Value) -> bool;
+
     /// Remove and return the first element, or `None` when empty. The lazy,
     /// consuming primitive in place of an `iter()`: walking a list means draining
     /// it from one end, exactly as the original `LazyListValue` is pulled through
@@ -74,6 +81,15 @@ impl ListValue for ArrayList {
     }
     fn get(&self, index: usize) -> Option<Value> {
         self.0.get(index).cloned()
+    }
+    fn set(&mut self, index: usize, value: Value) -> bool {
+        match self.0.get_mut(index) {
+            Some(slot) => {
+                *slot = value;
+                true
+            }
+            None => false,
+        }
     }
     fn pop_first(&mut self) -> Option<Value> {
         (!self.0.is_empty()).then(|| self.0.remove(0))
@@ -152,6 +168,10 @@ impl ListValue for RangeList {
             }
             _ => None,
         }
+    }
+    fn set(&mut self, _index: usize, _value: Value) -> bool {
+        // A lazy arithmetic progression has no stored elements to overwrite.
+        false
     }
     fn pop_first(&mut self) -> Option<Value> {
         match self {

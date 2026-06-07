@@ -407,6 +407,56 @@ impl Value {
         }
     }
 
+    /// Scarpet `:` element assignment — the write counterpart of [`scarpet_get`],
+    /// matching the original `LContainerValue` → `container.put`. On a `List` the
+    /// key is a numeric index, normalised modulo the length exactly as
+    /// [`scarpet_get`] reads it, and the element is replaced in place; a lazy
+    /// `range` is immutable ([`ImmutableList`]) and an empty list has no slot to
+    /// write ([`IndexOutOfRange`]). On a `Map` the key is inserted, or its value
+    /// updated when the key is already present. A non-container value (string /
+    /// number / null) cannot be assigned into ([`NotAContainer`]).
+    ///
+    /// [`scarpet_get`]: Value::scarpet_get
+    /// [`ImmutableList`]: VmError::ImmutableList
+    /// [`IndexOutOfRange`]: VmError::IndexOutOfRange
+    /// [`NotAContainer`]: VmError::NotAContainer
+    pub fn scarpet_put(&mut self, key: &Value, value: Value) -> Result<(), VmError> {
+        match self {
+            Value::List(items) => {
+                if items.is_empty() {
+                    return Err(VmError::IndexOutOfRange);
+                }
+                let idx = match key.as_number()? {
+                    Value::Int(i) => i,
+                    // `getLong` truncates a double toward zero, like a `(long)` cast.
+                    Value::Double(d) => d as i64,
+                    // `as_number` only ever yields an `Int` or a `Double`.
+                    _ => return Err(VmError::ExpectedNumber),
+                };
+                // The list is non-empty, so the normalised index is always in
+                // range; only a lazy backing can refuse the write.
+                let normalized = idx.rem_euclid(items.len() as i64) as usize;
+                if items.set(normalized, value) {
+                    Ok(())
+                } else {
+                    Err(VmError::ImmutableList)
+                }
+            }
+            Value::Map(entries) => {
+                for (k, v) in entries.iter_mut() {
+                    if k.scarpet_eq(key) {
+                        *v = value;
+                        return Ok(());
+                    }
+                }
+                entries.push((key.clone(), value));
+                Ok(())
+            }
+            // Non-containers (string / number / null / bool) cannot be written to.
+            _ => Err(VmError::NotAContainer),
+        }
+    }
+
     /// Scarpet `~` match (`left.in(right)`). On a `List` it is the index of the
     /// first element equal to `right` (else null); on a `Map` it is the key
     /// itself when present (else null); `null` / `undef` is always null. On a

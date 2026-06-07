@@ -46,4 +46,13 @@ pub enum VmError {
     /// element in a destructuring pattern (`[a, 1] = …`), where the original
     /// `assertAssignable` throws.
     NotAssignable,
+    /// An element assignment (`x:k = …`) whose base is not a container — a
+    /// string / number / null has nothing to write into.
+    NotAContainer,
+    /// An element assignment into a lazy, immutable list (`range(3):0 = …`),
+    /// which has no stored elements to overwrite.
+    ImmutableList,
+    /// An element assignment into an empty list (`[]:0 = …`), which has no slot
+    /// to write — `:` reading wraps modulo the length, but an empty list cannot.
+    IndexOutOfRange,
 }
