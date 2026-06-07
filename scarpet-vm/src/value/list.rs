@@ -46,24 +46,10 @@ pub trait ListValue: Debug + Send + Sync {
     /// A mutable borrow of the element at an already in-range `index`, or `None`
     /// when there is no stored slot to lend — a lazy [`RangeList`] computes its
     /// elements on demand, so it always returns `None`. The basis for in-place
-    /// element writes ([`set`](ListValue::set)) and for walking by reference into
-    /// a nested container assignment target. Callers normalise the index against
+    /// element writes and for walking by reference into a nested container
+    /// assignment target. Callers normalise the index against
     /// [`len`](ListValue::len) first, exactly as for [`get`](ListValue::get).
     fn get_mut(&mut self, index: usize) -> Option<&mut Value>;
-
-    /// Replace the element at an already in-range `index`, returning whether the
-    /// write landed. A realised [`ArrayList`] updates in place and returns `true`;
-    /// a lazy backing such as a [`RangeList`] has no slot and returns `false` (the
-    /// caller turns that into an error). Routed through [`get_mut`](ListValue::get_mut).
-    fn set(&mut self, index: usize, value: Value) -> bool {
-        match self.get_mut(index) {
-            Some(slot) => {
-                *slot = value;
-                true
-            }
-            None => false,
-        }
-    }
 
     /// Remove and return the first element, or `None` when empty. The lazy,
     /// consuming primitive in place of an `iter()`: walking a list means draining

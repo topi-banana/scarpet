@@ -380,18 +380,11 @@ impl Value {
                 if items.is_empty() {
                     return Ok(Value::Null);
                 }
-                let idx = match key.as_number()? {
-                    Value::Int(i) => i,
-                    // `getLong` truncates a double toward zero, like a `(long)` cast.
-                    Value::Double(d) => d as i64,
-                    // `as_number` only ever yields an `Int` or a `Double`.
-                    _ => return Ok(Value::Null),
-                };
                 // Wrap out-of-range / negative indices modulo the length. The
                 // normalised index is in range (the list is non-empty), so a
                 // lazy backing computes the element directly without realising
                 // its neighbours.
-                let normalized = idx.rem_euclid(items.len() as i64) as usize;
+                let normalized = Self::normalize_list_index(key, items.len())?;
                 Ok(items.get(normalized).unwrap_or(Value::Null))
             }
             Value::Map(entries) => {
@@ -405,6 +398,27 @@ impl Value {
             // Non-containers (string / number / null / bool) yield null.
             _ => Ok(Value::Null),
         }
+    }
+
+    /// Coerce `key` to a `List` index normalised modulo `len`, wrapping negative
+    /// and out-of-range indices like the original `ListValue.normalizeIndex` (`-1`
+    /// is the last element, indices cycle rather than fail). `len` must be
+    /// non-zero — every caller handles the empty list first, where there is no
+    /// slot to address. Shared by the `:` read ([`scarpet_get`]) and write
+    /// ([`element_mut`], and through it [`scarpet_put`]) paths.
+    ///
+    /// [`scarpet_get`]: Value::scarpet_get
+    /// [`element_mut`]: Value::element_mut
+    /// [`scarpet_put`]: Value::scarpet_put
+    fn normalize_list_index(key: &Value, len: usize) -> Result<usize, VmError> {
+        let idx = match key.as_number()? {
+            Value::Int(i) => i,
+            // `getLong` truncates a double toward zero, like a `(long)` cast.
+            Value::Double(d) => d as i64,
+            // `as_number` only ever yields an `Int` or a `Double`.
+            _ => return Err(VmError::ExpectedNumber),
+        };
+        Ok(idx.rem_euclid(len as i64) as usize)
     }
 
     /// Scarpet `:` element assignment — the write counterpart of [`scarpet_get`],
@@ -422,25 +436,11 @@ impl Value {
     /// [`NotAContainer`]: VmError::NotAContainer
     pub fn scarpet_put(&mut self, key: &Value, value: Value) -> Result<(), VmError> {
         match self {
-            Value::List(items) => {
-                if items.is_empty() {
-                    return Err(VmError::IndexOutOfRange);
-                }
-                let idx = match key.as_number()? {
-                    Value::Int(i) => i,
-                    // `getLong` truncates a double toward zero, like a `(long)` cast.
-                    Value::Double(d) => d as i64,
-                    // `as_number` only ever yields an `Int` or a `Double`.
-                    _ => return Err(VmError::ExpectedNumber),
-                };
-                // The list is non-empty, so the normalised index is always in
-                // range; only a lazy backing can refuse the write.
-                let normalized = idx.rem_euclid(items.len() as i64) as usize;
-                if items.set(normalized, value) {
-                    Ok(())
-                } else {
-                    Err(VmError::ImmutableList)
-                }
+            // A list slot is exactly the writable place `element_mut` lends, so
+            // reuse it rather than repeat the empty-check and index handling.
+            Value::List(_) => {
+                *self.element_mut(key)? = value;
+                Ok(())
             }
             Value::Map(entries) => {
                 for (k, v) in entries.iter_mut() {
@@ -475,14 +475,9 @@ impl Value {
                 if items.is_empty() {
                     return Err(VmError::IndexOutOfRange);
                 }
-                let idx = match key.as_number()? {
-                    Value::Int(i) => i,
-                    Value::Double(d) => d as i64,
-                    _ => return Err(VmError::ExpectedNumber),
-                };
-                let normalized = idx.rem_euclid(items.len() as i64) as usize;
                 // A non-empty list always normalises in range; only a lazy backing
                 // refuses to lend a slot.
+                let normalized = Self::normalize_list_index(key, items.len())?;
                 items.get_mut(normalized).ok_or(VmError::ImmutableList)
             }
             Value::Map(entries) => {

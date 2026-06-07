@@ -290,8 +290,11 @@ impl<'state, 'src> ScarpetVm<'state, 'src> {
     ) -> Result<ValueContainer, VmError> {
         match target {
             // `[a, b] = …` and `l(a, b) = …` are the same list-constructor l-value.
-            Assignable::List(patterns) => self.destructure(patterns, op, value),
-            Assignable::Call { name: "l", args } => self.destructure(args, op, value),
+            Assignable::List(patterns)
+            | Assignable::Call {
+                name: "l",
+                args: patterns,
+            } => self.destructure(patterns, op, value),
             // `base:key = …` writes into a container element in place, rather than
             // rebinding a variable slot.
             Assignable::Index {
@@ -506,7 +509,12 @@ impl<'state, 'src> ScarpetVm<'state, 'src> {
         match pat {
             Assignable::Var(name) => Ok(self.get_var(name).lock()?.clone()),
             Assignable::Expr(assign) => Ok(self.push(assign.as_ref().clone())?.lock()?.clone()),
-            Assignable::List(Patterns { before, rest }) => {
+            // `[a, b]` and `l(a, b)` are the same list constructor read as an r-value.
+            Assignable::List(Patterns { before, rest })
+            | Assignable::Call {
+                name: "l",
+                args: Patterns { before, rest },
+            } => {
                 if rest.is_some() {
                     return Err(VmError::NotAssignable);
                 }
@@ -520,19 +528,10 @@ impl<'state, 'src> ScarpetVm<'state, 'src> {
                     GetOp::Match => base.scarpet_match(&key),
                 }
             }
-            // `var(expr)` reads the dynamically named variable; `l(...)` is a list.
+            // `var(expr)` reads the dynamically named variable.
             Assignable::Call { name: "var", args } => {
                 let name = self.eval_var_name(args.clone())?;
                 Ok(self.get_var(&name).lock()?.clone())
-            }
-            Assignable::Call {
-                name: "l",
-                args: Patterns { before, rest },
-            } => {
-                if rest.is_some() {
-                    return Err(VmError::NotAssignable);
-                }
-                self.eval_before_as_list(before)
             }
             // An l-value-returning call has no plain r-value reading here.
             Assignable::Call { .. } => Err(VmError::NotAssignable),
