@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Sub, SubAssign},
+    ops::{Add, AddAssign, Deref, DerefMut, Div, DivAssign, Mul, MulAssign, Sub, SubAssign},
     sync::{Arc, Mutex},
 };
 
@@ -460,12 +460,55 @@ impl Value {
     }
 }
 
+/// A shared, thread-safe slot holding a [`Value`] (the original keeps every value
+/// behind an `Arc<Mutex<…>>` so a `task` thread can be handed one). The variant
+/// records whether the value carries an `...` unpack marker: a [`Single`] is an
+/// ordinary value, while an [`Expand`] is one produced by the unary `...`
+/// operator, to be spread into its elements when collected into an argument list
+/// or a list / map literal.
+///
+/// [`Single`]: ValueContainer::Single
+/// [`Expand`]: ValueContainer::Expand
 #[derive(Clone, Debug)]
-pub struct ValueContainer(Arc<Mutex<Value>>);
+pub enum ValueContainer {
+    Single(Arc<Mutex<Value>>),
+    Expand(Arc<Mutex<Value>>),
+}
+
+/// The lock guard returned by [`ValueContainer::lock`], carrying the same
+/// `Single` / `Expand` tag as the container it came from. It derefs to the
+/// guarded [`Value`] (like the [`MutexGuard`](std::sync::MutexGuard) it wraps),
+/// so the unpack tag stays available without getting in the way of reading or
+/// mutating the value through it.
+#[derive(Debug)]
+pub enum ValueContainerGuard<'lock> {
+    Single(std::sync::MutexGuard<'lock, Value>),
+    Expand(std::sync::MutexGuard<'lock, Value>),
+}
+
+impl Deref for ValueContainerGuard<'_> {
+    type Target = Value;
+    fn deref(&self) -> &Value {
+        match self {
+            ValueContainerGuard::Single(guard) | ValueContainerGuard::Expand(guard) => guard,
+        }
+    }
+}
+
+impl DerefMut for ValueContainerGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Value {
+        match self {
+            ValueContainerGuard::Single(guard) | ValueContainerGuard::Expand(guard) => guard,
+        }
+    }
+}
 
 impl ValueContainer {
     pub fn new(value: Value) -> Self {
-        Self(Arc::new(Mutex::new(value)))
+        Self::Single(Arc::new(Mutex::new(value)))
+    }
+    pub fn expand(value: Value) -> Self {
+        Self::Expand(Arc::new(Mutex::new(value)))
     }
     pub fn undef() -> Self {
         Self::new(Value::Undef)
@@ -485,8 +528,15 @@ impl ValueContainer {
     pub fn string(value: String) -> Self {
         Self::new(Value::String(value))
     }
-    pub fn lock(&self) -> Result<std::sync::MutexGuard<'_, Value>, VmError> {
-        self.0.lock().map_err(|_| VmError::PoisonedLock)
+    pub fn lock(&self) -> Result<ValueContainerGuard<'_>, VmError> {
+        Ok(match self {
+            Self::Single(v) => {
+                ValueContainerGuard::Single(v.lock().map_err(|_| VmError::PoisonedLock)?)
+            }
+            Self::Expand(v) => {
+                ValueContainerGuard::Expand(v.lock().map_err(|_| VmError::PoisonedLock)?)
+            }
+        })
     }
     /// `==`: whether the two values are Scarpet-equal ([`Value::scarpet_eq`]).
     /// Clones each side out of its lock first, so `x == x` (the same container

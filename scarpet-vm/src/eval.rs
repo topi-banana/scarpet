@@ -184,7 +184,10 @@ impl<'src, 'state> Evalute<Unary<'src>> for ScarpetVm<'state, 'src> {
             Unary::Neg(v) => self.push(*v)?.scarpet_neg(),
             Unary::Pos(v) => self.push(*v)?.scarpet_pos(),
             Unary::Not(v) => self.push(*v)?.scarpet_not(),
-            Unary::Unpack(v) => todo!(),
+            Unary::Unpack(v) => Ok(ValueContainer::Expand(match self.push(*v)? {
+                ValueContainer::Single(v) => v,
+                ValueContainer::Expand(v) => v,
+            })),
             Unary::Get(ost) => self.push(ost),
         }
     }
