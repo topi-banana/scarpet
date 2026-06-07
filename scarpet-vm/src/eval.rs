@@ -55,9 +55,75 @@ impl<'src, 'state> Evalute<Assign<'src>> for ScarpetVm<'state, 'src> {
         use scarpet_syntax::ast::{AssignOp, Assignable};
         match st {
             Assign::Set { target, op, value } => {
+                // Resolve `target` to a single mutable place — a shared
+                // `ValueContainer` slot — then apply `op` to it in place below.
+                // This "one l-value place" model suffices for a bare variable,
+                // but most `Assignable` shapes do not reduce to one pre-existing
+                // place; each `todo!()` sketches what it needs instead.
+                //
+                // The shape to grow into is a recursive resolver that, given an
+                // `Assignable` and the evaluated right-hand value, either
+                //   (a) resolves to a single place and applies `op` — `Var`,
+                //       `var(expr)`, `base:key` — or
+                //   (b) destructures the value across several sub-targets —
+                //       `[a, b]`, `l(a, b)`.
+                // The uniform `op` step below only fits case (a): a destructure
+                // is `=`-only (the original delegates `+=` to `+` first, then
+                // binds), and `<>` over a destructure is undefined.
                 let var = match target {
                     Assignable::Var(name) => self.get_var(name),
-                    _ => todo!(),
+
+                    // TODO(assign:list) `[a, b] = [1, 2]`, `[a, ...rest] = [1, 2, 3]`.
+                    // A list pattern is multi-value, not a single place. Evaluate
+                    // the value to a `Value::List`, bind each `before` element to
+                    // the matching element, and (when present) collect the
+                    // leftovers into `rest.binder` as a fresh list. Recurse so
+                    // nested patterns (`[[a], b]`) reuse this same resolver per
+                    // element. Arity: with no rest the lengths must match exactly
+                    // — the original raises "Too many values to unpack" when the
+                    // value list is longer and "Too few" when shorter (two new
+                    // `VmError` variants). A non-list value is an error. `=` only.
+                    Assignable::List(_patterns) => todo!("destructuring list assignment"),
+
+                    // TODO(assign:call) two shapes share this arm:
+                    //   * `var(expr) = …` — a dynamic variable: evaluate the one
+                    //     argument, coerce it to a string, and resolve through
+                    //     `get_var(name)`. This *is* a single place, so once the
+                    //     name is known it can flow through the `op` step below.
+                    //   * `l(a, b) = …` — `l(...)` is a list constructor, the same
+                    //     l-value as the `[a, b]` destructure above.
+                    // Dispatch on `name`: "var" → dynamic place, "l" → reuse the
+                    // list-destructure path. Any other call (`if(c, a, b) = …`, an
+                    // l-value-returning function) stays unsupported for now. `args`
+                    // is a `Patterns`; `var` expects exactly one computed argument
+                    // (an `Assignable::Expr`).
+                    Assignable::Call { name: _, args: _ } => todo!("call-shaped assignment target"),
+
+                    // TODO(assign:index) `x:0 = 5`, `m:'k' = v` — container
+                    // mutation (the original `LContainerValue` → `container.put`).
+                    // The read path `scarpet_get` returns a *clone*, so this needs
+                    // a separate write path:
+                    //   1. resolve `base` to its actual place (recurse through
+                    //      `Var` / `var(...)` / nested `Index`) — not a clone, so
+                    //      the mutation stays visible;
+                    //   2. lock that place and mutate the `Value` inside via a new
+                    //      `Value::scarpet_put(&mut self, key, value)`: list index
+                    //      set (normalize the index like `scarpet_get`) or map key
+                    //      insert-or-update.
+                    // The `ListValue` trait is read-only today, so it needs a
+                    // `set(index, value)` primitive (immutable lazy lists such as
+                    // `range` must error). `~` as an l-value is unusual — likely
+                    // unsupported. The original yields the assigned value, not the
+                    // container.
+                    Assignable::Index { .. } => todo!("indexed container assignment"),
+
+                    // `Expr` is a computed / literal pattern element. Lowering
+                    // never emits it as a *direct* target (`lower_assignable(_,
+                    // false)`), so it can only surface nested inside a destructure
+                    // — where it is not a valid l-value.
+                    // TODO(assign:expr) surface a `NotAssignable`-style error once
+                    // destructuring recurses into this resolver.
+                    Assignable::Expr(_) => todo!("computed target is not assignable"),
                 };
                 let val = self.push(*value)?;
                 match op {
