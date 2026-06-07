@@ -326,12 +326,9 @@ impl<'state, 'src> ScarpetVm<'state, 'src> {
                 let name = self.eval_var_name(args)?;
                 Ok(self.get_var(&name))
             }
-            // A single-level `base:key = …` is handled by `assign_index`, which
-            // resolves a `Var` / `var(...)` base through here. A *nested* base
-            // (`x:0:1 = …`) would have to resolve to the inner container by
-            // reference, but the read path clones, so it is not wired up yet.
-            // TODO(assign:index-nested) reach the inner container by reference.
-            Assignable::Index { .. } => todo!("nested container assignment"),
+            // `assign_index` flattens a `base:key` chain down to its root before
+            // resolving, so an `Index` never reaches here as a place on its own.
+            Assignable::Index { .. } => Err(VmError::NotAssignable),
             // Any other call would be an l-value-returning function (`if(c, a, b)`),
             // not modelled yet; `l(…)` is handled as a destructure before here.
             Assignable::Call { .. } => todo!("call-shaped assignment target"),
@@ -341,12 +338,15 @@ impl<'state, 'src> ScarpetVm<'state, 'src> {
         }
     }
 
-    /// Carry out `base:key <op> value` — assignment into a container element (the
-    /// original `LContainerValue` → `container.put`). `base` resolves to its place
-    /// and the element inside is replaced through [`Value::scarpet_put`], so the
-    /// write is visible through the variable. A compound `+=` reads the current
-    /// element first. Only `:` (`GetOp::Get`) addresses a writable element; `~` is
-    /// a match operator, not a target. Yields the stored value, as the original does.
+    /// Carry out `base:key <op> value` — assignment into a (possibly nested)
+    /// container element (the original `LContainerValue` → `container.put`). The
+    /// `root:k0:…:kn` chain is flattened to its root l-value (a `Var` / `var(...)`)
+    /// plus the key path; the root's place is locked once and the path walked *by
+    /// reference* through [`Value::element_mut`], so even a deep write
+    /// (`x:0:1 = …`) lands in the original. The final element is replaced through
+    /// [`Value::scarpet_put`] (a compound `+=` reads it first). Only `:`
+    /// (`GetOp::Get`) addresses a writable element; `~` is a match operator, not a
+    /// target. Yields the stored value, as the original does.
     fn assign_index(
         &mut self,
         base: Assignable<'src>,
@@ -358,22 +358,49 @@ impl<'state, 'src> ScarpetVm<'state, 'src> {
         if get_op != GetOp::Get {
             todo!("`~` is not an assignment target");
         }
-        let container = self.resolve_place(base)?;
-        let key = self.push(key)?.lock()?.clone();
-        let mut target = container.lock()?;
+        // Flatten `root:k0:…:kn` into the root l-value and the key path
+        // `[k0, …, kn]`. Keys are gathered innermost-first, then reversed.
+        let mut keys = vec![self.push(key)?.lock()?.clone()];
+        let mut current = base;
+        let root = loop {
+            match current {
+                Assignable::Index {
+                    base,
+                    op: GetOp::Get,
+                    key,
+                } => {
+                    keys.push(self.push(key)?.lock()?.clone());
+                    current = *base;
+                }
+                Assignable::Index { .. } => todo!("`~` is not an assignment target"),
+                other => break other,
+            }
+        };
+        keys.reverse();
+        let place = self.resolve_place(root)?;
+        let new = value.lock()?.clone();
+        let mut guard = place.lock()?;
+        // Walk to the innermost container by reference, then write the last key.
+        let mut container: &mut Value = &mut guard;
+        let (last, mids) = keys
+            .split_last()
+            .expect("keys holds at least the final key");
+        for k in mids {
+            container = container.element_mut(k)?;
+        }
         let stored = match op {
-            AssignOp::Assign => value.lock()?.clone(),
-            // `x:k += v` is `x:k = x:k + v`: read the current element, then add.
+            AssignOp::Assign => new,
+            // `c:k += v` is `c:k = c:k + v`: read the current element, then add.
             AssignOp::Add => {
-                let mut current = target.scarpet_get(&key)?;
-                current += value.lock()?.clone();
-                current
+                let mut element = container.scarpet_get(last)?;
+                element += new;
+                element
             }
             // Swapping an element with another l-value needs two places at once;
             // not modelled yet.
             AssignOp::Swap => todo!("`<>` on a container element"),
         };
-        target.scarpet_put(&key, stored.clone())?;
+        container.scarpet_put(last, stored.clone())?;
         Ok(ValueContainer::new(stored))
     }
 
@@ -1038,6 +1065,62 @@ mod tests {
         assert!(matches!(
             eval_err("x = []; x:0 = 1"),
             VmError::IndexOutOfRange
+        ));
+    }
+
+    /// A nested `x:0:1 = …` walks into the inner list by reference, so the write
+    /// lands in the original.
+    #[test]
+    fn nested_element_assign_writes_through() {
+        assert_eq!(
+            eval("x = [[1, 2], [3, 4]]; x:0:1 = 9; x"),
+            Value::list(vec![
+                Value::list(vec![Value::Int(1), Value::Int(9)]),
+                Value::list(vec![Value::Int(3), Value::Int(4)]),
+            ])
+        );
+        assert_eq!(
+            eval("x = [[1, 2], [3, 4]]; x:0:1 = 9; x:0:1"),
+            Value::Int(9)
+        );
+    }
+
+    /// The path may mix list indices and map keys (`x:0:'a'`).
+    #[test]
+    fn nested_element_assign_into_map_in_list() {
+        assert_eq!(
+            eval("x = [{'a' -> 1}]; x:0:'a' = 9; x:0:'a'"),
+            Value::Int(9)
+        );
+    }
+
+    /// Nesting walks to any depth (`x:0:0:0`).
+    #[test]
+    fn nested_element_assign_is_arbitrarily_deep() {
+        assert_eq!(eval("x = [[[1]]]; x:0:0:0 = 9; x:0:0:0"), Value::Int(9));
+    }
+
+    /// A compound `+=` works at depth too.
+    #[test]
+    fn nested_element_compound_add() {
+        assert_eq!(eval("x = [[1, 2]]; x:0:0 += 10; x:0:0"), Value::Int(11));
+    }
+
+    /// A missing map key cannot be walked through mid-path.
+    #[test]
+    fn nested_element_assign_through_missing_key_is_an_error() {
+        assert!(matches!(
+            eval_err("m = {}; m:'a':'b' = 1"),
+            VmError::IndexOutOfRange
+        ));
+    }
+
+    /// Reaching an immutable list at the end of the path still errors.
+    #[test]
+    fn nested_element_assign_into_immutable_list_is_an_error() {
+        assert!(matches!(
+            eval_err("x = [range(3)]; x:0:0 = 9"),
+            VmError::ImmutableList
         ));
     }
 }

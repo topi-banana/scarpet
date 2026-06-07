@@ -43,12 +43,27 @@ pub trait ListValue: Debug + Send + Sync {
     /// so a [`RangeList`] can answer in O(1) without realising its neighbours.
     fn get(&self, index: usize) -> Option<Value>;
 
+    /// A mutable borrow of the element at an already in-range `index`, or `None`
+    /// when there is no stored slot to lend — a lazy [`RangeList`] computes its
+    /// elements on demand, so it always returns `None`. The basis for in-place
+    /// element writes ([`set`](ListValue::set)) and for walking by reference into
+    /// a nested container assignment target. Callers normalise the index against
+    /// [`len`](ListValue::len) first, exactly as for [`get`](ListValue::get).
+    fn get_mut(&mut self, index: usize) -> Option<&mut Value>;
+
     /// Replace the element at an already in-range `index`, returning whether the
     /// write landed. A realised [`ArrayList`] updates in place and returns `true`;
-    /// a lazy backing such as a [`RangeList`] is immutable and returns `false`
-    /// (the caller turns that into an error). Callers normalise the index against
-    /// [`len`](ListValue::len) first, exactly as for [`get`](ListValue::get).
-    fn set(&mut self, index: usize, value: Value) -> bool;
+    /// a lazy backing such as a [`RangeList`] has no slot and returns `false` (the
+    /// caller turns that into an error). Routed through [`get_mut`](ListValue::get_mut).
+    fn set(&mut self, index: usize, value: Value) -> bool {
+        match self.get_mut(index) {
+            Some(slot) => {
+                *slot = value;
+                true
+            }
+            None => false,
+        }
+    }
 
     /// Remove and return the first element, or `None` when empty. The lazy,
     /// consuming primitive in place of an `iter()`: walking a list means draining
@@ -82,14 +97,8 @@ impl ListValue for ArrayList {
     fn get(&self, index: usize) -> Option<Value> {
         self.0.get(index).cloned()
     }
-    fn set(&mut self, index: usize, value: Value) -> bool {
-        match self.0.get_mut(index) {
-            Some(slot) => {
-                *slot = value;
-                true
-            }
-            None => false,
-        }
+    fn get_mut(&mut self, index: usize) -> Option<&mut Value> {
+        self.0.get_mut(index)
     }
     fn pop_first(&mut self) -> Option<Value> {
         (!self.0.is_empty()).then(|| self.0.remove(0))
@@ -169,9 +178,9 @@ impl ListValue for RangeList {
             _ => None,
         }
     }
-    fn set(&mut self, _index: usize, _value: Value) -> bool {
-        // A lazy arithmetic progression has no stored elements to overwrite.
-        false
+    fn get_mut(&mut self, _index: usize) -> Option<&mut Value> {
+        // A lazy arithmetic progression has no stored elements to borrow.
+        None
     }
     fn pop_first(&mut self) -> Option<Value> {
         match self {

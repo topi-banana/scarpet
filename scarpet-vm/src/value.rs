@@ -457,6 +457,47 @@ impl Value {
         }
     }
 
+    /// A mutable borrow of the element addressed by `key`, for walking by
+    /// reference into a nested container assignment target (`x:0:1 = …`). Unlike
+    /// [`scarpet_get`] it borrows the element in place rather than cloning, so a
+    /// write through the result lands in the original. A list index is normalised
+    /// modulo the length exactly as [`scarpet_get`] reads it; an empty list, a
+    /// lazy `range` ([`ImmutableList`]), an absent map key ([`IndexOutOfRange`]),
+    /// or a non-container ([`NotAContainer`]) all error.
+    ///
+    /// [`scarpet_get`]: Value::scarpet_get
+    /// [`ImmutableList`]: VmError::ImmutableList
+    /// [`IndexOutOfRange`]: VmError::IndexOutOfRange
+    /// [`NotAContainer`]: VmError::NotAContainer
+    pub fn element_mut(&mut self, key: &Value) -> Result<&mut Value, VmError> {
+        match self {
+            Value::List(items) => {
+                if items.is_empty() {
+                    return Err(VmError::IndexOutOfRange);
+                }
+                let idx = match key.as_number()? {
+                    Value::Int(i) => i,
+                    Value::Double(d) => d as i64,
+                    _ => return Err(VmError::ExpectedNumber),
+                };
+                let normalized = idx.rem_euclid(items.len() as i64) as usize;
+                // A non-empty list always normalises in range; only a lazy backing
+                // refuses to lend a slot.
+                items.get_mut(normalized).ok_or(VmError::ImmutableList)
+            }
+            Value::Map(entries) => {
+                for (k, v) in entries.iter_mut() {
+                    if k.scarpet_eq(key) {
+                        return Ok(v);
+                    }
+                }
+                // A missing key has no element to walk into mid-path.
+                Err(VmError::IndexOutOfRange)
+            }
+            _ => Err(VmError::NotAContainer),
+        }
+    }
+
     /// Scarpet `~` match (`left.in(right)`). On a `List` it is the index of the
     /// first element equal to `right` (else null); on a `Map` it is the key
     /// itself when present (else null); `null` / `undef` is always null. On a
