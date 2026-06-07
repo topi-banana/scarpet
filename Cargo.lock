@@ -1763,7 +1763,7 @@ checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 [[package]]
 name = "yew"
 version = "0.23.0"
-source = "git+https://github.com/yewstack/yew/#830db95a54af3b685211ac7349e7276383c9565f"
+source = "git+https://github.com/yewstack/yew/#4bc385737196e511902b41706359134470897d39"
 dependencies = [
  "console_error_panic_hook",
  "futures",
@@ -1787,7 +1787,7 @@ dependencies = [
 [[package]]
 name = "yew-macro"
 version = "0.23.0"
-source = "git+https://github.com/yewstack/yew/#830db95a54af3b685211ac7349e7276383c9565f"
+source = "git+https://github.com/yewstack/yew/#4bc385737196e511902b41706359134470897d39"
 dependencies = [
  "prettyplease",
  "proc-macro-error",
