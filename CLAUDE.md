@@ -4,13 +4,14 @@ Guidance for Claude Code when working in this repository.
 
 ## What this is
 
-Rust tooling for **Scarpet**, the scripting language of Minecraft's Carpet mod (`.sc` files). A Cargo workspace (edition 2024) of three crates:
+Rust tooling for **Scarpet**, the scripting language of Minecraft's Carpet mod (`.sc` files). A Cargo workspace (edition 2024) of four crates:
 
 - `scarpet-syntax` — lexer (`logos`) + parser (`chumsky` via the `logosky` bridge) → a CST that preserves comments and line breaks as **leading trivia** on each node. Builds for `wasm32`.
 - `scarpet-fmt` — formatter: lowers the CST to a Wadler/Lindig pretty-printing `Doc` IR, then renders it at a style set by a `Config` (indent width, max width).
-- `scarpet-cli` — `clap` CLI (`scarpet format`). Built binary is `scarpet-cli`.
+- `scarpet-vm` — tree-walking evaluator (early prototype): lowers the CST to an AST (`scarpet-syntax`'s `ast.rs`) and evaluates it — values, operators, assignment/destructuring, user-defined functions, and a few builtins. Driven by `scarpet repl`.
+- `scarpet-cli` — `clap` CLI (`scarpet format`, `scarpet repl`). Built binary is `scarpet-cli`.
 
-Data flow: `source → lexer → parser → CST (trivia) → lower → Doc → string`. It is strictly one-directional; there is no evaluator/interpreter here.
+Data flow (formatting): `source → lexer → parser → CST (trivia) → lower → Doc → string` — one-directional and non-destructive. A second, experimental path evaluates rather than formats: `scarpet-vm` lowers the same CST to an AST and walks it (`scarpet repl`). The evaluator is an early prototype; the formatter remains the mature path.
 
 ## Commands
 
