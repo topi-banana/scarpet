@@ -55,4 +55,9 @@ pub enum VmError {
     /// An element assignment into an empty list (`[]:0 = …`), which has no slot
     /// to write — `:` reading wraps modulo the length, but an empty list cannot.
     IndexOutOfRange,
+    /// Writing a `print` line to the VM's configured standard output failed: the
+    /// [`Write`](std::io::Write)r in [`GlobalState`](crate::GlobalState) returned
+    /// an I/O error. The process's stdout can fail (a broken pipe); the
+    /// playground's in-memory capture buffer never does.
+    StdoutWrite,
 }

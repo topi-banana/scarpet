@@ -1,6 +1,7 @@
-use std::{collections::BTreeMap, rc::Rc};
+use std::{collections::BTreeMap, io::Write, rc::Rc};
 
 use crate::{
+    error::VmError,
     function::{Function, register_builtins},
     value::ValueContainer,
 };
@@ -17,6 +18,12 @@ use crate::{
 /// `'static` and fit any `'src`.
 pub struct GlobalState<'src> {
     functions: BTreeMap<String, Rc<dyn Function<'src> + 'src>>,
+    /// Where `print` sends its output. The CLI leaves this as the process's
+    /// standard output; the playground swaps in a buffer so it can show what a
+    /// program printed. Boxed as a trait object (rather than a `W` type
+    /// parameter) so neither `GlobalState` nor [`ScarpetVm`] grows a writer
+    /// generic — `print` is not hot enough for the dynamic dispatch to matter.
+    stdout: Box<dyn Write>,
 }
 
 impl<'src> Default for GlobalState<'src> {
@@ -26,10 +33,20 @@ impl<'src> Default for GlobalState<'src> {
 }
 
 impl<'src> GlobalState<'src> {
-    /// A fresh state with the builtin functions registered.
+    /// A fresh state with the builtin functions registered, sending `print`
+    /// output to the process's standard output.
     pub fn new() -> Self {
+        Self::with_stdout(Box::new(std::io::stdout()))
+    }
+
+    /// Like [`new`](Self::new), but directs `print` output to `stdout` rather
+    /// than the process's standard output. The playground passes a buffer here
+    /// to capture what a program prints and render it; a test can do the same to
+    /// assert on the output.
+    pub fn with_stdout(stdout: Box<dyn Write>) -> Self {
         let mut state = Self {
             functions: BTreeMap::new(),
+            stdout,
         };
         register_builtins(&mut state);
         state
@@ -43,6 +60,14 @@ impl<'src> GlobalState<'src> {
     /// Look up a function, cloning the `Rc` so the table is no longer borrowed.
     pub(crate) fn function(&self, name: &str) -> Option<Rc<dyn Function<'src> + 'src>> {
         self.functions.get(name).cloned()
+    }
+
+    /// Write `line`, newline-terminated, to the configured `print` sink
+    /// ([`stdout`](Self::stdout)). The one place `print` emits text, so the CLI
+    /// sees it on its standard output and the playground gathers it into a
+    /// buffer. An I/O failure surfaces as [`VmError::StdoutWrite`].
+    pub(crate) fn write_line(&mut self, line: &str) -> Result<(), VmError> {
+        writeln!(self.stdout, "{line}").map_err(|_| VmError::StdoutWrite)
     }
 
     pub fn create_new_vm<'me>(&'me mut self) -> ScarpetVm<'me, 'src> {
@@ -80,6 +105,12 @@ impl<'state, 'src> ScarpetVm<'state, 'src> {
     /// Define (or redefine) a user function in the shared state.
     pub(crate) fn define(&mut self, name: &str, function: Rc<dyn Function<'src> + 'src>) {
         self.global.register(name, function);
+    }
+
+    /// Write a line to the VM's `print` sink (see [`GlobalState::write_line`]).
+    /// `print` routes here once it has evaluated and stringified its argument.
+    pub(crate) fn write_line(&mut self, line: &str) -> Result<(), VmError> {
+        self.global.write_line(line)
     }
 
     /// The container bound to `name` in this VM's local scope, inserting a fresh

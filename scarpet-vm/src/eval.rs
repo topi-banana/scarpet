@@ -830,6 +830,37 @@ mod tests {
         assert_eq!(eval("print('hi')"), Value::String("hi".to_owned()));
     }
 
+    /// `print` writes each value's string form, newline-terminated, to the
+    /// [`GlobalState`]'s configured stdout — here a shared buffer, exactly as the
+    /// playground captures it to display a program's output.
+    #[test]
+    fn builtin_print_writes_lines_to_configured_stdout() {
+        use std::sync::{Arc, Mutex};
+
+        /// A `Write` sink over a shared buffer, mirroring the playground's
+        /// capture writer.
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let cst = parse_source("print('hello'); print(6 * 7)").expect("parse");
+        let code = Code::try_from(&cst).expect("lower");
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut global = GlobalState::with_stdout(Box::new(Buf(captured.clone())));
+        let mut vm = global.create_new_vm();
+        vm.push(code).expect("eval");
+
+        let text = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert_eq!(text, "hello\n42\n");
+    }
+
     #[test]
     fn user_function_definition_and_call() {
         assert_eq!(eval("f(x) -> x * 2; f(5)"), Value::Int(10));
