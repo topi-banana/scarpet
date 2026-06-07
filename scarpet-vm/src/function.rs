@@ -1,9 +1,6 @@
 use std::rc::Rc;
 
-use scarpet_syntax::ast::{
-    Additive, Args, Assign, Code, Compare, Equality, Expr, Get, Land, Lor, Mult, Power, Primary,
-    Unary,
-};
+use scarpet_syntax::ast::{Args, Assignable, Expr, Patterns};
 
 use crate::{
     Value,
@@ -180,10 +177,25 @@ impl<'src> DefFunction<'src> {
     /// Build from an `Expr::Def`'s parameter list and body. Each parameter must
     /// be a plain variable name; anything richer (literal patterns, `...rest`,
     /// `outer(x)`) is not modelled yet and yields `None`.
-    pub fn new(params: &Args<'src>, body: Box<Expr<'src>>) -> Option<Self> {
-        let Args(codes) = params;
-        let params = codes.iter().map(code_ident).collect::<Option<Vec<_>>>()?;
-        Some(Self { params, body })
+    pub fn new(params: &Patterns<'src>, body: Box<Expr<'src>>) -> Option<Self> {
+        // A rest binder is unsupported for now; only a fixed list of plain
+        // binders is bound. Anything else (a destructure, an `outer(x)`
+        // capture, a literal pattern) also yields `None`.
+        if params.rest.is_some() {
+            return None;
+        }
+        let names = params
+            .before
+            .iter()
+            .map(|p| match p {
+                Assignable::Var(name) => Some(*name),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            params: names,
+            body,
+        })
     }
 }
 
@@ -215,100 +227,5 @@ impl<'src> Function<'src> for DefFunction<'src> {
             *inner.get_var(name).lock()? = value;
         }
         inner.push((*self.body).clone())
-    }
-}
-
-// Parameter-name extraction: a plain binder like `x` is a one-expression `Code`
-// that threads down every passthrough level of the ladder to a `Primary::Ident`.
-// Any operator on the way (so not a bare name) makes this `None`.
-
-fn code_ident<'s>(code: &Code<'s>) -> Option<&'s str> {
-    match code.0.as_slice() {
-        [expr] => expr_ident(expr),
-        _ => None,
-    }
-}
-fn expr_ident<'s>(e: &Expr<'s>) -> Option<&'s str> {
-    if let Expr::Assign(a) = e {
-        assign_ident(a)
-    } else {
-        None
-    }
-}
-fn assign_ident<'s>(a: &Assign<'s>) -> Option<&'s str> {
-    if let Assign::Lor(l) = a {
-        lor_ident(l)
-    } else {
-        None
-    }
-}
-fn lor_ident<'s>(l: &Lor<'s>) -> Option<&'s str> {
-    if let Lor::Land(x) = l {
-        land_ident(x)
-    } else {
-        None
-    }
-}
-fn land_ident<'s>(l: &Land<'s>) -> Option<&'s str> {
-    if let Land::Equality(x) = l {
-        equality_ident(x)
-    } else {
-        None
-    }
-}
-fn equality_ident<'s>(e: &Equality<'s>) -> Option<&'s str> {
-    if let Equality::Compare(x) = e {
-        compare_ident(x)
-    } else {
-        None
-    }
-}
-fn compare_ident<'s>(c: &Compare<'s>) -> Option<&'s str> {
-    if let Compare::Additive(x) = c {
-        additive_ident(x)
-    } else {
-        None
-    }
-}
-fn additive_ident<'s>(a: &Additive<'s>) -> Option<&'s str> {
-    if let Additive::Mult(x) = a {
-        mult_ident(x)
-    } else {
-        None
-    }
-}
-fn mult_ident<'s>(m: &Mult<'s>) -> Option<&'s str> {
-    if let Mult::Power(x) = m {
-        power_ident(x)
-    } else {
-        None
-    }
-}
-fn power_ident<'s>(p: &Power<'s>) -> Option<&'s str> {
-    if let Power::Unary(x) = p {
-        unary_ident(x)
-    } else {
-        None
-    }
-}
-fn unary_ident<'s>(u: &Unary<'s>) -> Option<&'s str> {
-    if let Unary::Get(x) = u {
-        get_ident(x)
-    } else {
-        None
-    }
-}
-fn get_ident<'s>(g: &Get<'s>) -> Option<&'s str> {
-    if let Get::Primary(x) = g {
-        primary_ident(x)
-    } else {
-        None
-    }
-}
-fn primary_ident<'s>(p: &Primary<'s>) -> Option<&'s str> {
-    if let Primary::Ident(name) = p {
-        Some(*name)
-    } else {
-        None
     }
 }
