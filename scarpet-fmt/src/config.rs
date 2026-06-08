@@ -17,14 +17,48 @@ pub enum LineEnding {
     Lf,
     /// Windows-style carriage return + line feed, `\r\n`.
     Crlf,
+    /// Match the line ending already used by the source: the style of its first
+    /// line break wins. Falls back to [`Native`](LineEnding::Native) when the
+    /// source has no break — or when a CST is formatted without its source text,
+    /// since then there is nothing to detect.
+    Auto,
+    /// The host platform's native line ending, fixed at compile time: `\r\n` on
+    /// Windows, `\n` everywhere else (including `wasm32`).
+    Native,
 }
 
 impl LineEnding {
-    /// The string emitted for a single break in this style.
+    /// The platform-native break string, fixed at compile time: `\r\n` on
+    /// Windows, `\n` everywhere else.
+    const NATIVE: &'static str = if cfg!(windows) { "\r\n" } else { "\n" };
+
+    /// The concrete break string for this style, resolved without any source
+    /// text. [`Lf`](Self::Lf) / [`Crlf`](Self::Crlf) map to their literal bytes
+    /// and [`Native`](Self::Native) to the host platform; [`Auto`](Self::Auto)
+    /// has no source to inspect here, so it too resolves to the native ending.
+    /// Resolve `Auto` against real source with [`resolve`](Self::resolve) first
+    /// (as [`format_source`](crate::format_source) does).
     pub fn as_str(self) -> &'static str {
         match self {
             LineEnding::Lf => "\n",
             LineEnding::Crlf => "\r\n",
+            LineEnding::Auto | LineEnding::Native => Self::NATIVE,
+        }
+    }
+
+    /// Collapse [`Auto`](Self::Auto) to the concrete style implied by `source`:
+    /// the first line break decides ([`Crlf`](Self::Crlf) if it is `\r\n`,
+    /// else [`Lf`](Self::Lf)), and a source with no break yields
+    /// [`Native`](Self::Native). Every other variant is returned unchanged, so
+    /// this is a no-op for an already-concrete setting.
+    pub fn resolve(self, source: &str) -> LineEnding {
+        match self {
+            LineEnding::Auto => match source.find('\n') {
+                Some(i) if source.as_bytes()[..i].last() == Some(&b'\r') => LineEnding::Crlf,
+                Some(_) => LineEnding::Lf,
+                None => LineEnding::Native,
+            },
+            other => other,
         }
     }
 }
@@ -81,6 +115,36 @@ mod tests {
     fn line_ending_as_str() {
         assert_eq!(LineEnding::Lf.as_str(), "\n");
         assert_eq!(LineEnding::Crlf.as_str(), "\r\n");
+    }
+
+    #[test]
+    fn native_and_auto_as_str_match_the_platform() {
+        let native = if cfg!(windows) { "\r\n" } else { "\n" };
+        assert_eq!(LineEnding::Native.as_str(), native);
+        // Without source text `Auto` has nothing to detect, so it too falls
+        // back to the native ending.
+        assert_eq!(LineEnding::Auto.as_str(), native);
+    }
+
+    #[test]
+    fn auto_resolves_from_the_first_break() {
+        assert_eq!(LineEnding::Auto.resolve("a\nb\r\n"), LineEnding::Lf);
+        assert_eq!(LineEnding::Auto.resolve("a\r\nb\n"), LineEnding::Crlf);
+        assert_eq!(LineEnding::Auto.resolve("a\nb"), LineEnding::Lf);
+        assert_eq!(LineEnding::Auto.resolve("a\r\nb"), LineEnding::Crlf);
+    }
+
+    #[test]
+    fn auto_without_a_break_falls_back_to_native() {
+        assert_eq!(LineEnding::Auto.resolve("no breaks"), LineEnding::Native);
+        assert_eq!(LineEnding::Auto.resolve(""), LineEnding::Native);
+    }
+
+    #[test]
+    fn resolve_is_a_noop_for_concrete_styles() {
+        assert_eq!(LineEnding::Lf.resolve("a\r\nb"), LineEnding::Lf);
+        assert_eq!(LineEnding::Crlf.resolve("a\nb"), LineEnding::Crlf);
+        assert_eq!(LineEnding::Native.resolve("a\nb"), LineEnding::Native);
     }
 
     #[test]
