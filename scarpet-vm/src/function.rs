@@ -71,7 +71,9 @@ impl<'src> Function<'src> for Str {
     }
 }
 
-/// `print(x)` — write the value's string form to stdout and return it.
+/// `print(x)` — write the value's string form, newline-terminated, to the VM's
+/// configured standard output and return the value. The CLI shows it on its
+/// stdout; the playground captures it into a buffer to display.
 struct Print;
 impl<'src> Function<'src> for Print {
     fn call(
@@ -80,7 +82,10 @@ impl<'src> Function<'src> for Print {
         args: Args<'src>,
     ) -> Result<ValueContainer, VmError> {
         let value = arg1(vm, args)?;
-        println!("{}", value.lock()?.to_scarpet_string());
+        // Stringify (releasing the value's lock) before writing, so the write
+        // borrows only the vm — `print` returns the same value it printed.
+        let line = value.lock()?.to_scarpet_string();
+        vm.write_line(&line)?;
         Ok(value)
     }
 }

@@ -7,6 +7,7 @@ edition = "2024"
 yew = { git = "https://github.com/yewstack/yew/", features = ["csr"] }
 scarpet-fmt = { workspace = true }
 scarpet-syntax = { workspace = true }
+scarpet-vm = { workspace = true }
 web-sys = { version = "0.3", features = [
   "HtmlInputElement",
   "HtmlSelectElement",

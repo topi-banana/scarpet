@@ -1159,6 +1159,7 @@ version = "0.1.0"
 dependencies = [
  "scarpet-fmt",
  "scarpet-syntax",
+ "scarpet-vm",
  "web-sys",
  "yew",
 ]

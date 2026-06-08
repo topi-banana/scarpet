@@ -1,14 +1,18 @@
-//! `scarpet-playground`: a browser playground for the `scarpet` formatter and syntax tree.
+//! `scarpet-playground`: a browser playground for the `scarpet` formatter, syntax tree, and VM.
 //!
 //! A two-pane editor — type Scarpet (`.sc`) source on the left, then run the formatter,
-//! dump the lossless syntax tree (CST), or lower it to the typed AST on the right with the
-//! buttons in the top-right. The formatter's `Config` is editable from the options bar
-//! between the header and the panes.
+//! dump the lossless syntax tree (CST), lower it to the typed AST, or evaluate it with
+//! `scarpet-vm` and see what it printed — on the right with the buttons in the top-right.
+//! The formatter's `Config` is editable from the options bar between the header and the panes.
 //! Everything runs in the browser via `wasm32`; there is no server round-trip.
+
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use scarpet_fmt::{BraceStyle, Config, LineEnding};
 use scarpet_syntax::ast::Code;
 use scarpet_syntax::parser::ParseError;
+use scarpet_vm::{Evalute, GlobalState};
 use web_sys::{HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement};
 use yew::prelude::*;
 
@@ -21,6 +25,9 @@ enum Mode {
     Syntax,
     /// `scarpet-syntax` typed AST dump — the CST lowered via `Code::try_from`.
     Ast,
+    /// `scarpet-vm` evaluation — lower to the AST, run it, and show what the
+    /// program printed (its `print` output, captured from the VM's stdout).
+    Run,
 }
 
 impl Mode {
@@ -30,6 +37,7 @@ impl Mode {
             Mode::Format => "Formatted",
             Mode::Syntax => "Syntax tree",
             Mode::Ast => "AST",
+            Mode::Run => "Output",
         }
     }
 }
@@ -53,16 +61,36 @@ enum Msg {
     Noop,
 }
 
-/// A small (deliberately unformatted) sample so the playground does something on first load.
-const SAMPLE: &str = "// Scarpet sample — hit Format, Syntax tree, or AST.
+/// A small (deliberately unformatted) sample so the playground does something on
+/// first load. Runs under `scarpet-vm` as-is — `Run` prints the two lines — and
+/// is loosely spaced so `Format` has a visible effect too.
+const SAMPLE: &str = "// Scarpet sample — hit Run, Format, Syntax tree, or AST.
 fib(n) -> if(n < 2, n, fib(n-1)+fib(n-2));
-sum = 0;
-loop(10, sum += fib(_) );
-print('sum of first 10 fib = '+sum)
+print('fib(10) = '+fib(10));
+print('fib(20) = '+fib(20))
 ";
 
 /// Shared base classes for the toolbar buttons.
 const BTN_BASE: &str = "inline-flex h-9 cursor-pointer items-center rounded-md px-3 text-sm font-medium transition-colors";
+
+/// An [`std::io::Write`] sink that appends to a shared in-memory buffer, so the
+/// playground can capture the VM's `print` output and display it. The VM holds
+/// one clone of the handle inside its [`GlobalState`]; [`App::run_vm`] keeps
+/// another to read the bytes back once the program finishes. Single-threaded
+/// (`Rc`/`RefCell`), matching the browser's `wasm` runtime.
+#[derive(Clone)]
+struct SharedBuffer(Rc<RefCell<Vec<u8>>>);
+
+impl std::io::Write for SharedBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 struct App {
     input: String,
@@ -129,8 +157,55 @@ impl App {
                 },
                 Err(err) => self.report_parse(&err),
             },
+            Mode::Run => self.run_vm(),
         }
         self.mode = Some(mode);
+    }
+
+    /// Evaluate the input with `scarpet-vm` and show what it printed. Parses and
+    /// lowers like [`Mode::Ast`], then runs the AST in a VM whose `print` output
+    /// is captured into a buffer; that captured text becomes the output. A parse
+    /// or lowering failure reports like the other tools; a runtime [`VmError`]
+    /// still shows whatever the program printed before failing, with the error
+    /// in the diagnostics strip.
+    ///
+    /// [`VmError`]: scarpet_vm::VmError
+    fn run_vm(&mut self) {
+        let cst = match scarpet_syntax::parser::parse_source(&self.input) {
+            Ok(cst) => cst,
+            Err(err) => return self.report_parse(&err),
+        };
+        let code = match Code::try_from(&cst) {
+            Ok(code) => code,
+            Err(err) => {
+                self.output = String::new();
+                self.diagnostics = vec![err.to_string()];
+                self.diagnostics_title = "Lowering error";
+                return;
+            }
+        };
+        // Capture `print` output into a shared buffer: the VM holds one clone of
+        // the handle inside its `GlobalState`, and we keep `buffer` to read the
+        // bytes back once the run finishes.
+        let buffer = Rc::new(RefCell::new(Vec::<u8>::new()));
+        let mut global = GlobalState::with_stdout(Box::new(SharedBuffer(buffer.clone())));
+        let mut vm = global.create_new_vm();
+        let result = vm.push(code);
+        let printed = String::from_utf8_lossy(&buffer.borrow()).into_owned();
+        match result {
+            Ok(_) => {
+                self.output = printed;
+                self.diagnostics = Vec::new();
+            }
+            // A runtime error: keep any output produced before it, and surface
+            // the error itself (its human-readable `Display`) in the diagnostics
+            // strip below the output — both sit in the output pane.
+            Err(err) => {
+                self.output = printed;
+                self.diagnostics = vec![err.to_string()];
+                self.diagnostics_title = "Runtime error";
+            }
+        }
     }
 
     /// Record a parse error as the current diagnostics, clearing any stale output.
@@ -312,6 +387,7 @@ impl Component for App {
         let on_format = link.callback(|_| Msg::Run(Mode::Format));
         let on_syntax = link.callback(|_| Msg::Run(Mode::Syntax));
         let on_ast = link.callback(|_| Msg::Run(Mode::Ast));
+        let on_run = link.callback(|_| Msg::Run(Mode::Run));
 
         let output_title = self.mode.map_or("Output", Mode::output_title);
         let label = "border-b border-hairline bg-canvas px-4 py-2 font-mono text-xs font-medium uppercase tracking-wider text-mute";
@@ -342,6 +418,12 @@ impl Component for App {
                             class={classes!(BTN_BASE, "bg-ink", "text-canvas", "hover:opacity-90")}
                         >
                             { "Format" }
+                        </button>
+                        <button
+                            onclick={on_run}
+                            class={classes!(BTN_BASE, "bg-link", "text-canvas", "hover:opacity-90")}
+                        >
+                            { "Run" }
                         </button>
                     </div>
                 </header>
