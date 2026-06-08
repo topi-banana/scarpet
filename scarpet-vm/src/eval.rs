@@ -1031,6 +1031,67 @@ mod tests {
         assert!(matches!(eval_err("range('a')"), VmError::ExpectedNumber));
     }
 
+    /// `for(list, expr)` returns how many times `expr` was truthy. Here `_i` is
+    /// `0, 1, 2`, so the two non-zero indices count.
+    #[test]
+    fn for_returns_the_truthy_count() {
+        assert_eq!(eval("for([1, 2, 3], _i)"), Value::Int(2));
+    }
+
+    /// The body runs in the current scope, so `_` is the element and a `+=`
+    /// accumulates into an outer variable.
+    #[test]
+    fn for_binds_element_and_accumulates_in_scope() {
+        assert_eq!(eval("s = 0; for([10, 20, 30], s += _); s"), Value::Int(60));
+    }
+
+    /// `for` walks a lazy `range` element by element.
+    #[test]
+    fn for_iterates_a_range() {
+        // `_i` is 0..4, so the four non-zero indices are truthy.
+        assert_eq!(eval("for(range(5), _i)"), Value::Int(4));
+        assert_eq!(eval("s = 0; for(range(1, 5), s += _); s"), Value::Int(10));
+    }
+
+    /// `for` needs a list and exactly two arguments.
+    #[test]
+    fn for_argument_errors() {
+        assert!(matches!(eval_err("for(5, _)"), VmError::ExpectedList));
+        assert!(matches!(eval_err("for([1, 2])"), VmError::WrongArgCount));
+        assert!(matches!(eval_err("for([1], _, _)"), VmError::WrongArgCount));
+    }
+
+    /// End to end: `for` + multi-branch `if` + `range` + `%` + `print` drive a
+    /// FizzBuzz, the playground's sample program. Asserts the captured output.
+    #[test]
+    fn for_drives_fizzbuzz() {
+        use std::sync::{Arc, Mutex};
+
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let src = "fizzbuzz(n) -> for(range(1, n + 1), if(_ % 15 == 0, print('FizzBuzz'), \
+                   _ % 3 == 0, print('Fizz'), _ % 5 == 0, print('Buzz'), print(_))); \
+                   fizzbuzz(5)";
+        let cst = parse_source(src).expect("parse");
+        let code = Code::try_from(&cst).expect("lower");
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut global = GlobalState::with_stdout(Box::new(Buf(captured.clone())));
+        let mut vm = global.create_new_vm();
+        vm.push(code).expect("eval");
+
+        let text = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert_eq!(text, "1\n2\nFizz\n4\nBuzz\n");
+    }
+
     /// `[a, b] = [1, 2]` binds each element of the pattern to the matching value.
     #[test]
     fn destructure_list_binds_each_element() {

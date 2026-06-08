@@ -31,6 +31,7 @@ pub(crate) fn register_builtins(state: &mut GlobalState<'_>) {
     state.register("call", Rc::new(Call));
     state.register("if", Rc::new(If));
     state.register("range", Rc::new(Range));
+    state.register("for", Rc::new(For));
 }
 
 /// Evaluate the single argument of a one-arity builtin.
@@ -164,6 +165,43 @@ impl<'src> Function<'src> for Range {
             _ => unreachable!(),
         }?;
         Ok(ValueContainer::new(Value::List(Box::new(range))))
+    }
+}
+
+/// `for(list, expr(_, _i))` — evaluate `expr` once per element of `list`, with
+/// `_` bound to the element and `_i` to its index, returning how many times `expr`
+/// was truthy (the original `for`). The body runs in the *current* scope, so a
+/// `sum += _` accumulates outside the loop; `_` / `_i` are ordinary slots set each
+/// iteration. A lazy `range` is walked element by element, so a huge range is not
+/// realised up front. (`break` / `continue` are not modelled yet.)
+struct For;
+impl<'src> Function<'src> for For {
+    fn call(
+        &self,
+        vm: &mut ScarpetVm<'_, 'src>,
+        Args(mut args): Args<'src>,
+    ) -> Result<ValueContainer, VmError> {
+        if args.len() != 2 {
+            return Err(VmError::WrongArgCount);
+        }
+        let list = args.pop_front().expect("checked len == 2");
+        let expr = args.pop_front().expect("checked len == 2");
+        // Evaluate the list once; a lazy backing (a `range`) clones cheaply and is
+        // still walked one element at a time below.
+        let Value::List(items) = vm.push(list)?.lock()?.clone() else {
+            return Err(VmError::ExpectedList);
+        };
+        let mut count: i64 = 0;
+        for i in 0..items.len() {
+            let Some(element) = items.get(i) else { break };
+            // Bind `_` / `_i` in the current scope, then evaluate the body there.
+            *vm.get_var("_").lock()? = element;
+            *vm.get_var("_i").lock()? = Value::Int(i as i64);
+            if vm.push(expr.clone())?.lock()?.is_true() {
+                count += 1;
+            }
+        }
+        Ok(ValueContainer::int(count))
     }
 }
 
