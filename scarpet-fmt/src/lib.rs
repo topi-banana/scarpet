@@ -17,7 +17,14 @@ use scarpet_syntax::parser::{Cst, ParseError, parse_source};
 /// Returns [`FmtError::Parse`] if the source does not parse.
 pub fn format_source(src: &str, config: &Config) -> Result<String, FmtError> {
     let cst = parse_source(src).map_err(FmtError::Parse)?;
-    Ok(format_cst(&cst, config))
+    // `Auto` picks its line ending from the source, so resolve it now while
+    // `src` is in hand: `format_cst` sees only the CST, which carries no
+    // line-ending information of its own.
+    let config = Config {
+        line_ending: config.line_ending.resolve(src),
+        ..*config
+    };
+    Ok(format_cst(&cst, &config))
 }
 
 /// Format an already-parsed CST. Infallible: a well-formed CST always renders.
@@ -85,6 +92,34 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(format_source("// c\nx", &cfg).unwrap(), "// c\r\nx\r\n");
+    }
+
+    #[test]
+    fn auto_line_ending_follows_lf_source() {
+        let cfg = Config {
+            line_ending: LineEnding::Auto,
+            ..Config::default()
+        };
+        assert_eq!(format_source("// c\nx", &cfg).unwrap(), "// c\nx\n");
+    }
+
+    #[test]
+    fn auto_line_ending_follows_crlf_source() {
+        let cfg = Config {
+            line_ending: LineEnding::Auto,
+            ..Config::default()
+        };
+        assert_eq!(format_source("// c\r\nx", &cfg).unwrap(), "// c\r\nx\r\n");
+    }
+
+    #[test]
+    fn auto_line_ending_falls_back_to_native_without_a_break() {
+        let cfg = Config {
+            line_ending: LineEnding::Auto,
+            ..Config::default()
+        };
+        let native = if cfg!(windows) { "\r\n" } else { "\n" };
+        assert_eq!(format_source("42", &cfg).unwrap(), format!("42{native}"));
     }
 
     #[test]
