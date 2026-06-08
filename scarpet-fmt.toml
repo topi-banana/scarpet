@@ -10,7 +10,8 @@ indent = 4
 max_width = 100
 # Comment line-length target. -1 disables wrapping.
 comment_width = -1
-# Newline style for breaks the formatter inserts: "lf" (Unix) or "crlf" (Windows).
+# Newline style for breaks the formatter inserts: "lf" (Unix), "crlf" (Windows),
+# "auto" (match the source's existing endings), or "native" (the host platform's).
 line_ending = "lf"
 # Opening delimiter of a broken (), [] or {} block: "same_line" (default) or "next_line".
 brace_style = "same_line"
