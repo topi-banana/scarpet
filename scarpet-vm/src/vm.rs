@@ -128,4 +128,13 @@ impl<'state, 'src> ScarpetVm<'state, 'src> {
             .or_insert_with(ValueContainer::undef)
             .clone()
     }
+
+    /// Install `container` as the slot for `name` in this scope, replacing any
+    /// existing binding. Used to inject an `outer(x)` capture into a function
+    /// body's scope as the *shared* defining-scope slot (so the body sees and can
+    /// update the captured variable), unlike [`get_var`](Self::get_var), which
+    /// always creates a fresh slot.
+    pub(crate) fn bind(&mut self, name: &str, container: ValueContainer) {
+        self.var.insert(name.to_owned(), container);
+    }
 }

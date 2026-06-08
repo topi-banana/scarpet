@@ -13,7 +13,7 @@
 //! - `;` → [`Code`]`(Vec<Expr>)` — a statement sequence
 //! - `->` → [`Expr`] — a function definition [`Expr::Def`] when the left of the
 //!   arrow is a call, otherwise a generic [`Expr::Arrow`]
-//! - `=` `+=` `<>` → [`Assign`] — a [`Lor`] target with an [`AssignOp`]
+//! - `=` `+=` `<>` → [`Assign`] — an [`LValue`] target with an [`AssignOp`]
 //! - `||` `&&` `==`/`!=` `<`/`<=`/`>`/`>=` `+`/`-` `*`/`/`/`%` `^` → one enum
 //!   per level ([`Lor`], [`Land`], [`Equality`], [`Compare`], [`Additive`],
 //!   [`Mult`], [`Power`])
@@ -21,14 +21,24 @@
 //! - `~` `:` → [`Get`]
 //! - atoms, calls, `[...]`, `{...}`, `(...)` → [`Primary`]
 //!
-//! Lowering is fallible where a [`Patterns`] is required — a function's
-//! parameters and the patterns nested within them — so a malformed pattern yields
-//! [`LowerError`] rather than a silently wrong tree. Parameters are a [`Patterns`]:
-//! they admit literal / computed elements (an [`Assignable::Expr`], for value
-//! dispatch like `f('add', x) -> …`) yet constrain `...rest` to at most one per
-//! level. An assignment target (the left of `=`/`+=`/`<>`) is *not* validated
-//! here — it lowers as an ordinary [`Lor`] expression, leaving l-value checking to
-//! the evaluator, so `1 = 2` or `a + b = c` lowers without error.
+//! Lowering is fallible where a structured **target** or **parameter list** is
+//! required, so a malformed one yields [`LowerError`] rather than a silently wrong
+//! tree. The two are deliberately *separate* types, because they are different
+//! little languages:
+//!
+//! - A function's parameters lower to [`Params`] — a flat list of plain binders,
+//!   `outer(x)`-style [`Capture`]s (each a [`ParamWord`] reserved word), and at
+//!   most one `...rest`. A call-arrow whose "parameters" are not all valid (a
+//!   literal, an index, a nested pattern) is *not* a definition: it lowers to a
+//!   generic [`Expr::Arrow`] — a map key→value pair — exactly as Scarpet treats
+//!   `{ k -> v }` in `MAPDEF` context.
+//! - An assignment target (the left of `=`/`+=`/`<>`) lowers to [`LValue`] — a
+//!   single [`Place`] (`x`, `var(e)`, `a:b:c`), a [`Destructure`](LValue::Destructure)
+//!   list (`[a, b]` / `l(a, b)`) that may nest and carry at most one `...rest` per
+//!   level, or a [`Computed`](LValue::Computed) call (`if(c, a, b) = …`) resolved
+//!   at runtime. A shape that can never be a place (`1 = 2`, `a + b = c`,
+//!   `a ~ b = c`) is a [`LowerError::NotAssignable`]. So the structured cases are
+//!   executable by construction, unlike a general [`Lor`] expression.
 //!
 //! Every borrowed `&'s str` points back into the original source, exactly as in
 //! the [`Cst`]; lowering allocates only the `Vec`/`Box` spine.
@@ -56,13 +66,12 @@ pub enum Expr<'s> {
     /// `name(params) -> body` — a function definition (the left of `->` is a
     /// call). The anonymous form `_(x) -> …` is just `name == "_"`.
     ///
-    /// `params` are a [`Patterns`]: plain binders (`a`), `outer(x)` captures (an
-    /// [`Assignable::Call`]), *literal pattern* parameters for value dispatch
-    /// (`f('add', x) -> …`, an [`Assignable::Expr`]), and at most one rest binder
-    /// (`...rest`). It is the evaluator that classifies each by shape.
+    /// `params` are a [`Params`]: plain positional binders, `outer(x)`-style
+    /// [`Capture`]s, and at most one `...rest`. Lowering has already classified and
+    /// validated them, so the evaluator binds without re-checking.
     Def {
         name: &'s str,
-        params: Patterns<'s>,
+        params: Params<'s>,
         body: Box<Expr<'s>>,
     },
     /// `lhs -> body` where `lhs` is not a call — a map entry (`'k' -> v`) or
@@ -76,16 +85,15 @@ pub enum Expr<'s> {
 }
 
 /// The assignment level (`=`, `+=`, `<>`). Right-associative, so `a = b = 5`
-/// nests on the right. The left of the operator is a [`Lor`] target — a general
-/// expression, not a pre-validated l-value; the evaluator decides whether it can
-/// be assigned to.
+/// nests on the right. The left of the operator is an [`LValue`] target,
+/// validated at lowering — the evaluator never sees a non-assignable shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Assign<'s> {
-    /// `target <op> value`. `target` is a general [`Lor`] expression; only some
-    /// shapes (a variable, an index, a destructuring list / `l(…)`, `var(…)`) are
-    /// valid l-values, which the evaluator — not lowering — enforces.
+    /// `target <op> value`. `target` is a structurally valid [`LValue`] (a
+    /// [`Place`] or a destructuring list); a non-assignable left side is a
+    /// [`LowerError::NotAssignable`] rather than a runtime error.
     Set {
-        target: Lor<'s>,
+        target: LValue<'s>,
         op: AssignOp,
         value: Box<Assign<'s>>,
     },
@@ -104,66 +112,116 @@ pub enum AssignOp {
     Swap,
 }
 
-/// A `,`-separated pattern list: a function's parameters, the elements of a
-/// destructuring list (`[a, b, c]`), and the arguments of a call-shaped pattern
-/// (`outer(x)`, `l(a, b)`). The rest binder `...x` may appear **at most once** at this
-/// level — it lives in [`Patterns::rest`] rather than as a repeatable element,
-/// so a second `...` at the same level is unrepresentable (lowering reports
-/// [`LowerError::MultipleRest`]). Nested lists / calls each carry their own
-/// [`Patterns`], so a rest inside a nested destructure is a different level.
+// ====================================================================
+// Function parameters — a flat, faithful-to-Scarpet signature
+// ====================================================================
+
+/// A function's parameter list, lowered from `f(<params>) -> body`. Structured so
+/// binding is direct: [`fixed`](Params::fixed) binders consume arguments by
+/// position, [`captures`](Params::captures) (`outer(x)`) pull from the defining
+/// scope *without* consuming a position, and the single optional
+/// [`rest`](Params::rest) collects the trailing arguments (an empty list when none
+/// remain). This mirrors fabric-carpet's `FunctionValue`: variables, `outer`, and
+/// one vararg are the *only* legal parameters — a literal or nested pattern is a
+/// [`LowerError::InvalidParameter`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Patterns<'s> {
-    /// The pattern elements before the rest binder — or all of them, when there
-    /// is no rest.
-    pub before: Vec<Assignable<'s>>,
-    /// The rest binder `...x` and the elements after it, when a rest is present.
-    pub rest: Option<RestPat<'s>>,
+pub struct Params<'s> {
+    /// Positional binders, in order — each consumes one argument.
+    pub fixed: Vec<&'s str>,
+    /// Reserved-word captures such as `outer(x)`; these do not consume a
+    /// positional argument.
+    pub captures: Vec<Capture<'s>>,
+    /// The single optional vararg `...rest`. At most one per signature (a second
+    /// is a [`LowerError::MultipleRest`]).
+    pub rest: Option<&'s str>,
 }
 
-/// The rest binder `...x` of a [`Patterns`], together with any pattern elements
-/// that follow it (the `b` in `[a, ...x, b]`).
+/// A reserved-word parameter capture, e.g. `outer(x)`. The [`word`](Capture::word)
+/// is an enum so a new reserved binder is one variant away, with no reshaping of
+/// [`Params`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RestPat<'s> {
-    /// The pattern bound by `...` (the `x` in `...x`).
-    pub binder: Box<Assignable<'s>>,
-    /// Pattern elements after the rest binder.
-    pub after: Vec<Assignable<'s>>,
+pub struct Capture<'s> {
+    /// Which reserved word wraps the binder.
+    pub word: ParamWord,
+    /// The captured variable name (the `x` in `outer(x)`).
+    pub name: &'s str,
 }
 
-/// A single pattern: one element of a [`Patterns`] list — a function's parameters
-/// and the patterns nested within them. Beyond the bare variable and
-/// destructuring list, this covers the shapes that occur in real Scarpet: indexed
-/// patterns (`x:0`, `m:'k'`, `obj~'f'`), call-shaped patterns (`l(a, b)`,
-/// `outer(x)`), and computed elements ([`Assignable::Expr`], for value dispatch
-/// like `f('add', x)`). The rest binder `...x` is not a variant here; it is
-/// carried by [`Patterns`]. Assignment *targets* are no longer an [`Assignable`] —
-/// they lower as a general [`Lor`] expression (see [`Assign`]).
+/// A reserved word that may wrap a parameter in a signature. Mirrors
+/// fabric-carpet's `FunctionAnnotationValue.Type`; today only `outer` exists, but
+/// adding a variant here (and a case in [`param_word`]) introduces a new one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamWord {
+    /// `outer(x)` — capture `x` from the defining scope.
+    Outer,
+}
+
+// ====================================================================
+// Assignment targets (l-values) — a recursive, always-executable shape
+// ====================================================================
+
+/// An assignment target: the left of `=`, `+=`, `<>`. Lowering rejects a shape
+/// that can never be a place (`1 = 2`, `a + b = c`, `a ~ b = c`) as
+/// [`LowerError::NotAssignable`]. The structured variants ([`Place`],
+/// [`Destructure`](LValue::Destructure)) are executable by construction; the lone
+/// dynamic variant ([`Computed`](LValue::Computed)) mirrors Scarpet's runtime
+/// l-value model, where any call returning a *bound* value is a place.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Assignable<'s> {
-    /// A plain variable: `x`.
+pub enum LValue<'s> {
+    /// A single writable place: `x`, `var(e)`, or `a:b:c`.
+    Place(Place<'s>),
+    /// A destructuring list: `[a, b]` / `l(a, b)`, binding several places at once
+    /// (see [`LPatterns`]).
+    Destructure(LPatterns<'s>),
+    /// A place produced by evaluating a call — `if(c, a, b) = …`, where the call
+    /// returns one of its bound arguments. This is the one l-value resolved
+    /// dynamically (Scarpet decides assignability at runtime by whether the value
+    /// is bound), so only a call — never a literal or operator — reaches here.
+    Computed(Box<Primary<'s>>),
+}
+
+/// A single writable place. The base of an [`Index`](Place::Index) is itself a
+/// [`Place`], so "indexing a destructuring list" is unrepresentable by
+/// construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Place<'s> {
+    /// A plain variable: `x`. A `global_*` name is still a [`Var`](Place::Var) —
+    /// the global routing is by name prefix, decided when binding.
     Var(&'s str),
-    /// A destructuring list: `[a, b, c]`. Its elements are a [`Patterns`], so a
-    /// nested rest (`[a, ...rest]`) is constrained at that level.
-    List(Patterns<'s>),
-    /// An indexed target: `base:key` (`op == Get`) or `base~key` (`op == Match`).
-    /// The key is a [`Primary`] (the grammar only allows a primary there).
+    /// A dynamically named variable: `var(<expr>)`. The argument's string value is
+    /// the variable name.
+    DynVar(Box<Code<'s>>),
+    /// A container element: `base:key`, nestable as `a:b:c`. `key` is an ordinary
+    /// expression evaluated to the address; only `:` (not `~`) reaches here.
     Index {
-        base: Box<Assignable<'s>>,
-        op: GetOp,
+        base: Box<Place<'s>>,
         key: Primary<'s>,
     },
-    /// A call-shaped pattern: a destructuring constructor (`l(a, b)`) or an
-    /// `outer(x)` capture. The arguments are a [`Patterns`]; a computed argument
-    /// (a literal or an expression) lowers to [`Assignable::Expr`], which the
-    /// evaluator interprets per the called function. (As an assignment *target*,
-    /// `l(…)` / `var(…)` now lower as an ordinary [`Primary::Call`] instead.)
-    Call { name: &'s str, args: Patterns<'s> },
-    /// A computed pattern element: a literal used for value dispatch (`'add'` in
-    /// `f('add', x)`) or an expression that names / selects a sub-target. Appears
-    /// only in a pattern position — an assignment target is a [`Lor`], so a
-    /// non-assignable left side like `1 = 2` is the evaluator's concern now, not a
-    /// [`LowerError`].
-    Expr(Box<Assign<'s>>),
+}
+
+/// The elements of a destructuring [`LValue::Destructure`]: a fixed front, an
+/// optional single rest binder, and a fixed tail after it. One rest per level
+/// keeps the split unambiguous — `[a, ...mid, b]` binds `a` from the front, `b`
+/// from the back, and `mid` the middle. A second `...` at this level is a
+/// [`LowerError::MultipleRest`]; a nested list carries its own [`LPatterns`], so a
+/// rest inside it is a different level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LPatterns<'s> {
+    /// Elements before the rest binder — or all of them, when there is no rest.
+    pub before: Vec<LValue<'s>>,
+    /// The rest binder `...x` and the elements after it, when a rest is present.
+    pub rest: Option<LRest<'s>>,
+}
+
+/// The rest binder `...x` of an [`LPatterns`], plus any elements after it (the
+/// `b` in `[a, ...x, b]`). The binder is itself an [`LValue`], so `[a, ...[p, q]]`
+/// — a rest into a nested destructure — is representable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LRest<'s> {
+    /// The place(s) bound by `...` (the `x` in `...x`).
+    pub binder: Box<LValue<'s>>,
+    /// Elements after the rest binder.
+    pub after: Vec<LValue<'s>>,
 }
 
 /// Logical or (`||`). Left-associative.
@@ -302,7 +360,7 @@ pub enum Get<'s> {
     Primary(Primary<'s>),
 }
 
-/// Which operator joins a [`Get::Index`] / [`Assignable::Index`].
+/// Which operator joins a [`Get::Index`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GetOp {
     /// `:` — element / member access.
@@ -337,10 +395,12 @@ pub enum Primary<'s> {
 /// Why a [`Cst`] could not be lowered to an AST.
 ///
 /// The [`Cst`] carries no source spans, so an error describes *what* was wrong
-/// rather than *where*. The cases are an internal shape that a well-formed parse
-/// never produces, and more than one rest binder at one pattern level. (An
-/// assignment target is no longer checked here — it lowers as a [`Lor`], so a
-/// non-assignable left side is the evaluator's concern, not a [`LowerError`].)
+/// rather than *where*. Beyond an internal shape no well-formed parse produces,
+/// lowering enforces the executable shape of assignment targets, so a
+/// non-assignable target or a second `...` at one destructuring level is rejected
+/// here rather than at evaluation. (A malformed function *signature* is not an
+/// error — a call-arrow whose parameters are not a valid signature is simply a
+/// generic [`Expr::Arrow`], i.e. a map key→value pair, as Scarpet treats it.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LowerError {
     /// A node shape no well-formed parse produces reached a position that only
@@ -348,8 +408,12 @@ pub enum LowerError {
     /// due). Indicates a malformed or hand-built CST. The text names the kind.
     Unexpected(&'static str),
     /// More than one rest binder (`...x`) appeared at the same level of a
-    /// pattern list — only one is allowed per [`Patterns`].
+    /// destructuring list ([`LPatterns`]).
     MultipleRest,
+    /// The left of `=`/`+=`/`<>` is not a valid assignment target — a literal,
+    /// operator expression, `~` match, or other non-place shape (`1 = 2`,
+    /// `a + b = c`, `a ~ b = c`, `[a, 1] = …`).
+    NotAssignable,
 }
 
 impl std::fmt::Display for LowerError {
@@ -360,6 +424,9 @@ impl std::fmt::Display for LowerError {
             }
             LowerError::MultipleRest => {
                 write!(f, "multiple rest binders (`...`) at the same level")
+            }
+            LowerError::NotAssignable => {
+                write!(f, "left-hand side is not a valid assignment target")
             }
         }
     }
@@ -465,12 +532,16 @@ impl<'a, 's> TryFrom<&'a Cst<'s>> for Expr<'s> {
         } = &cst.kind
         {
             let body = Box::new(Expr::try_from(rhs.as_ref())?);
-            if let CstKind::Call { callee, args } = &lhs.kind {
-                Ok(Expr::Def {
-                    name: ident_of(callee)?,
-                    params: lower_patterns(args)?,
-                    body,
-                })
+            // A call LHS with a *valid signature* is a function definition. Any
+            // other arrow — a non-call LHS, or a call whose "parameters" are not a
+            // valid signature (a literal / index, e.g. the map key `str('x', _)`) —
+            // is a generic arrow: a key→value pair in `{ … }` map context, exactly
+            // as Scarpet treats it.
+            if let CstKind::Call { callee, args } = &lhs.kind
+                && let CstKind::Ident(name) = &callee.kind
+                && let Some(params) = lower_params(args)
+            {
+                Ok(Expr::Def { name, params, body })
             } else {
                 Ok(Expr::Arrow {
                     lhs: Assign::try_from(lhs.as_ref())?,
@@ -484,7 +555,7 @@ impl<'a, 's> TryFrom<&'a Cst<'s>> for Expr<'s> {
 }
 
 /// `assign` (`=`, `+=`, `<>`; right-associative). The left of the operator is an
-/// [`Assignable`] target.
+/// [`LValue`] target, validated by [`lower_lvalue`].
 impl<'a, 's> TryFrom<&'a Cst<'s>> for Assign<'s> {
     type Error = LowerError;
     fn try_from(cst: &'a Cst<'s>) -> Result<Self, LowerError> {
@@ -505,50 +576,70 @@ impl<'a, 's> TryFrom<&'a Cst<'s>> for Assign<'s> {
             unreachable!("matched a Binary assign op above")
         };
         Ok(Assign::Set {
-            target: Lor::try_from(lhs.as_ref())?,
+            target: lower_lvalue(lhs)?,
             op,
             value: Box::new(Assign::try_from(rhs.as_ref())?),
         })
     }
 }
 
-/// Lower a CST node to a single [`Assignable`] pattern — one element of a
-/// [`Patterns`] (a function's parameters and the patterns nested within them). A
-/// shape that is not a binder, destructure, call, or index — a literal or any
-/// other expression — becomes a computed [`Assignable::Expr`] (value dispatch like
-/// `f('add', x)`). The per-element helper [`lower_patterns`] drives; not a
-/// `TryFrom` impl only because it is also called recursively on an
-/// [`Assignable::Index`] base.
-fn lower_assignable<'s>(cst: &Cst<'s>) -> Result<Assignable<'s>, LowerError> {
+// --- lowering: assignment targets and function parameters -----------
+
+/// Lower a CST node to an [`LValue`] assignment target. `[...]` / `l(...)` is a
+/// destructuring list; a call other than those (and `var(…)`) is a dynamic
+/// [`Computed`](LValue::Computed) place (`if(c, a, b) = …`); anything else must be
+/// a single [`Place`] ([`lower_place`]), so a shape that can never be a place
+/// (`1 = 2`, `a + b = c`, `a ~ b`) is a [`LowerError::NotAssignable`]. Also drives
+/// the recursion for nested destructures, since each element is itself an [`LValue`].
+fn lower_lvalue<'s>(cst: &Cst<'s>) -> Result<LValue<'s>, LowerError> {
     match &cst.kind {
-        CstKind::Ident(s) => Ok(Assignable::Var(s)),
-        CstKind::List(items) => Ok(Assignable::List(lower_patterns(items)?)),
-        CstKind::Call { callee, args } => Ok(Assignable::Call {
-            name: ident_of(callee)?,
-            args: lower_patterns(args)?,
-        }),
-        CstKind::Binary {
-            op: op @ (BinOp::Get | BinOp::Match),
-            lhs,
-            rhs,
-        } => Ok(Assignable::Index {
-            base: Box::new(lower_assignable(lhs)?),
-            op: get_op(*op),
-            key: Primary::try_from(rhs.as_ref())?,
-        }),
-        _ => Ok(Assignable::Expr(Box::new(Assign::try_from(cst)?))),
+        CstKind::List(items) => Ok(LValue::Destructure(lower_lpatterns(items)?)),
+        CstKind::Call { callee, args } if matches!(&callee.kind, CstKind::Ident("l")) => {
+            Ok(LValue::Destructure(lower_lpatterns(args)?))
+        }
+        // A call other than `l(…)` / `var(…)` may still be a place at runtime —
+        // `if(c, a, b) = …` returns one of its bound arguments.
+        CstKind::Call { callee, .. } if !matches!(&callee.kind, CstKind::Ident("var")) => {
+            Ok(LValue::Computed(Box::new(Primary::try_from(cst)?)))
+        }
+        // `x`, `var(e)`, `a:b:c` — a single statically-known place.
+        _ => Ok(LValue::Place(lower_place(cst)?)),
     }
 }
 
-/// Lower the `,`-separated elements of a pattern position — a `[...]`
-/// destructure, a call target's args, or a function's params — into a
-/// [`Patterns`], dropping phantom `Empty` slots. A `...x` element becomes the
-/// rest binder; a second one at this level is a [`LowerError::MultipleRest`].
-/// Elements after the rest go into [`RestPat::after`]. Each element is lowered
-/// with `allow_expr = true`, so literal / computed patterns are admitted.
-fn lower_patterns<'s>(items: &[Cst<'s>]) -> Result<Patterns<'s>, LowerError> {
+/// Lower a CST node to a single writable [`Place`]: a variable, `var(<expr>)`, or
+/// a (possibly nested) `:` index whose base is itself a place. Any other shape is
+/// a [`LowerError::NotAssignable`] — in particular `~` is a match, not a writable
+/// address.
+fn lower_place<'s>(cst: &Cst<'s>) -> Result<Place<'s>, LowerError> {
+    match &cst.kind {
+        CstKind::Ident(s) => Ok(Place::Var(s)),
+        // `var(<expr>)` names a variable dynamically; it takes exactly one argument.
+        CstKind::Call { callee, args } if matches!(&callee.kind, CstKind::Ident("var")) => {
+            let arg = single_arg(args).ok_or(LowerError::NotAssignable)?;
+            Ok(Place::DynVar(Box::new(Code::try_from(arg)?)))
+        }
+        // `base:key` — a writable element; `~` (Match) is not a target.
+        CstKind::Binary {
+            op: BinOp::Get,
+            lhs,
+            rhs,
+        } => Ok(Place::Index {
+            base: Box::new(lower_place(lhs)?),
+            key: Primary::try_from(rhs.as_ref())?,
+        }),
+        _ => Err(LowerError::NotAssignable),
+    }
+}
+
+/// Lower the `,`-separated elements of a destructuring list (`[...]` / `l(...)`)
+/// into an [`LPatterns`], dropping phantom `Empty` slots. A `...x` element becomes
+/// the single rest binder (a second is a [`LowerError::MultipleRest`]); elements
+/// after it go into [`LRest::after`]. Each element is itself an [`LValue`], so a
+/// nested destructure recurses.
+fn lower_lpatterns<'s>(items: &[Cst<'s>]) -> Result<LPatterns<'s>, LowerError> {
     let mut before = Vec::new();
-    let mut rest: Option<RestPat<'s>> = None;
+    let mut rest: Option<LRest<'s>> = None;
     for item in items {
         if matches!(item.kind, CstKind::Empty) {
             continue;
@@ -561,19 +652,90 @@ fn lower_patterns<'s>(items: &[Cst<'s>]) -> Result<Patterns<'s>, LowerError> {
             if rest.is_some() {
                 return Err(LowerError::MultipleRest);
             }
-            rest = Some(RestPat {
-                binder: Box::new(lower_assignable(operand)?),
+            rest = Some(LRest {
+                binder: Box::new(lower_lvalue(operand)?),
                 after: Vec::new(),
             });
         } else {
-            let pat = lower_assignable(item)?;
+            let elem = lower_lvalue(item)?;
             match &mut rest {
-                None => before.push(pat),
-                Some(r) => r.after.push(pat),
+                None => before.push(elem),
+                Some(r) => r.after.push(elem),
             }
         }
     }
-    Ok(Patterns { before, rest })
+    Ok(LPatterns { before, rest })
+}
+
+/// Try to lower the `,`-separated arguments of a call-arrow LHS as a function
+/// signature ([`Params`]), dropping phantom `Empty` slots. Each parameter must be
+/// a plain binder, an `outer(x)`-style [`Capture`] (a [`ParamWord`]), or the
+/// single `...rest`. Returns `None` if any of them is not — a literal, an index, a
+/// nested pattern, an unknown reserved word, or a second `...` — in which case the
+/// arrow is not a definition but a generic [`Expr::Arrow`] (a map key→value pair),
+/// matching Scarpet, which only treats a valid signature LHS as a definition.
+fn lower_params<'s>(items: &[Cst<'s>]) -> Option<Params<'s>> {
+    let mut fixed = Vec::new();
+    let mut captures = Vec::new();
+    let mut rest: Option<&'s str> = None;
+    for item in items {
+        match &item.kind {
+            CstKind::Empty => {}
+            // `...rest` — the single vararg; its binder must be a plain name.
+            CstKind::Unary {
+                op: UnaryOp::Unpack,
+                operand,
+            } => {
+                if rest.is_some() {
+                    return None;
+                }
+                let CstKind::Ident(name) = &operand.kind else {
+                    return None;
+                };
+                rest = Some(name);
+            }
+            // A plain positional binder.
+            CstKind::Ident(s) => fixed.push(*s),
+            // A reserved-word capture such as `outer(x)`: a known word wrapping one
+            // plain name.
+            CstKind::Call { callee, args } => {
+                let CstKind::Ident(name) = &callee.kind else {
+                    return None;
+                };
+                let word = param_word(name)?;
+                let CstKind::Ident(bound) = &single_arg(args)?.kind else {
+                    return None;
+                };
+                captures.push(Capture { word, name: bound });
+            }
+            // Literals, operator expressions, nested lists, … are not parameters.
+            _ => return None,
+        }
+    }
+    Some(Params {
+        fixed,
+        captures,
+        rest,
+    })
+}
+
+/// Map a signature reserved word to its [`ParamWord`]. Add a case here (and a
+/// [`ParamWord`] variant) to introduce a new reserved binder.
+fn param_word(name: &str) -> Option<ParamWord> {
+    match name {
+        "outer" => Some(ParamWord::Outer),
+        _ => None,
+    }
+}
+
+/// The sole non-`Empty` argument of a single-argument call (`var(e)`, `outer(x)`),
+/// or `None` when there is not exactly one.
+fn single_arg<'a, 's>(args: &'a [Cst<'s>]) -> Option<&'a Cst<'s>> {
+    let mut it = args.iter().filter(|c| !matches!(c.kind, CstKind::Empty));
+    match (it.next(), it.next()) {
+        (Some(arg), None) => Some(arg),
+        _ => None,
+    }
 }
 
 /// `lor` (`||`; left-associative).
@@ -899,37 +1061,13 @@ mod tests {
         p
     }
 
-    /// Descend a bare [`Assign`] (no assignment op) to its [`Primary`] — the
-    /// `Assign` counterpart of `prim_of_expr`, for inspecting the expression
-    /// wrapped in an [`Assignable::Expr`].
-    fn assign_prim<'a, 's>(a: &'a Assign<'s>) -> &'a Primary<'s> {
-        let Assign::Lor(Lor::Land(Land::Equality(Equality::Compare(Compare::Additive(
-            Additive::Mult(Mult::Power(Power::Unary(Unary::Get(Get::Primary(p))))),
-        ))))) = a
-        else {
-            panic!("not a bare primary assign: {a:?}");
+    /// The variable name of a plain-variable [`LValue::Place`], for inspecting an
+    /// assignment target or a destructure element.
+    fn place_var_name<'s>(lv: &LValue<'s>) -> &'s str {
+        let LValue::Place(Place::Var(name)) = lv else {
+            panic!("not a variable place: {lv:?}");
         };
-        p
-    }
-
-    /// Descend a bare [`Lor`] (no operators applied) to its [`Get`] — for
-    /// inspecting an [`Assign::Set`] target, which is a general [`Lor`] now.
-    fn lor_get<'a, 's>(l: &'a Lor<'s>) -> &'a Get<'s> {
-        let Lor::Land(Land::Equality(Equality::Compare(Compare::Additive(Additive::Mult(
-            Mult::Power(Power::Unary(Unary::Get(g))),
-        ))))) = l
-        else {
-            panic!("not a bare get lor: {l:?}");
-        };
-        g
-    }
-
-    /// Descend a bare [`Lor`] target to its [`Primary`].
-    fn lor_prim<'a, 's>(l: &'a Lor<'s>) -> &'a Primary<'s> {
-        let Get::Primary(p) = lor_get(l) else {
-            panic!("not a bare primary lor: {l:?}");
-        };
-        p
+        name
     }
 
     // --- Code root (statement-sequence) --------------------------------------
@@ -1106,11 +1244,9 @@ mod tests {
             panic!("expected a Def");
         };
         assert_eq!(*name, "foo");
-        // params are a Patterns: two plain binders, no rest.
-        assert_eq!(
-            params.before,
-            vec![Assignable::Var("a"), Assignable::Var("b")]
-        );
+        // params: two positional binders, no captures, no rest.
+        assert_eq!(params.fixed, ["a", "b"]);
+        assert!(params.captures.is_empty());
         assert!(params.rest.is_none());
         // body is `a + b`
         as_additive(body);
@@ -1123,53 +1259,50 @@ mod tests {
             panic!("expected a Def");
         };
         assert_eq!(*name, "_");
-        assert_eq!(params.before, vec![Assignable::Var("x")]);
+        assert_eq!(params.fixed, ["x"]);
         assert!(params.rest.is_none());
     }
 
     #[test]
     fn rest_parameter_lands_in_the_rest_slot() {
-        // `...rest` is the pattern list's rest binder, not a repeatable element.
+        // `...rest` is the signature's single vararg.
         let a = ast("f(a, ...rest) -> rest");
         let Expr::Def { params, .. } = only_expr(&a) else {
             panic!("expected a Def");
         };
-        assert_eq!(params.before, vec![Assignable::Var("a")]);
-        let rest = params.rest.as_ref().expect("expected a rest binder");
-        assert_eq!(*rest.binder, Assignable::Var("rest"));
-        assert!(rest.after.is_empty());
+        assert_eq!(params.fixed, ["a"]);
+        assert_eq!(params.rest, Some("rest"));
     }
 
     #[test]
-    fn literal_pattern_parameter_lowers() {
-        // Scarpet dispatches on literal parameters: `f('add', x) -> …`. The
-        // string parameter is a computed pattern (`Assignable::Expr`).
-        let a = ast("f('add', x) -> x");
+    fn non_signature_call_arrow_is_a_generic_arrow() {
+        // A call-arrow whose "parameters" are not a valid signature is NOT a
+        // definition — it is a generic arrow (a map key→value pair). Scarpet allows
+        // only variables / `outer` / `...rest` in a signature, so a literal arg
+        // (`str('add', _)`), an index arg (`f(a:0)`), or an unknown reserved word
+        // (`f(inner(x))`) all fall back to `Expr::Arrow`.
+        for src in ["str('add', _) -> x", "f(a:0) -> x", "f(inner(x)) -> x"] {
+            let a = ast(src);
+            assert!(matches!(only_expr(&a), Expr::Arrow { .. }), "{src}");
+        }
+    }
+
+    #[test]
+    fn outer_capture_parameter_lowers_to_a_capture() {
+        // `outer(x)` is a reserved-word capture; it does not occupy a position.
+        let a = ast("_(a, outer(x)) -> x");
         let Expr::Def { params, .. } = only_expr(&a) else {
             panic!("expected a Def");
         };
-        assert_eq!(params.before.len(), 2);
-        let Assignable::Expr(e) = &params.before[0] else {
-            panic!("expected a computed pattern");
-        };
-        assert_eq!(assign_prim(e), &Primary::Str("'add'"));
-        assert_eq!(params.before[1], Assignable::Var("x"));
+        assert_eq!(params.fixed, ["a"]);
+        assert_eq!(
+            params.captures,
+            vec![Capture {
+                word: ParamWord::Outer,
+                name: "x"
+            }]
+        );
         assert!(params.rest.is_none());
-    }
-
-    #[test]
-    fn outer_capture_parameter_lowers_to_a_call_pattern() {
-        let a = ast("_(outer(x)) -> x");
-        let Expr::Def { params, .. } = only_expr(&a) else {
-            panic!("expected a Def");
-        };
-        assert_eq!(params.before.len(), 1);
-        let Assignable::Call { name, args } = &params.before[0] else {
-            panic!("expected outer(...) as a call pattern");
-        };
-        assert_eq!(*name, "outer");
-        assert_eq!(args.before, vec![Assignable::Var("x")]);
-        assert!(args.rest.is_none());
     }
 
     #[test]
@@ -1192,7 +1325,7 @@ mod tests {
         let Expr::Assign(Assign::Set { target, op, value }) = only_expr(&a) else {
             panic!("expected a Set");
         };
-        assert_eq!(lor_prim(target), &Primary::Ident("a"));
+        assert_eq!(place_var_name(target), "a");
         assert_eq!(*op, AssignOp::Assign);
         let Assign::Set {
             target: t2,
@@ -1202,7 +1335,7 @@ mod tests {
         else {
             panic!("expected a nested Set");
         };
-        assert_eq!(lor_prim(t2), &Primary::Ident("b"));
+        assert_eq!(place_var_name(t2), "b");
         assert_eq!(*op2, AssignOp::Assign);
     }
 
@@ -1223,108 +1356,181 @@ mod tests {
 
     #[test]
     fn indexed_assignment_target() {
-        // `x:0 = 5` → the target is an indexed get expression.
+        // `x:0 = 5` → an indexed place rooted at the variable `x`.
         let a = ast("x:0 = 5");
         let Expr::Assign(Assign::Set { target, .. }) = only_expr(&a) else {
             panic!("expected a Set");
         };
-        let Get::Index { base, op, key } = lor_get(target) else {
-            panic!("expected an indexed target");
+        let LValue::Place(Place::Index { base, key }) = target else {
+            panic!("expected an indexed place: {target:?}");
         };
-        assert_eq!(base.as_ref(), &Get::Primary(Primary::Ident("x")));
-        assert_eq!(*op, GetOp::Get);
+        assert_eq!(base.as_ref(), &Place::Var("x"));
         assert_eq!(key, &Primary::Number("0"));
     }
 
     #[test]
+    fn nested_index_assignment_target() {
+        // `a:b:c = 5` → Index(Index(a, b), c): the base of an index is itself a place.
+        let a = ast("a:b:c = 5");
+        let Expr::Assign(Assign::Set { target, .. }) = only_expr(&a) else {
+            panic!("expected a Set");
+        };
+        let LValue::Place(Place::Index { base, key }) = target else {
+            panic!("expected an indexed place");
+        };
+        assert_eq!(key, &Primary::Ident("c"));
+        let Place::Index { base, key } = base.as_ref() else {
+            panic!("expected a nested index");
+        };
+        assert_eq!(base.as_ref(), &Place::Var("a"));
+        assert_eq!(key, &Primary::Ident("b"));
+    }
+
+    #[test]
     fn destructuring_list_assignment_target() {
-        // `[a, b] = t` — the target is now a plain list-literal expression, not a
-        // pre-classified destructuring pattern (the evaluator interprets it).
+        // `[a, b] = t` — a destructure of two variable places.
         let a = ast("[a, b] = t");
         let Expr::Assign(Assign::Set { target, .. }) = only_expr(&a) else {
             panic!("expected a Set");
         };
-        let Primary::List(Args(codes)) = lor_prim(target) else {
-            panic!("expected a list target");
+        let LValue::Destructure(pats) = target else {
+            panic!("expected a destructure: {target:?}");
         };
-        assert_eq!(codes.len(), 2);
-        assert_eq!(prim_of_expr(&codes[0].0[0]), &Primary::Ident("a"));
-        assert_eq!(prim_of_expr(&codes[1].0[0]), &Primary::Ident("b"));
+        assert!(pats.rest.is_none());
+        let names: Vec<_> = pats.before.iter().map(place_var_name).collect();
+        assert_eq!(names, ["a", "b"]);
     }
 
     #[test]
     fn destructuring_call_assignment_target() {
-        // `l(x, y, z) = p` — the `l(...)` constructor target lowers as an ordinary
-        // call expression now; the evaluator treats it as a destructure.
+        // `l(x, y, z) = p` — the `l(...)` constructor is the same destructure as `[…]`.
         let a = ast("l(x, y, z) = p");
         let Expr::Assign(Assign::Set { target, .. }) = only_expr(&a) else {
             panic!("expected a Set");
         };
-        let Primary::Call { name, args } = lor_prim(target) else {
-            panic!("expected a call target");
+        let LValue::Destructure(pats) = target else {
+            panic!("expected a destructure: {target:?}");
         };
-        assert_eq!(*name, "l");
-        assert_eq!(args.0.len(), 3);
-        assert_eq!(prim_of_expr(&args.0[0].0[0]), &Primary::Ident("x"));
-        assert_eq!(prim_of_expr(&args.0[2].0[0]), &Primary::Ident("z"));
+        let names: Vec<_> = pats.before.iter().map(place_var_name).collect();
+        assert_eq!(names, ["x", "y", "z"]);
     }
 
     #[test]
-    fn lvalue_returning_call_assignment_targets() {
-        // `var(<expr>) = …` — a call target lowers as a plain call expression; the
-        // computed name is its argument expression.
+    fn dynamic_var_assignment_target() {
+        // `var(<expr>) = …` lowers to a `DynVar` place holding the name expression.
         let a = ast("var('global_' + s) = 1");
         let Expr::Assign(Assign::Set { target, .. }) = only_expr(&a) else {
             panic!("expected a Set");
         };
-        let Primary::Call { name, args } = lor_prim(target) else {
-            panic!("expected a call target");
+        let LValue::Place(Place::DynVar(arg)) = target else {
+            panic!("expected a DynVar place: {target:?}");
         };
-        assert_eq!(*name, "var");
-        assert_eq!(args.0.len(), 1);
         // the argument is `'global_' + s`, an additive expression
-        as_additive(&args.0[0].0[0]);
-
-        // `if(c, a, b) = …` is likewise a plain call target.
-        let a = ast("if(c, a, b) = 1");
-        let Expr::Assign(Assign::Set { target, .. }) = only_expr(&a) else {
-            panic!("expected a Set");
-        };
-        let Primary::Call { name, args } = lor_prim(target) else {
-            panic!("expected a call target");
-        };
-        assert_eq!(*name, "if");
-        assert_eq!(args.0.len(), 3);
+        let Code(exprs) = arg.as_ref();
+        assert_eq!(exprs.len(), 1);
+        as_additive(&exprs[0]);
     }
 
     #[test]
-    fn rest_in_a_list_target_is_a_plain_unpack() {
-        // `[a, ...r, b] = t` — a target is a plain expression, so `...r` is an
-        // unpack unary element, not a `RestPat` (rest binders survive only in a
-        // `Patterns`, i.e. function parameters).
+    fn rest_in_a_list_target_binds_a_rest() {
+        // `[a, ...r, b] = t` — `...r` is the single rest binder; `a` is bound from
+        // the front and `b` from the back, the one-rest-per-level rule keeping the
+        // split unambiguous.
         let a = ast("[a, ...r, b] = t");
         let Expr::Assign(Assign::Set { target, .. }) = only_expr(&a) else {
             panic!("expected a Set");
         };
-        let Primary::List(Args(codes)) = lor_prim(target) else {
-            panic!("expected a list target");
+        let LValue::Destructure(pats) = target else {
+            panic!("expected a destructure");
         };
-        assert_eq!(codes.len(), 3);
-        assert_eq!(prim_of_expr(&codes[0].0[0]), &Primary::Ident("a"));
-        let Unary::Unpack(inner) = as_unary(&codes[1].0[0]) else {
-            panic!("expected an unpack element");
-        };
-        assert_eq!(
-            inner.as_ref(),
-            &Unary::Get(Get::Primary(Primary::Ident("r")))
-        );
-        assert_eq!(prim_of_expr(&codes[2].0[0]), &Primary::Ident("b"));
+        assert_eq!(pats.before.len(), 1);
+        assert_eq!(place_var_name(&pats.before[0]), "a");
+        let rest = pats.rest.as_ref().expect("expected a rest binder");
+        assert_eq!(place_var_name(&rest.binder), "r");
+        assert_eq!(rest.after.len(), 1);
+        assert_eq!(place_var_name(&rest.after[0]), "b");
     }
 
     #[test]
-    fn multiple_rest_binders_are_an_error() {
-        // Two `...` at the same level cannot be represented.
-        assert_eq!(lower_err("f(...a, ...b) -> 0"), LowerError::MultipleRest);
+    fn nested_destructure_target() {
+        // `[a, [...b, c]] = t` — a destructure element is itself an `LValue`, so a
+        // nested destructure (with its own rest) recurses.
+        let a = ast("[a, [...b, c]] = t");
+        let Expr::Assign(Assign::Set { target, .. }) = only_expr(&a) else {
+            panic!("expected a Set");
+        };
+        let LValue::Destructure(pats) = target else {
+            panic!("expected a destructure");
+        };
+        assert_eq!(pats.before.len(), 2);
+        assert_eq!(place_var_name(&pats.before[0]), "a");
+        let LValue::Destructure(inner) = &pats.before[1] else {
+            panic!("expected a nested destructure");
+        };
+        assert!(inner.before.is_empty());
+        let rest = inner.rest.as_ref().expect("expected an inner rest");
+        assert_eq!(place_var_name(&rest.binder), "b");
+        assert_eq!(place_var_name(&rest.after[0]), "c");
+    }
+
+    #[test]
+    fn rest_binder_into_a_nested_destructure() {
+        // `[a, ...[p, q]] = t` — the rest binder is itself an `LValue`, here a
+        // nested destructure.
+        let a = ast("[a, ...[p, q]] = t");
+        let Expr::Assign(Assign::Set { target, .. }) = only_expr(&a) else {
+            panic!("expected a Set");
+        };
+        let LValue::Destructure(pats) = target else {
+            panic!("expected a destructure");
+        };
+        let rest = pats.rest.as_ref().expect("expected a rest binder");
+        let LValue::Destructure(inner) = rest.binder.as_ref() else {
+            panic!("expected the rest binder to be a destructure");
+        };
+        let names: Vec<_> = inner.before.iter().map(place_var_name).collect();
+        assert_eq!(names, ["p", "q"]);
+    }
+
+    #[test]
+    fn computed_call_assignment_target() {
+        // `if(c, a, b) = …` — a call that may return a bound place at runtime
+        // lowers to a `Computed` target (Scarpet's dynamic l-value model).
+        let a = ast("if(c, a, b) = 1");
+        let Expr::Assign(Assign::Set { target, .. }) = only_expr(&a) else {
+            panic!("expected a Set");
+        };
+        let LValue::Computed(call) = target else {
+            panic!("expected a computed target: {target:?}");
+        };
+        let Primary::Call { name, .. } = call.as_ref() else {
+            panic!("expected a call");
+        };
+        assert_eq!(*name, "if");
+    }
+
+    #[test]
+    fn multiple_rest_binders_in_a_destructure_are_an_error() {
+        // Two `...` at the same destructuring level cannot be represented. (In a
+        // *signature* a second `...` instead makes the arrow a non-definition, so
+        // `f(...a, ...b) -> 0` lowers to a generic arrow, not an error.)
+        assert_eq!(lower_err("[...a, ...b] = t"), LowerError::MultipleRest);
+        assert!(matches!(
+            only_expr(&ast("f(...a, ...b) -> 0")),
+            Expr::Arrow { .. }
+        ));
+    }
+
+    #[test]
+    fn non_assignable_targets_are_rejected_at_lowering() {
+        // The target is an `LValue` now, so a shape that can never be a place fails
+        // at lowering rather than evaluation: a literal, an operator or
+        // parenthesised expression, `~` match, and a literal destructure element.
+        // (A call like `if(…)` is the one exception — it may be a place at runtime,
+        // so it lowers to `LValue::Computed`.)
+        for src in ["1 = 2", "a + b = c", "(a) = b", "a ~ b = c", "[a, 1] = t"] {
+            assert_eq!(lower_err(src), LowerError::NotAssignable, "{src}");
+        }
     }
 
     // --- primaries: call / list / map ----------------------------------------
@@ -1381,22 +1587,6 @@ mod tests {
             panic!("expected a call");
         };
         assert_eq!(args.0.len(), 2);
-    }
-
-    // --- errors --------------------------------------------------------------
-
-    #[test]
-    fn assignment_targets_are_not_validated_at_lowering() {
-        // The target is a general `Lor` expression now; l-value validity is the
-        // evaluator's concern, so shapes that are not assignable still lower to an
-        // `Assign::Set` rather than a `LowerError`.
-        for src in ["1 = 2", "a + b = c", "(a) = b"] {
-            let a = ast(src);
-            assert!(
-                matches!(only_expr(&a), Expr::Assign(Assign::Set { .. })),
-                "{src} should lower to an assignment"
-            );
-        }
     }
 }
 

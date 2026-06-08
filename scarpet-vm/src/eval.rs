@@ -6,8 +6,8 @@
 use std::{cmp::Ordering, rc::Rc};
 
 use scarpet_syntax::ast::{
-    Additive, Args, Assign, AssignOp, Code, Compare, Equality, Expr, Get, GetOp, Land, Lor, Mult,
-    Power, Primary, Unary,
+    Additive, Args, Assign, AssignOp, Code, Compare, Equality, Expr, Get, GetOp, LPatterns, LRest,
+    LValue, Land, Lor, Mult, ParamWord, Place, Power, Primary, Unary,
 };
 
 use crate::{
@@ -39,7 +39,16 @@ impl<'src, 'state> Evalute<Expr<'src>> for ScarpetVm<'state, 'src> {
     fn push(&mut self, st: Expr<'src>) -> Result<ValueContainer, VmError> {
         match st {
             Expr::Def { name, params, body } => {
-                let func = DefFunction::new(&params, body).ok_or(VmError::UnsupportedParameter)?;
+                // Resolve each `outer(x)` against the *defining* scope now, grabbing
+                // its shared slot to inject when the function runs.
+                let mut captures = Vec::with_capacity(params.captures.len());
+                for cap in &params.captures {
+                    let slot = match cap.word {
+                        ParamWord::Outer => self.get_var(cap.name),
+                    };
+                    captures.push((cap.name, slot));
+                }
+                let func = DefFunction::new(&params, captures, body);
                 self.define(name, Rc::new(func));
                 Ok(ValueContainer::string(name.to_owned()))
             }
@@ -55,10 +64,10 @@ impl<'src, 'state> Evalute<Assign<'src>> for ScarpetVm<'state, 'src> {
         match st {
             Assign::Set { target, op, value } => {
                 // The right-hand side is evaluated once, in the current scope,
-                // before binding; `assign` then routes it to the target — a single
-                // place for `op` to update, or a destructure to spread across.
+                // before binding; `assign_lvalue` then routes it to the target — a
+                // single place for `op` to update, or a destructure to spread across.
                 let value = self.push(*value)?;
-                self.assign(target, op, value)
+                self.assign_lvalue(target, op, value)
             }
             Assign::Lor(ost) => self.push(ost),
         }
@@ -278,120 +287,116 @@ impl<'state, 'src> ScarpetVm<'state, 'src> {
     }
 
     /// Carry out `target <op> value` — the body of an [`Assign::Set`]. The target
-    /// is a general expression now, so peel the precedence-ladder passthrough down
-    /// to the `get` level (`:`/`~` and the primaries): anything with an operator
-    /// above that level is not an l-value. [`assign_get`](Self::assign_get) then
-    /// dispatches on the shape.
-    fn assign(
+    /// is a structurally validated [`LValue`], so this dispatches on its shape with
+    /// no re-validation: a single [`Place`] that `op` writes through, a
+    /// [`Destructure`](LValue::Destructure) that spreads `value` across several
+    /// sub-targets, or a [`Computed`](LValue::Computed) call whose value is the
+    /// place (Scarpet's runtime l-value).
+    fn assign_lvalue(
         &mut self,
-        target: Lor<'src>,
+        target: LValue<'src>,
         op: AssignOp,
         value: ValueContainer,
     ) -> Result<ValueContainer, VmError> {
-        let get = peel_get(target).ok_or(VmError::NotAssignable)?;
-        self.assign_get(get, op, value)
-    }
-
-    /// Route a target peeled to the `get` level to its handler: a *destructuring*
-    /// list pattern (`[a, b]`, `l(a, b)`) spreads `value` across several
-    /// sub-targets and is `=`-only; a `base:key` index writes into a container
-    /// element in place; everything else resolves to a single mutable place that
-    /// `op` updates (the slot itself being the assignment's value, so `b = a = 1`
-    /// reads `a`'s slot for `b`).
-    fn assign_get(
-        &mut self,
-        get: Get<'src>,
-        op: AssignOp,
-        value: ValueContainer,
-    ) -> Result<ValueContainer, VmError> {
-        match get {
-            // `base:key = …` writes into a container element in place, rather than
-            // rebinding a variable slot.
-            Get::Index {
-                base,
-                op: get_op,
-                key,
-            } => self.assign_index(*base, get_op, key, op, value),
-            // `[a, b] = …` and `l(a, b) = …` are the same list-constructor l-value.
-            Get::Primary(Primary::List(args) | Primary::Call { name: "l", args }) => {
-                self.destructure(args, op, value)
-            }
-            // Everything else resolves to a single mutable place, which `op` writes
-            // through; the slot itself is the assignment's value.
-            Get::Primary(primary) => {
-                let place = self.resolve_place(primary)?;
-                match op {
-                    AssignOp::Assign => *place.lock()? = value.lock()?.clone(),
-                    AssignOp::Add => *place.lock()? += value.lock()?.clone(),
-                    AssignOp::Swap => std::mem::swap(&mut *place.lock()?, &mut *value.lock()?),
-                }
-                Ok(place)
+        match target {
+            LValue::Place(place) => self.assign_place(place, op, value),
+            LValue::Destructure(pats) => self.destructure(pats, op, value),
+            // `if(c, a, b) = …`: the call evaluates to one of its bound arguments'
+            // shared slots, which `op` then writes through.
+            LValue::Computed(call) => {
+                let slot = self.push(*call)?;
+                self.assign_to_slot(slot, op, value)
             }
         }
     }
 
-    /// Resolve a single-place primary target to its shared [`ValueContainer`]
-    /// slot: the local slot for a bare variable, or the dynamically named slot for
-    /// `var(expr)` (whose argument's value is the variable name). Any other primary
-    /// — a literal, a map, an l-value-returning call (`if(…)`) — is not a place.
-    /// (A list / `l(…)` is multi-value, handled in [`assign_get`](Self::assign_get)
-    /// before it reaches here.)
-    fn resolve_place(&mut self, primary: Primary<'src>) -> Result<ValueContainer, VmError> {
-        match primary {
-            Primary::Ident(name) => Ok(self.get_var(name)),
-            // `var(expr)` names a variable dynamically — `var('x' + i) = …`.
-            Primary::Call { name: "var", args } => {
-                let name = self.eval_var_name(args)?;
+    /// Carry out `<place> <op> value` for a single [`Place`]: a `base:key` index
+    /// writes into a container element in place ([`assign_index`](Self::assign_index)),
+    /// while a variable / `var(…)` resolves to a mutable slot that `op` writes
+    /// through (the slot itself being the assignment's value, so `b = a = 1` reads
+    /// `a`'s slot for `b`).
+    fn assign_place(
+        &mut self,
+        place: Place<'src>,
+        op: AssignOp,
+        value: ValueContainer,
+    ) -> Result<ValueContainer, VmError> {
+        match place {
+            Place::Index { base, key } => self.assign_index(*base, key, op, value),
+            other => {
+                let slot = self.resolve_root(other)?;
+                self.assign_to_slot(slot, op, value)
+            }
+        }
+    }
+
+    /// Apply `op` to a resolved variable slot: `=` overwrites it, `+=` adds in
+    /// place, `<>` swaps it with the other slot. Yields the slot, which is the
+    /// assignment's value.
+    fn assign_to_slot(
+        &mut self,
+        slot: ValueContainer,
+        op: AssignOp,
+        value: ValueContainer,
+    ) -> Result<ValueContainer, VmError> {
+        match op {
+            AssignOp::Assign => *slot.lock()? = value.lock()?.clone(),
+            AssignOp::Add => *slot.lock()? += value.lock()?.clone(),
+            AssignOp::Swap => std::mem::swap(&mut *slot.lock()?, &mut *value.lock()?),
+        }
+        Ok(slot)
+    }
+
+    /// Resolve the root of a place chain to its shared [`ValueContainer`] slot: the
+    /// local slot for a bare variable, or the dynamically named slot for `var(expr)`
+    /// (whose argument's value is the variable name). An [`Index`](Place::Index)
+    /// never reaches here — [`assign_index`](Self::assign_index) flattens the chain
+    /// to its non-index root first.
+    fn resolve_root(&mut self, root: Place<'src>) -> Result<ValueContainer, VmError> {
+        match root {
+            Place::Var(name) => Ok(self.get_var(name)),
+            Place::DynVar(code) => {
+                let name = self.eval_var_name(*code)?;
                 Ok(self.get_var(&name))
             }
-            _ => Err(VmError::NotAssignable),
+            Place::Index { .. } => {
+                unreachable!("an index chain flattens to a non-index root")
+            }
         }
     }
 
     /// Carry out `base:key <op> value` — assignment into a (possibly nested)
     /// container element (the original `LContainerValue` → `container.put`). The
-    /// `root:k0:…:kn` chain is flattened to its root l-value (a bare variable /
-    /// `var(...)` primary) plus the key path; the root's place is locked once and
-    /// the path walked *by reference* through [`Value::element_mut`], so even a
-    /// deep write (`x:0:1 = …`) lands in the original. The final element is
-    /// replaced through [`Value::scarpet_put`] (a compound `+=` reads it first).
-    /// Only `:` (`GetOp::Get`) addresses a writable element; `~` is a match
-    /// operator, not a target. Yields the stored value, as the original does.
+    /// `root:k0:…:kn` chain is flattened to its root place (a variable / `var(...)`)
+    /// plus the key path; the root's slot is locked once and the path walked *by
+    /// reference* through [`Value::element_mut`], so even a deep write (`x:0:1 = …`)
+    /// lands in the original. The final element is replaced through
+    /// [`Value::scarpet_put`] (a compound `+=` reads it first). Yields the stored
+    /// value, as the original does. Lowering guarantees only `:` reaches here.
     fn assign_index(
         &mut self,
-        base: Get<'src>,
-        get_op: GetOp,
+        base: Place<'src>,
         key: Primary<'src>,
         op: AssignOp,
         value: ValueContainer,
     ) -> Result<ValueContainer, VmError> {
-        // `~` (Match) is a search operator, not a writable container address.
-        if get_op != GetOp::Get {
-            return Err(VmError::NotAssignable);
-        }
-        // Flatten `root:k0:…:kn` into the root primary and the key path
-        // `[k0, …, kn]`. Keys are gathered innermost-first, then reversed.
+        // Flatten `root:k0:…:kn` into the root place and the key path `[k0, …, kn]`.
+        // Keys are gathered innermost-first, then reversed.
         let mut keys = vec![self.push(key)?.lock()?.clone()];
         let mut current = base;
         let root = loop {
             match current {
-                Get::Index {
-                    base,
-                    op: GetOp::Get,
-                    key,
-                } => {
+                Place::Index { base, key } => {
                     keys.push(self.push(key)?.lock()?.clone());
                     current = *base;
                 }
-                // A `~` anywhere along the path is not a writable address either.
-                Get::Index { .. } => return Err(VmError::NotAssignable),
-                Get::Primary(primary) => break primary,
+                other => break other,
             }
         };
         keys.reverse();
-        let place = self.resolve_place(root)?;
+        let slot = self.resolve_root(root)?;
         let new = value.lock()?.clone();
-        let mut guard = place.lock()?;
+        let mut guard = slot.lock()?;
         // Walk to the innermost container by reference, then write the last key.
         let mut container: &mut Value = &mut guard;
         let (last, mids) = keys
@@ -421,44 +426,23 @@ impl<'state, 'src> ScarpetVm<'state, 'src> {
     }
 
     /// Spread `value` across a destructuring list pattern (`[a, b] = …`,
-    /// `l(a, b) = …`). The pattern's elements are plain expressions now: each must
-    /// peel to a `get`-level l-value, and a leading `...` (an unpack unary) marks
-    /// the one rest binder. `value` must be a list; its elements bind by position,
-    /// the rest binder collecting the leftover middle into a fresh list. Sub-
-    /// patterns recurse through [`assign_get`](Self::assign_get), so a nested
-    /// `[[a], b]` works. A compound `+=` reads the pattern as an r-value first
+    /// `l(a, b) = …`). The pattern is an [`LPatterns`] validated at lowering, so
+    /// each element is an [`LValue`] bound by position through
+    /// [`assign_lvalue`](Self::assign_lvalue) — a nested `[[a], b]` simply recurses.
+    /// `value` must be a list; the optional rest binder collects the leftover middle
+    /// into a fresh list. A compound `+=` reads the pattern as an r-value first
     /// (`[a, b] += v` is `[a, b] = [a, b] + v`); `<>` is rejected. Yields `true`.
     fn destructure(
         &mut self,
-        Args(elems): Args<'src>,
+        LPatterns { before, rest }: LPatterns<'src>,
         op: AssignOp,
         value: ValueContainer,
     ) -> Result<ValueContainer, VmError> {
-        // Classify each element into the fixed front (`before`), the single
-        // optional rest binder, and the fixed tail (`after`). A second `...` at
-        // this level is not a representable l-value.
-        let mut before: Vec<Get<'src>> = Vec::new();
-        let mut rest: Option<Get<'src>> = None;
-        let mut after: Vec<Get<'src>> = Vec::new();
-        for elem in elems {
-            let (is_rest, get) = peel_elem(elem)?;
-            if is_rest {
-                if rest.is_some() {
-                    return Err(VmError::NotAssignable);
-                }
-                rest = Some(get);
-            } else if rest.is_none() {
-                before.push(get);
-            } else {
-                after.push(get);
-            }
-        }
-        // Pick the value to bind. `=` binds the RHS directly; `+=` reads the
-        // pattern as an r-value list and adds the RHS into it first (the original
-        // delegates `+=` to `+`, then destructures — `Value`'s `AddAssign` covers
-        // both list-pairwise and scalar-broadcast). `<>` would need the RHS as a
-        // *pattern of places*, which is gone once it has been evaluated to an
-        // ordinary value, so it is rejected.
+        // Pick the value to bind. `=` binds the RHS directly; `+=` reads the pattern
+        // as an r-value list and adds the RHS into it first (`Value`'s `AddAssign`
+        // covers both list-pairwise and scalar-broadcast). `<>` would need the RHS
+        // as a *pattern of places*, gone once evaluated to a value, so it is
+        // rejected.
         let value = match op {
             AssignOp::Assign => value,
             AssignOp::Add => {
@@ -466,7 +450,7 @@ impl<'state, 'src> ScarpetVm<'state, 'src> {
                     // A rest pattern has no well-defined r-value to add into.
                     return Err(VmError::NotAssignable);
                 }
-                let mut sum = self.eval_gets_as_list(&before)?;
+                let mut sum = self.read_lvalues_as_list(&before)?;
                 sum += value.lock()?.clone();
                 ValueContainer::new(sum)
             }
@@ -484,102 +468,82 @@ impl<'state, 'src> ScarpetVm<'state, 'src> {
                     Ordering::Less => return Err(VmError::TooFewValuesToUnpack),
                     Ordering::Equal => {}
                 }
-                for (get, item) in before.into_iter().zip(items) {
-                    self.assign_get(get, AssignOp::Assign, ValueContainer::new(item))?;
+                for (lv, item) in before.into_iter().zip(items) {
+                    self.assign_lvalue(lv, AssignOp::Assign, ValueContainer::new(item))?;
                 }
             }
             // `[a, ...rest, b]`: bind `before` from the front and `after` from the
             // back, and collect the middle into the rest binder as a new list.
-            Some(binder) => {
+            Some(LRest { binder, after }) => {
                 let fixed = before.len() + after.len();
                 if items.len() < fixed {
                     return Err(VmError::TooFewValuesToUnpack);
                 }
                 let tail = items.split_off(items.len() - after.len());
                 let middle = items.split_off(before.len());
-                for (get, item) in before.into_iter().zip(items) {
-                    self.assign_get(get, AssignOp::Assign, ValueContainer::new(item))?;
+                for (lv, item) in before.into_iter().zip(items) {
+                    self.assign_lvalue(lv, AssignOp::Assign, ValueContainer::new(item))?;
                 }
-                self.assign_get(
-                    binder,
+                self.assign_lvalue(
+                    *binder,
                     AssignOp::Assign,
                     ValueContainer::new(Value::list(middle)),
                 )?;
-                for (get, item) in after.into_iter().zip(tail) {
-                    self.assign_get(get, AssignOp::Assign, ValueContainer::new(item))?;
+                for (lv, item) in after.into_iter().zip(tail) {
+                    self.assign_lvalue(lv, AssignOp::Assign, ValueContainer::new(item))?;
                 }
             }
         }
         Ok(ValueContainer::bool(true))
     }
 
-    /// Evaluate the single argument of a dynamic `var(expr)` target to the name
-    /// of the variable it selects: `var` takes one argument, and its value's
-    /// string form is the name (so `var('x' + i)` and `var(key)` both work).
-    fn eval_var_name(&mut self, Args(mut elems): Args<'src>) -> Result<String, VmError> {
-        if elems.len() != 1 {
-            return Err(VmError::WrongArgCount);
-        }
-        let arg = elems.pop().expect("checked len == 1");
-        let value = self.push(arg)?;
+    /// Evaluate a dynamic `var(expr)` name [`Code`] to the variable name it selects:
+    /// the value's string form is the name (so `var('x' + i)` and `var(key)` both
+    /// work). The single-argument shape is guaranteed by lowering.
+    fn eval_var_name(&mut self, code: Code<'src>) -> Result<String, VmError> {
+        let value = self.push(code)?;
         let name = value.lock()?.to_scarpet_string();
         Ok(name)
     }
 
-    /// Evaluate a slice of `get`-level pattern elements into a realised
-    /// [`Value::list`] — the r-value of a `[a, b, …]` / `l(a, b, …)` pattern, used
-    /// by the compound `[a, b] += …` path. Each element evaluates as the ordinary
-    /// expression it is.
-    fn eval_gets_as_list(&mut self, gets: &[Get<'src>]) -> Result<Value, VmError> {
-        let mut items = Vec::with_capacity(gets.len());
-        for get in gets {
-            items.push(self.push(get.clone())?.lock()?.clone());
+    /// Realise a slice of destructure elements as a [`Value::list`] — the r-value of
+    /// a `[a, b, …]` / `l(a, b, …)` pattern, used by the compound `[a, b] += …`
+    /// path. Each element is read as the expression it denotes.
+    fn read_lvalues_as_list(&mut self, lvalues: &[LValue<'src>]) -> Result<Value, VmError> {
+        let mut items = Vec::with_capacity(lvalues.len());
+        for lv in lvalues {
+            items.push(self.read_lvalue(lv)?);
         }
         Ok(Value::list(items))
     }
-}
 
-/// Peel the precedence-ladder passthrough of an assignment-target expression down
-/// to the `unary` level. Returns `None` if any binary operator is applied above
-/// it, since such an expression is not a bare l-value.
-fn peel_unary<'src>(lor: Lor<'src>) -> Option<Unary<'src>> {
-    let Lor::Land(Land::Equality(Equality::Compare(Compare::Additive(Additive::Mult(
-        Mult::Power(Power::Unary(unary)),
-    ))))) = lor
-    else {
-        return None;
-    };
-    Some(unary)
-}
-
-/// Peel further to the `get` level (`:`/`~` and the primaries). Returns `None` if
-/// a prefix unary (`-`, `+`, `!`, `...`) is applied — a bare target carries none.
-fn peel_get<'src>(lor: Lor<'src>) -> Option<Get<'src>> {
-    match peel_unary(lor)? {
-        Unary::Get(get) => Some(get),
-        _ => None,
+    /// Read an [`LValue`] as an r-value (its current value), for the `+=` destructure
+    /// path: a [`Place`] reads its slot / element, a [`Computed`](LValue::Computed)
+    /// evaluates its call, and a nested [`Destructure`](LValue::Destructure) reads
+    /// its elements into a list.
+    fn read_lvalue(&mut self, lv: &LValue<'src>) -> Result<Value, VmError> {
+        match lv {
+            LValue::Place(place) => self.read_place(place),
+            LValue::Computed(call) => Ok(self.push((**call).clone())?.lock()?.clone()),
+            LValue::Destructure(pats) => self.read_lvalues_as_list(&pats.before),
+        }
     }
-}
 
-/// Classify a destructuring-list element. A list element is a `Code` (a statement
-/// sequence); a valid l-value element is a single expression peeled to the `get`
-/// level. A leading `...` (an unpack unary) marks the rest binder — the returned
-/// flag is `true` for it, and its operand is peeled to the binder's `get`.
-fn peel_elem<'src>(Code(mut exprs): Code<'src>) -> Result<(bool, Get<'src>), VmError> {
-    if exprs.len() != 1 {
-        return Err(VmError::NotAssignable);
-    }
-    let Expr::Assign(Assign::Lor(lor)) = exprs.pop().expect("checked len == 1") else {
-        return Err(VmError::NotAssignable);
-    };
-    match peel_unary(lor).ok_or(VmError::NotAssignable)? {
-        // `...x` — the rest binder; peel its operand to the bound `get`.
-        Unary::Unpack(inner) => match *inner {
-            Unary::Get(get) => Ok((true, get)),
-            _ => Err(VmError::NotAssignable),
-        },
-        Unary::Get(get) => Ok((false, get)),
-        _ => Err(VmError::NotAssignable),
+    /// Read a [`Place`] as an r-value: a variable / `var(…)` reads its slot, an
+    /// index reads the addressed element.
+    fn read_place(&mut self, place: &Place<'src>) -> Result<Value, VmError> {
+        match place {
+            Place::Var(name) => Ok(self.get_var(name).lock()?.clone()),
+            Place::DynVar(code) => {
+                let name = self.eval_var_name((**code).clone())?;
+                Ok(self.get_var(&name).lock()?.clone())
+            }
+            Place::Index { base, key } => {
+                let base = self.read_place(base)?;
+                let key = self.push(key.clone())?.lock()?.clone();
+                base.scarpet_get(&key)
+            }
+        }
     }
 }
 
@@ -905,6 +869,50 @@ mod tests {
         assert_eq!(eval("a = 10; f() -> a; f()"), Value::Undef);
     }
 
+    /// `outer(x)` captures a defining-scope variable so the body can see it (the
+    /// body otherwise has no access to caller locals).
+    #[test]
+    fn outer_captures_a_defining_scope_variable() {
+        assert_eq!(eval("o = 9; f(a, outer(o)) -> a + o; f(1)"), Value::Int(10));
+    }
+
+    /// An `outer(x)` capture does not consume a positional argument, so the fixed
+    /// parameters still bind by position.
+    #[test]
+    fn outer_capture_does_not_consume_a_position() {
+        assert_eq!(
+            eval("o = 100; g(x, outer(o), y) -> x + y + o; g(1, 2)"),
+            Value::Int(103)
+        );
+    }
+
+    /// `...rest` collects the trailing arguments into a list.
+    #[test]
+    fn rest_parameter_collects_trailing_arguments() {
+        assert_eq!(
+            eval("g(a, ...rest) -> rest; g(1, 2, 3)"),
+            Value::list(vec![Value::Int(2), Value::Int(3)])
+        );
+        // The fixed parameter still binds.
+        assert_eq!(eval("g(a, ...rest) -> a; g(1, 2, 3)"), Value::Int(1));
+    }
+
+    /// `...rest` is an empty list when no arguments are left for it.
+    #[test]
+    fn rest_parameter_is_empty_without_extras() {
+        assert_eq!(eval("g(a, ...rest) -> rest; g(1)"), Value::list(vec![]));
+    }
+
+    /// A `...rest` signature accepts any argument count at or above the fixed
+    /// parameters; fewer is still an error.
+    #[test]
+    fn rest_parameter_arity_lower_bound() {
+        assert!(matches!(
+            eval_err("g(a, ...rest) -> a; g()"),
+            VmError::WrongArgCount
+        ));
+    }
+
     #[test]
     fn unknown_function_is_an_error() {
         let cst = parse_source("nope(1)").expect("parse");
@@ -1067,6 +1075,30 @@ mod tests {
         );
     }
 
+    /// A nested destructure with its own rest binds recursively: in `[a, [...b, c]]`
+    /// the inner list splits into a rest `b` and a trailing `c`.
+    #[test]
+    fn destructure_nested_with_inner_rest() {
+        assert_eq!(
+            eval("[a, [...b, c]] = [1, [2, 5, 3]]; [a, b, c]"),
+            Value::list(vec![
+                Value::Int(1),
+                Value::list(vec![Value::Int(2), Value::Int(5)]),
+                Value::Int(3),
+            ])
+        );
+    }
+
+    /// The rest binder may itself be a nested destructure: `[a, ...[b, c]]` binds
+    /// `a` from the front, then unpacks the middle list into `[b, c]`.
+    #[test]
+    fn destructure_rest_binder_into_nested() {
+        assert_eq!(
+            eval("[a, ...[b, c]] = [1, 2, 3]; [a, b, c]"),
+            Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+        );
+    }
+
     /// Without a rest binder the lengths must match exactly.
     #[test]
     fn destructure_arity_mismatch_is_an_error() {
@@ -1084,15 +1116,6 @@ mod tests {
     #[test]
     fn destructure_non_list_is_an_error() {
         assert!(matches!(eval_err("[a] = 5"), VmError::ExpectedList));
-    }
-
-    /// A literal in a destructuring pattern is not an assignable target.
-    #[test]
-    fn destructure_literal_target_is_an_error() {
-        assert!(matches!(
-            eval_err("[a, 1] = [1, 2]"),
-            VmError::NotAssignable
-        ));
     }
 
     /// `var('test') = 7` binds the variable named by the string. It is a single
@@ -1272,32 +1295,30 @@ mod tests {
         );
     }
 
-    /// `~` is a match operator, not a writable address, so it cannot be assigned.
+    /// `if(cond, a, b) = v` assigns through whichever bound argument the call
+    /// selects — Scarpet's dynamic l-value, lowered to a `Computed` target. A true
+    /// condition binds `a` (leaving `b` untouched), a false one binds `b`.
     #[test]
-    fn match_operator_is_not_an_assignment_target() {
-        assert!(matches!(
-            eval_err("x = [1, 2]; x ~ 1 = 9"),
-            VmError::NotAssignable
-        ));
+    fn computed_call_target_assigns_through_if() {
+        assert_eq!(
+            eval("if(1, a, b) = 5; [a, b]"),
+            Value::list(vec![Value::Int(5), Value::Undef])
+        );
+        assert_eq!(
+            eval("if(0, a, b) = 5; [a, b]"),
+            Value::list(vec![Value::Undef, Value::Int(5)])
+        );
     }
 
-    /// An l-value-returning function call (`if(...) = …`) is not a supported target.
+    /// A computed call target also drives a compound `+=`: `if(c, a, b) += v`
+    /// updates whichever variable the condition selects — the idiom from
+    /// `world_map.sc` (`if(…, loot_rooms, shulker_rooms) += …`).
     #[test]
-    fn lvalue_returning_call_is_not_a_target() {
-        assert!(matches!(
-            eval_err("if(1, a, b) = 5"),
-            VmError::NotAssignable
-        ));
-    }
-
-    /// A non-assignable left side — a literal, an operator expression, or a
-    /// parenthesised expression — lowers fine now (the target is a general
-    /// expression) but is rejected at evaluation, where l-value checking moved.
-    #[test]
-    fn non_assignable_targets_are_rejected_at_eval() {
-        assert!(matches!(eval_err("1 = 2"), VmError::NotAssignable));
-        assert!(matches!(eval_err("a + b = c"), VmError::NotAssignable));
-        assert!(matches!(eval_err("(a) = b"), VmError::NotAssignable));
+    fn computed_call_target_compound_add() {
+        assert_eq!(
+            eval("a = 10; b = 20; if(1, a, b) += 5; [a, b]"),
+            Value::list(vec![Value::Int(15), Value::Int(20)])
+        );
     }
 
     /// `[a, b] += [1, 2]` reads the pattern as an r-value and adds element-wise.

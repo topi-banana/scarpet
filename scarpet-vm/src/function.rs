@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use scarpet_syntax::ast::{Args, Assignable, Expr, Patterns};
+use scarpet_syntax::ast::{Args, Expr, Params};
 
 use crate::{
     Value,
@@ -171,36 +171,33 @@ impl<'src> Function<'src> for Range {
     }
 }
 
-/// A user-defined function: its parameter names and its body AST. `call` runs
-/// the body in a fresh variable scope with the parameters bound to the args.
+/// A user-defined function, lowered from a validated [`Params`] signature: the
+/// positional parameter names, the `outer(x)` captures (each a shared slot grabbed
+/// from the defining scope at definition time), the optional `...rest` name, and
+/// the body AST. `call` runs the body in a fresh scope with the captures injected
+/// and the arguments bound.
 pub struct DefFunction<'src> {
-    params: Vec<&'src str>,
+    fixed: Vec<&'src str>,
+    captures: Vec<(&'src str, ValueContainer)>,
+    rest: Option<&'src str>,
     body: Box<Expr<'src>>,
 }
 
 impl<'src> DefFunction<'src> {
-    /// Build from an `Expr::Def`'s parameter list and body. Each parameter must
-    /// be a plain variable name; anything richer (literal patterns, `...rest`,
-    /// `outer(x)`) is not modelled yet and yields `None`.
-    pub fn new(params: &Patterns<'src>, body: Box<Expr<'src>>) -> Option<Self> {
-        // A rest binder is unsupported for now; only a fixed list of plain
-        // binders is bound. Anything else (a destructure, an `outer(x)`
-        // capture, a literal pattern) also yields `None`.
-        if params.rest.is_some() {
-            return None;
-        }
-        let names = params
-            .before
-            .iter()
-            .map(|p| match p {
-                Assignable::Var(name) => Some(*name),
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>()?;
-        Some(Self {
-            params: names,
+    /// Build from an `Expr::Def`'s [`Params`], its already-resolved `outer(x)`
+    /// captures (the caller resolves them from the defining scope, where it has the
+    /// vm), and its body. Infallible: lowering has already validated the signature.
+    pub fn new(
+        params: &Params<'src>,
+        captures: Vec<(&'src str, ValueContainer)>,
+        body: Box<Expr<'src>>,
+    ) -> Self {
+        Self {
+            fixed: params.fixed.clone(),
+            captures,
+            rest: params.rest,
             body,
-        })
+        }
     }
 }
 
@@ -211,25 +208,38 @@ impl<'src> Function<'src> for DefFunction<'src> {
         args: Args<'src>,
     ) -> Result<ValueContainer, VmError> {
         let Args(codes) = args;
-        if codes.len() != self.params.len() {
+        // The fixed parameters must all be supplied; with a `...rest`, extra
+        // arguments are allowed (and collected), so the count is a lower bound.
+        let ok = match self.rest {
+            None => codes.len() == self.fixed.len(),
+            Some(_) => codes.len() >= self.fixed.len(),
+        };
+        if !ok {
             return Err(VmError::WrongArgCount);
         }
-        // A function body runs in its own VM over the same global state, with
-        // only the parameters bound. Scarpet functions do not see caller locals
-        // without `outer` / `global`, which are not modelled yet. Each parameter
-        // gets its own fresh slot holding a copy of the argument's value, so the
-        // body cannot reach back and mutate a caller variable passed by name.
-        //
-        // The arguments are evaluated here, in the caller's scope, before the
-        // child exists: `inner` borrows `vm`, so `vm.push` is unavailable once
-        // it does.
-        let values = codes
+        // Arguments are evaluated here, in the caller's scope, before the child
+        // exists (`inner` borrows `vm`, so `vm.push` is unavailable once it does).
+        let mut values = codes
             .into_iter()
             .map(|arg| Ok(vm.push(arg)?.lock()?.clone()))
             .collect::<Result<Vec<Value>, VmError>>()?;
+        // Everything past the fixed parameters is the rest (an empty list when the
+        // function has a `...rest` but no extra arguments were passed).
+        let rest_values = values.split_off(self.fixed.len());
+
+        // The body runs in its own VM over the same global state. `outer(x)`
+        // captures are injected as the *shared* defining-scope slots, so the body
+        // sees and can update them; the parameters get fresh slots holding a copy
+        // of each argument, so the body cannot reach back into a caller local.
         let mut inner = vm.child();
-        for (name, value) in self.params.iter().zip(values) {
+        for (name, slot) in &self.captures {
+            inner.bind(name, slot.clone());
+        }
+        for (name, value) in self.fixed.iter().zip(values) {
             *inner.get_var(name).lock()? = value;
+        }
+        if let Some(rest) = self.rest {
+            *inner.get_var(rest).lock()? = Value::list(rest_values);
         }
         inner.push((*self.body).clone())
     }
