@@ -1,3 +1,5 @@
+use std::fmt;
+
 /// An error raised while evaluating Scarpet code.
 #[derive(Debug)]
 pub enum VmError {
@@ -60,4 +62,81 @@ pub enum VmError {
     /// an I/O error. The process's stdout can fail (a broken pipe); the
     /// playground's in-memory capture buffer never does.
     StdoutWrite,
+}
+
+impl fmt::Display for VmError {
+    /// A short, human-readable message — what a tool surfaces to the user (the
+    /// REPL on stderr, the playground in its diagnostics strip) instead of the
+    /// terse `Debug` variant name. Wording follows the original fabric-carpet
+    /// `InternalExpressionException` messages where there is a counterpart.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            VmError::PoisonedLock => "a value's lock was poisoned",
+            VmError::IncomparableMap => "cannot compare with a map value",
+            VmError::ExpectedNumber => "operand has to be of a numeric type",
+            VmError::DivisionByZero => "division by zero",
+            VmError::MapEntryNotPair => "map constructor requires elements that have two items",
+            VmError::InvalidPattern => "incorrect matching pattern",
+            VmError::UnknownFunction => "unknown function",
+            VmError::WrongArgCount => "wrong number of arguments for a function",
+            VmError::UnsupportedParameter => "unsupported function parameter",
+            VmError::ExpectedList => "right-hand side of a destructuring assignment is not a list",
+            VmError::TooManyValuesToUnpack => "too many values to unpack",
+            VmError::TooFewValuesToUnpack => "too few values to unpack",
+            VmError::NotAssignable => "left-hand side is not a valid assignment target",
+            VmError::NotAContainer => "cannot address an element of a non-container value",
+            VmError::ImmutableList => "cannot modify an immutable list",
+            VmError::IndexOutOfRange => "index out of range",
+            VmError::StdoutWrite => "failed to write to standard output",
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for VmError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every variant renders a non-empty, lower-case message (no `Debug` variant
+    /// names leaking through) — what the REPL and playground show the user.
+    #[test]
+    fn display_is_human_readable() {
+        // A representative spread across the error groups.
+        assert_eq!(VmError::UnknownFunction.to_string(), "unknown function");
+        assert_eq!(VmError::DivisionByZero.to_string(), "division by zero");
+        assert_eq!(
+            VmError::StdoutWrite.to_string(),
+            "failed to write to standard output"
+        );
+        // None should be empty or start with an upper-case ASCII letter (which
+        // would betray a stray `Debug` variant name).
+        for err in [
+            VmError::PoisonedLock,
+            VmError::IncomparableMap,
+            VmError::ExpectedNumber,
+            VmError::DivisionByZero,
+            VmError::MapEntryNotPair,
+            VmError::InvalidPattern,
+            VmError::UnknownFunction,
+            VmError::WrongArgCount,
+            VmError::UnsupportedParameter,
+            VmError::ExpectedList,
+            VmError::TooManyValuesToUnpack,
+            VmError::TooFewValuesToUnpack,
+            VmError::NotAssignable,
+            VmError::NotAContainer,
+            VmError::ImmutableList,
+            VmError::IndexOutOfRange,
+            VmError::StdoutWrite,
+        ] {
+            let msg = err.to_string();
+            assert!(!msg.is_empty(), "{err:?} has an empty message");
+            assert!(
+                !msg.chars().next().unwrap().is_ascii_uppercase(),
+                "{err:?} message should read as a phrase, got {msg:?}"
+            );
+        }
+    }
 }

@@ -448,14 +448,15 @@ fn handle_submission(vm: &mut ScarpetVm<'_, 'static>, name: &str, src: &'static 
     match check_line(src) {
         Checked::Blank => {}
         // Evaluate in the session VM and print the value (still its `Debug`
-        // form). A `VmError` — or a poisoned value lock — is reported without
-        // tearing the REPL down, so the next prompt still has the same VM.
+        // form). A `VmError` — or a poisoned value lock — is reported by its
+        // human-readable `Display`, without tearing the REPL down, so the next
+        // prompt still has the same VM.
         Checked::Ast(ast) => match vm.push(ast) {
             Ok(value) => match value.lock() {
                 Ok(v) => println!("{v:?}"),
-                Err(e) => eprintln!("repl: {e:?}"),
+                Err(e) => eprintln!("repl: {e}"),
             },
-            Err(e) => eprintln!("repl: {e:?}"),
+            Err(e) => eprintln!("repl: {e}"),
         },
         Checked::Parse(e) => report_parse_error(name, src, &e),
         Checked::Lower(e) => report_lower_error(name, src, &e),

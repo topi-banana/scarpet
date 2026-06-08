@@ -198,10 +198,11 @@ impl App {
                 self.diagnostics = Vec::new();
             }
             // A runtime error: keep any output produced before it, and surface
-            // the error itself in the diagnostics strip.
+            // the error itself (its human-readable `Display`) in the diagnostics
+            // strip below the output — both sit in the output pane.
             Err(err) => {
                 self.output = printed;
-                self.diagnostics = vec![format!("{err:?}")];
+                self.diagnostics = vec![err.to_string()];
                 self.diagnostics_title = "Runtime error";
             }
         }
