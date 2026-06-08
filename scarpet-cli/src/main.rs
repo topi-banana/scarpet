@@ -700,10 +700,15 @@ mod tests {
 
     #[test]
     fn repl_reports_lowering_errors() {
-        // These parse, but cannot be lowered: assigning to a literal or to an
-        // operator expression is not a valid target.
-        assert!(matches!(check_line("1 = 2"), Checked::Lower(_)));
-        assert!(matches!(check_line("a + b = c"), Checked::Lower(_)));
+        // These parse, but cannot be lowered: a top-level comma has no `;`-level
+        // to land in, and two `...rest` binders share one parameter list. (A
+        // non-assignable target like `1 = 2` now lowers and fails at evaluation
+        // instead.)
+        assert!(matches!(check_line("a, b"), Checked::Lower(_)));
+        assert!(matches!(
+            check_line("f(...a, ...b) -> 0"),
+            Checked::Lower(_)
+        ));
     }
 
     #[test]
