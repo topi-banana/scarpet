@@ -268,6 +268,8 @@ impl App {
             let select: HtmlSelectElement = e.target_unchecked_into();
             Msg::SetLineEnding(match select.value().as_str() {
                 "crlf" => LineEnding::Crlf,
+                "auto" => LineEnding::Auto,
+                "native" => LineEnding::Native,
                 _ => LineEnding::Lf,
             })
         });
@@ -306,6 +308,8 @@ impl App {
                     <select class={sel} onchange={on_line_ending}>
                         <option value="lf" selected={self.config.line_ending == LineEnding::Lf}>{ "LF" }</option>
                         <option value="crlf" selected={self.config.line_ending == LineEnding::Crlf}>{ "CRLF" }</option>
+                        <option value="auto" selected={self.config.line_ending == LineEnding::Auto}>{ "Auto" }</option>
+                        <option value="native" selected={self.config.line_ending == LineEnding::Native}>{ "Native" }</option>
                     </select>
                 </label>
                 <label class={lbl}>
