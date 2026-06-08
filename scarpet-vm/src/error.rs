@@ -32,9 +32,6 @@ pub enum VmError {
     /// A function was called with the wrong number of arguments for its
     /// parameter list.
     WrongArgCount,
-    /// A function definition used a parameter that is not a plain variable
-    /// (literal patterns, `...rest`, `outer(x)` are not modelled yet).
-    UnsupportedParameter,
     /// The right-hand side of a destructuring assignment (`[a, b] = …`) was not a
     /// list, so it cannot be unpacked.
     ExpectedList,
@@ -79,7 +76,6 @@ impl fmt::Display for VmError {
             VmError::InvalidPattern => "incorrect matching pattern",
             VmError::UnknownFunction => "unknown function",
             VmError::WrongArgCount => "wrong number of arguments for a function",
-            VmError::UnsupportedParameter => "unsupported function parameter",
             VmError::ExpectedList => "right-hand side of a destructuring assignment is not a list",
             VmError::TooManyValuesToUnpack => "too many values to unpack",
             VmError::TooFewValuesToUnpack => "too few values to unpack",
@@ -121,7 +117,6 @@ mod tests {
             VmError::InvalidPattern,
             VmError::UnknownFunction,
             VmError::WrongArgCount,
-            VmError::UnsupportedParameter,
             VmError::ExpectedList,
             VmError::TooManyValuesToUnpack,
             VmError::TooFewValuesToUnpack,

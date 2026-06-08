@@ -715,15 +715,13 @@ mod tests {
 
     #[test]
     fn repl_reports_lowering_errors() {
-        // These parse, but cannot be lowered: a top-level comma has no `;`-level
-        // to land in, and two `...rest` binders share one parameter list. (A
-        // non-assignable target like `1 = 2` now lowers and fails at evaluation
-        // instead.)
+        // These parse, but cannot be lowered: a top-level comma has no `;`-level to
+        // land in, two `...rest` binders share one destructuring level, and a
+        // non-assignable target is rejected up front (l-value validity moved to
+        // lowering).
         assert!(matches!(check_line("a, b"), Checked::Lower(_)));
-        assert!(matches!(
-            check_line("f(...a, ...b) -> 0"),
-            Checked::Lower(_)
-        ));
+        assert!(matches!(check_line("[...a, ...b] = t"), Checked::Lower(_)));
+        assert!(matches!(check_line("1 = 2"), Checked::Lower(_)));
     }
 
     #[test]

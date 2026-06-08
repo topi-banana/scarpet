@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use scarpet_syntax::ast::{Args, Assignable, Expr, Patterns};
+use scarpet_syntax::ast::{Args, Expr, Params};
 
 use crate::{
     Value,
@@ -31,6 +31,7 @@ pub(crate) fn register_builtins(state: &mut GlobalState<'_>) {
     state.register("call", Rc::new(Call));
     state.register("if", Rc::new(If));
     state.register("range", Rc::new(Range));
+    state.register("for", Rc::new(For));
 }
 
 /// Evaluate the single argument of a one-arity builtin.
@@ -41,7 +42,7 @@ fn arg1<'src>(
     if args.len() != 1 {
         return Err(VmError::WrongArgCount);
     }
-    vm.push(args.pop().unwrap())
+    vm.push(args.pop_front().unwrap())
 }
 
 /// `type(x)` — the value's type name (the original `type`).
@@ -98,13 +99,13 @@ impl<'src> Function<'src> for Call {
         args: Args<'src>,
     ) -> Result<ValueContainer, VmError> {
         let Args(mut codes) = args;
-        if codes.is_empty() {
+        let Some(arg) = codes.pop_front() else {
             return Err(VmError::WrongArgCount);
-        }
+        };
         // The first argument names the function to call. The original `call`
         // also accepts a first-class function value, but this VM has no
         // function-value type yet, so only a string name resolves to a callable.
-        let Value::String(name) = vm.push(codes.remove(0))?.lock()?.clone() else {
+        let Value::String(name) = vm.push(arg)?.lock()?.clone() else {
             return Err(VmError::UnknownFunction);
         };
         let Some(function) = vm.function(&name) else {
@@ -121,18 +122,14 @@ impl<'src> Function<'src> for If {
         vm: &mut ScarpetVm<'_, 'src>,
         Args(mut args): Args<'src>,
     ) -> Result<ValueContainer, VmError> {
-        args.reverse();
-        let Some(res) = args.pop() else {
-            return Err(VmError::WrongArgCount);
-        };
-        let if_true = args.pop();
-        let if_false = args.pop();
-        if vm.push(res)?.lock()?.is_true() {
-            if let Some(expr) = if_true {
+        while let Some(cord) = args.pop_front() {
+            let value = vm.push(cord);
+            let Some(expr) = args.pop_front() else {
+                return value;
+            };
+            if value?.lock()?.is_true() {
                 return vm.push(expr);
             }
-        } else if let Some(expr) = if_false {
-            return vm.push(expr);
         }
         Ok(ValueContainer::null())
     }
@@ -171,36 +168,70 @@ impl<'src> Function<'src> for Range {
     }
 }
 
-/// A user-defined function: its parameter names and its body AST. `call` runs
-/// the body in a fresh variable scope with the parameters bound to the args.
+/// `for(list, expr(_, _i))` — evaluate `expr` once per element of `list`, with
+/// `_` bound to the element and `_i` to its index, returning how many times `expr`
+/// was truthy (the original `for`). The body runs in the *current* scope, so a
+/// `sum += _` accumulates outside the loop; `_` / `_i` are ordinary slots set each
+/// iteration. A lazy `range` is walked element by element, so a huge range is not
+/// realised up front. (`break` / `continue` are not modelled yet.)
+struct For;
+impl<'src> Function<'src> for For {
+    fn call(
+        &self,
+        vm: &mut ScarpetVm<'_, 'src>,
+        Args(mut args): Args<'src>,
+    ) -> Result<ValueContainer, VmError> {
+        if args.len() != 2 {
+            return Err(VmError::WrongArgCount);
+        }
+        let list = args.pop_front().expect("checked len == 2");
+        let expr = args.pop_front().expect("checked len == 2");
+        // Evaluate the list once; a lazy backing (a `range`) clones cheaply and is
+        // still walked one element at a time below.
+        let Value::List(items) = vm.push(list)?.lock()?.clone() else {
+            return Err(VmError::ExpectedList);
+        };
+        let mut count: i64 = 0;
+        for i in 0..items.len() {
+            let Some(element) = items.get(i) else { break };
+            // Bind `_` / `_i` in the current scope, then evaluate the body there.
+            *vm.get_var("_").lock()? = element;
+            *vm.get_var("_i").lock()? = Value::Int(i as i64);
+            if vm.push(expr.clone())?.lock()?.is_true() {
+                count += 1;
+            }
+        }
+        Ok(ValueContainer::int(count))
+    }
+}
+
+/// A user-defined function, lowered from a validated [`Params`] signature: the
+/// positional parameter names, the `outer(x)` captures (each a shared slot grabbed
+/// from the defining scope at definition time), the optional `...rest` name, and
+/// the body AST. `call` runs the body in a fresh scope with the captures injected
+/// and the arguments bound.
 pub struct DefFunction<'src> {
-    params: Vec<&'src str>,
+    fixed: Vec<&'src str>,
+    captures: Vec<(&'src str, ValueContainer)>,
+    rest: Option<&'src str>,
     body: Box<Expr<'src>>,
 }
 
 impl<'src> DefFunction<'src> {
-    /// Build from an `Expr::Def`'s parameter list and body. Each parameter must
-    /// be a plain variable name; anything richer (literal patterns, `...rest`,
-    /// `outer(x)`) is not modelled yet and yields `None`.
-    pub fn new(params: &Patterns<'src>, body: Box<Expr<'src>>) -> Option<Self> {
-        // A rest binder is unsupported for now; only a fixed list of plain
-        // binders is bound. Anything else (a destructure, an `outer(x)`
-        // capture, a literal pattern) also yields `None`.
-        if params.rest.is_some() {
-            return None;
-        }
-        let names = params
-            .before
-            .iter()
-            .map(|p| match p {
-                Assignable::Var(name) => Some(*name),
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>()?;
-        Some(Self {
-            params: names,
+    /// Build from an `Expr::Def`'s [`Params`], its already-resolved `outer(x)`
+    /// captures (the caller resolves them from the defining scope, where it has the
+    /// vm), and its body. Infallible: lowering has already validated the signature.
+    pub fn new(
+        params: &Params<'src>,
+        captures: Vec<(&'src str, ValueContainer)>,
+        body: Box<Expr<'src>>,
+    ) -> Self {
+        Self {
+            fixed: params.fixed.clone(),
+            captures,
+            rest: params.rest,
             body,
-        })
+        }
     }
 }
 
@@ -211,25 +242,38 @@ impl<'src> Function<'src> for DefFunction<'src> {
         args: Args<'src>,
     ) -> Result<ValueContainer, VmError> {
         let Args(codes) = args;
-        if codes.len() != self.params.len() {
+        // The fixed parameters must all be supplied; with a `...rest`, extra
+        // arguments are allowed (and collected), so the count is a lower bound.
+        let ok = match self.rest {
+            None => codes.len() == self.fixed.len(),
+            Some(_) => codes.len() >= self.fixed.len(),
+        };
+        if !ok {
             return Err(VmError::WrongArgCount);
         }
-        // A function body runs in its own VM over the same global state, with
-        // only the parameters bound. Scarpet functions do not see caller locals
-        // without `outer` / `global`, which are not modelled yet. Each parameter
-        // gets its own fresh slot holding a copy of the argument's value, so the
-        // body cannot reach back and mutate a caller variable passed by name.
-        //
-        // The arguments are evaluated here, in the caller's scope, before the
-        // child exists: `inner` borrows `vm`, so `vm.push` is unavailable once
-        // it does.
-        let values = codes
+        // Arguments are evaluated here, in the caller's scope, before the child
+        // exists (`inner` borrows `vm`, so `vm.push` is unavailable once it does).
+        let mut values = codes
             .into_iter()
             .map(|arg| Ok(vm.push(arg)?.lock()?.clone()))
             .collect::<Result<Vec<Value>, VmError>>()?;
+        // Everything past the fixed parameters is the rest (an empty list when the
+        // function has a `...rest` but no extra arguments were passed).
+        let rest_values = values.split_off(self.fixed.len());
+
+        // The body runs in its own VM over the same global state. `outer(x)`
+        // captures are injected as the *shared* defining-scope slots, so the body
+        // sees and can update them; the parameters get fresh slots holding a copy
+        // of each argument, so the body cannot reach back into a caller local.
         let mut inner = vm.child();
-        for (name, value) in self.params.iter().zip(values) {
+        for (name, slot) in &self.captures {
+            inner.bind(name, slot.clone());
+        }
+        for (name, value) in self.fixed.iter().zip(values) {
             *inner.get_var(name).lock()? = value;
+        }
+        if let Some(rest) = self.rest {
+            *inner.get_var(rest).lock()? = Value::list(rest_values);
         }
         inner.push((*self.body).clone())
     }

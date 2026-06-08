@@ -61,13 +61,17 @@ enum Msg {
     Noop,
 }
 
-/// A small (deliberately unformatted) sample so the playground does something on
-/// first load. Runs under `scarpet-vm` as-is — `Run` prints the two lines — and
-/// is loosely spaced so `Format` has a visible effect too.
+/// A small sample so the playground does something on first load. Runs under
+/// `scarpet-vm` as-is — `Run` prints the two `fib` lines and the FizzBuzz
+/// sequence for 1..20 — and the long, multi-branch `if` kept on one line gives
+/// `Format` a visible effect too.
 const SAMPLE: &str = "// Scarpet sample — hit Run, Format, Syntax tree, or AST.
 fib(n) -> if(n < 2, n, fib(n-1)+fib(n-2));
 print('fib(10) = '+fib(10));
-print('fib(20) = '+fib(20))
+print('fib(20) = '+fib(20));
+
+fizzbuzz(n) -> for(range(1, n + 1), if(_ % 15 == 0, print('FizzBuzz'), _ % 3 == 0, print('Fizz'), _ % 5 == 0, print('Buzz'), print(_)));
+fizzbuzz(20)
 ";
 
 /// Shared base classes for the toolbar buttons.
