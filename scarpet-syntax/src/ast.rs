@@ -43,6 +43,8 @@
 //! Every borrowed `&'s str` points back into the original source, exactly as in
 //! the [`Cst`]; lowering allocates only the `Vec`/`Box` spine.
 
+use std::collections::VecDeque;
+
 use crate::parser::{BinOp, Cst, CstKind, UnaryOp};
 
 // ====================================================================
@@ -53,7 +55,7 @@ use crate::parser::{BinOp, Cst, CstKind, UnaryOp};
 /// body, and the program root (the grammar's `top`). Each element is a full
 /// [`Code`] (statement sequence), so `[a; b, c]` is two elements `a; b` and `c`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Args<'s>(pub Vec<Code<'s>>);
+pub struct Args<'s>(pub VecDeque<Code<'s>>);
 
 /// `;`-separated statement sequence; the value is the last [`Expr`]. A lone
 /// expression is a one-element `Code`.
@@ -452,7 +454,7 @@ impl std::error::Error for LowerError {}
 impl<'a, 's> TryFrom<&'a Cst<'s>> for Args<'s> {
     type Error = LowerError;
     fn try_from(cst: &'a Cst<'s>) -> Result<Self, LowerError> {
-        let mut codes = Vec::new();
+        let mut codes = VecDeque::new();
         collect_comma(cst, &mut codes)?;
         Ok(Args(codes))
     }
@@ -464,12 +466,12 @@ impl<'a, 's> TryFrom<&'a Cst<'s>> for Args<'s> {
 impl<'a, 's> TryFrom<&'a [Cst<'s>]> for Args<'s> {
     type Error = LowerError;
     fn try_from(items: &'a [Cst<'s>]) -> Result<Self, LowerError> {
-        let mut codes = Vec::with_capacity(items.len());
+        let mut codes = VecDeque::with_capacity(items.len());
         for item in items {
             if matches!(item.kind, CstKind::Empty) {
                 continue;
             }
-            codes.push(Code::try_from(item)?);
+            codes.push_back(Code::try_from(item)?);
         }
         Ok(Args(codes))
     }
@@ -477,7 +479,7 @@ impl<'a, 's> TryFrom<&'a [Cst<'s>]> for Args<'s> {
 
 /// Walk a left-nested `,` chain left-to-right, lowering each operand to a
 /// [`Code`]. A non-`,` node is the single operand.
-fn collect_comma<'s>(cst: &Cst<'s>, out: &mut Vec<Code<'s>>) -> Result<(), LowerError> {
+fn collect_comma<'s>(cst: &Cst<'s>, out: &mut VecDeque<Code<'s>>) -> Result<(), LowerError> {
     if let CstKind::Binary {
         op: BinOp::Comma,
         lhs,
@@ -485,9 +487,9 @@ fn collect_comma<'s>(cst: &Cst<'s>, out: &mut Vec<Code<'s>>) -> Result<(), Lower
     } = &cst.kind
     {
         collect_comma(lhs, out)?;
-        out.push(Code::try_from(rhs.as_ref())?);
+        out.push_back(Code::try_from(rhs.as_ref())?);
     } else {
-        out.push(Code::try_from(cst)?);
+        out.push_back(Code::try_from(cst)?);
     }
     Ok(())
 }

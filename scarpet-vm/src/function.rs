@@ -41,7 +41,7 @@ fn arg1<'src>(
     if args.len() != 1 {
         return Err(VmError::WrongArgCount);
     }
-    vm.push(args.pop().unwrap())
+    vm.push(args.pop_front().unwrap())
 }
 
 /// `type(x)` — the value's type name (the original `type`).
@@ -98,13 +98,13 @@ impl<'src> Function<'src> for Call {
         args: Args<'src>,
     ) -> Result<ValueContainer, VmError> {
         let Args(mut codes) = args;
-        if codes.is_empty() {
+        let Some(arg) = codes.pop_front() else {
             return Err(VmError::WrongArgCount);
-        }
+        };
         // The first argument names the function to call. The original `call`
         // also accepts a first-class function value, but this VM has no
         // function-value type yet, so only a string name resolves to a callable.
-        let Value::String(name) = vm.push(codes.remove(0))?.lock()?.clone() else {
+        let Value::String(name) = vm.push(arg)?.lock()?.clone() else {
             return Err(VmError::UnknownFunction);
         };
         let Some(function) = vm.function(&name) else {
@@ -121,18 +121,14 @@ impl<'src> Function<'src> for If {
         vm: &mut ScarpetVm<'_, 'src>,
         Args(mut args): Args<'src>,
     ) -> Result<ValueContainer, VmError> {
-        args.reverse();
-        let Some(res) = args.pop() else {
-            return Err(VmError::WrongArgCount);
-        };
-        let if_true = args.pop();
-        let if_false = args.pop();
-        if vm.push(res)?.lock()?.is_true() {
-            if let Some(expr) = if_true {
+        while let Some(cord) = args.pop_front() {
+            let value = vm.push(cord);
+            let Some(expr) = args.pop_front() else {
+                return value;
+            };
+            if value?.lock()?.is_true() {
                 return vm.push(expr);
             }
-        } else if let Some(expr) = if_false {
-            return vm.push(expr);
         }
         Ok(ValueContainer::null())
     }
