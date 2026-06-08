@@ -83,7 +83,8 @@ struct ConfigFile {
     max_width: Option<usize>,
     /// Target maximum comment width. `-1` disables comment wrapping.
     comment_width: Option<isize>,
-    /// Line ending for inserted breaks: `"lf"` (default) or `"crlf"`.
+    /// Line ending for inserted breaks: `"lf"` (default), `"crlf"`, `"auto"`
+    /// (match the source), or `"native"` (the host platform's).
     line_ending: Option<String>,
     /// Opening-delimiter placement for broken blocks: `"same_line"` (default)
     /// or `"next_line"`.
@@ -120,9 +121,11 @@ fn parse_config(text: &str, name: &str) -> Result<Config, String> {
         None => default.line_ending,
         Some("lf") => LineEnding::Lf,
         Some("crlf") => LineEnding::Crlf,
+        Some("auto") => LineEnding::Auto,
+        Some("native") => LineEnding::Native,
         Some(other) => {
             return Err(format!(
-                "{name}: line_ending must be \"lf\" or \"crlf\", got {other:?}"
+                "{name}: line_ending must be \"lf\", \"crlf\", \"auto\", or \"native\", got {other:?}"
             ));
         }
     };
@@ -616,6 +619,18 @@ mod tests {
     fn parse_config_reads_crlf() {
         let cfg = parse_config("line_ending = \"crlf\"", "x").unwrap();
         assert_eq!(cfg.line_ending, LineEnding::Crlf);
+    }
+
+    #[test]
+    fn parse_config_reads_auto_line_ending() {
+        let cfg = parse_config("line_ending = \"auto\"", "x").unwrap();
+        assert_eq!(cfg.line_ending, LineEnding::Auto);
+    }
+
+    #[test]
+    fn parse_config_reads_native_line_ending() {
+        let cfg = parse_config("line_ending = \"native\"", "x").unwrap();
+        assert_eq!(cfg.line_ending, LineEnding::Native);
     }
 
     #[test]
