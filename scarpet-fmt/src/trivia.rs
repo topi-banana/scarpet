@@ -29,6 +29,13 @@ pub fn has_blank_before(leading: &[Trivia]) -> bool {
         >= 2
 }
 
+/// Whether `leading` contains any comment (same-line or own-line). Used to keep
+/// a binary operator in tail position when its RHS carries a comment, since the
+/// operator's leading trivia rebinds to the RHS on re-parse.
+pub fn has_comment(leading: &[Trivia]) -> bool {
+    leading.iter().any(|t| matches!(t, Trivia::Comment(_)))
+}
+
 /// The same-line trailing comment at the very head of `leading`, if any: a
 /// comment with no preceding break was written on the previous token's line.
 pub fn same_line_comment<'s>(leading: &[Trivia<'s>]) -> Option<&'s str> {

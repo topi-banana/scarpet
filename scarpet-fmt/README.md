@@ -55,7 +55,7 @@ Three capabilities are intentionally absent today; several roadmap items below d
 
 ## Configuration today
 
-Six knobs, parsed from `scarpet-fmt.toml` by the CLI (TOML parsing lives in `scarpet-cli` so this crate stays file-I/O-free and `wasm`-clean):
+Seven knobs, parsed from `scarpet-fmt.toml` by the CLI (TOML parsing lives in `scarpet-cli` so this crate stays file-I/O-free and `wasm`-clean):
 
 | Config field | TOML key | Default | rustfmt analogue |
 | --- | --- | --- | --- |
@@ -65,6 +65,7 @@ Six knobs, parsed from `scarpet-fmt.toml` by the CLI (TOML parsing lives in `sca
 | `line_ending` | `line_ending` | `"lf"` | `newline_style` (`lf` / `crlf` / `auto` / `native`) |
 | `brace_style` | `brace_style` | `"same_line"` | partial `brace_style` / `indent_style` |
 | `trailing_comma` | `trailing_comma` | `"vertical"` | `trailing_comma` (`vertical` / `always` / `never`) |
+| `binop_separator` | `binop_separator` | `"back"` | `binop_separator` (`back` / `front`; rustfmt defaults `front`) |
 
 Everything else about the layout is currently fixed. The roadmap is to make the fixed choices configurable, matching rustfmt wherever an option has a Scarpet analogue.
 
@@ -96,7 +97,7 @@ Legend: ✅ done · 🟡 planned (has a Scarpet analogue) · ⬜ out of scope (R
 | `tab_spaces` | ✅ | `indent_width` |
 | `hard_tabs` | 🟡 | needs tab rendering |
 | `indent_style` | 🟡 | `Block` done; `Visual` needs `Align` |
-| `binop_separator` | 🟡 | operator wrap position; currently `Back`-only (rustfmt defaults `Front`) |
+| `binop_separator` | ✅ | `back` (default) / `front`; assignment-likes always `back`; rustfmt defaults `front` |
 | `space_after_colon` / `space_before_colon` | 🟡 | spacing around the `:` (get) operator; currently tight |
 | `struct_field_align_threshold` | 🟡 | align map `->` values (needs `Align`) |
 
@@ -171,7 +172,7 @@ Enabling work the rest depends on:
 
 ### Phase 1 — High-value width & comma knobs
 
-`use_small_heuristics` + `fn_call_width` / `array_width` / `struct_lit_width`; `binop_separator`; `overflow_delimited_expr`; `blank_lines_upper_bound` / `blank_lines_lower_bound`. Direct analogues, common in the corpus, low risk.
+`use_small_heuristics` + `fn_call_width` / `array_width` / `struct_lit_width`; `overflow_delimited_expr`; `blank_lines_upper_bound` / `blank_lines_lower_bound`. Direct analogues, common in the corpus, low risk.
 
 ### Phase 2 — Indentation & whitespace
 

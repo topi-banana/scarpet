@@ -97,6 +97,26 @@ pub enum TrailingComma {
     Never,
 }
 
+/// Where a binary operator sits when its expression wraps across lines.
+///
+/// The rough analogue of rustfmt's `binop_separator`. It applies only to the
+/// spaced operators (arithmetic, comparison, logical, and `~`); the
+/// assignment-like operators (`=`, `+=`, `<>`) always stay [`Back`](Self::Back)
+/// so their right-hand side keeps hugging the operator line. A flat expression
+/// that fits on one line is unaffected.
+///
+/// Note that rustfmt defaults this to `Front`; this crate defaults to
+/// [`Back`](Self::Back) to leave the original fixed style unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BinopSeparator {
+    /// Keep the operator at the tail of the line before the break — `a +` ⏎
+    /// `    b` (the default, reproducing the original fixed style).
+    #[default]
+    Back,
+    /// Move the operator to the head of the wrapped line — `a` ⏎ `    + b`.
+    Front,
+}
+
 /// Formatting style knobs, threaded through lowering and rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
@@ -113,6 +133,8 @@ pub struct Config {
     pub brace_style: BraceStyle,
     /// Whether the last item of a `()`/`[]`/`{}` carries a trailing comma.
     pub trailing_comma: TrailingComma,
+    /// Where a binary operator sits when its expression wraps across lines.
+    pub binop_separator: BinopSeparator,
 }
 
 impl Default for Config {
@@ -124,6 +146,7 @@ impl Default for Config {
             line_ending: LineEnding::Lf,
             brace_style: BraceStyle::SameLine,
             trailing_comma: TrailingComma::Vertical,
+            binop_separator: BinopSeparator::Back,
         }
     }
 }
@@ -186,5 +209,10 @@ mod tests {
     #[test]
     fn default_config_uses_vertical_trailing_comma() {
         assert_eq!(Config::default().trailing_comma, TrailingComma::Vertical);
+    }
+
+    #[test]
+    fn default_config_uses_back_binop_separator() {
+        assert_eq!(Config::default().binop_separator, BinopSeparator::Back);
     }
 }

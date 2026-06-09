@@ -18,3 +18,7 @@ brace_style = "same_line"
 # Trailing comma after the last item of a block: "vertical" (only when the block
 # breaks across lines), "always" (also on one-liners), or "never".
 trailing_comma = "vertical"
+# Where a wrapping binary operator sits: "back" (default, at the line's tail) or
+# "front" (the head of the wrapped line). Assignment-like operators (=, +=, <>)
+# always stay "back".
+binop_separator = "back"

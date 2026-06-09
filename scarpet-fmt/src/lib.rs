@@ -9,7 +9,7 @@ mod doc;
 mod lower;
 mod trivia;
 
-pub use config::{BraceStyle, Config, LineEnding, TrailingComma};
+pub use config::{BinopSeparator, BraceStyle, Config, LineEnding, TrailingComma};
 use scarpet_syntax::parser::{Cst, ParseError, parse_source};
 
 /// Format Scarpet source text. Parses, then renders per `config`.
@@ -151,7 +151,7 @@ mod tests {
 /// Round-trip the whole `example/` corpus to prove the formatter is safe.
 #[cfg(test)]
 mod corpus {
-    use crate::{BraceStyle, Config, TrailingComma, format_cst};
+    use crate::{BinopSeparator, BraceStyle, Config, TrailingComma, format_cst};
     use scarpet_syntax::parser::{parse_source, strip_trivia};
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
@@ -302,6 +302,24 @@ mod corpus {
         assert!(
             failures.is_empty(),
             "never-trailing-comma corpus round-trip failures ({}):\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// The same guarantee under `binop_separator = front`, which moves every
+    /// wrapping binary operator to the head of its line — the layout that most
+    /// stresses the operator-trivia rebinding the non-destructive proof guards.
+    #[test]
+    fn roundtrip_front_binop_separator_is_nondestructive_and_idempotent() {
+        let config = Config {
+            binop_separator: BinopSeparator::Front,
+            ..Config::default()
+        };
+        let failures = roundtrip_failures(&config);
+        assert!(
+            failures.is_empty(),
+            "front-binop-separator corpus round-trip failures ({}):\n{}",
             failures.len(),
             failures.join("\n")
         );
