@@ -6,7 +6,7 @@ use ariadne::{Label, Report, ReportKind, Source};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rustyline::error::ReadlineError;
 use rustyline::{DefaultEditor, EventHandler, KeyCode, KeyEvent, Modifiers};
-use scarpet_fmt::{BraceStyle, Config, FmtError, LineEnding, format_source};
+use scarpet_fmt::{BraceStyle, Config, FmtError, LineEnding, TrailingComma, format_source};
 use scarpet_syntax::ast::{Code, LowerError};
 use scarpet_syntax::parser::{ParseError, has_open_delimiter, parse_source};
 use scarpet_vm::{Evalute, GlobalState, ScarpetVm};
@@ -89,6 +89,9 @@ struct ConfigFile {
     /// Opening-delimiter placement for broken blocks: `"same_line"` (default)
     /// or `"next_line"`.
     brace_style: Option<String>,
+    /// Trailing comma after the last item of a block: `"vertical"` (default),
+    /// `"always"`, or `"never"`.
+    trailing_comma: Option<String>,
 }
 
 /// Resolve the formatting [`Config`]. An explicit `--config` path must exist
@@ -139,6 +142,17 @@ fn parse_config(text: &str, name: &str) -> Result<Config, String> {
             ));
         }
     };
+    let trailing_comma = match file.trailing_comma.as_deref() {
+        None => default.trailing_comma,
+        Some("vertical") => TrailingComma::Vertical,
+        Some("always") => TrailingComma::Always,
+        Some("never") => TrailingComma::Never,
+        Some(other) => {
+            return Err(format!(
+                "{name}: trailing_comma must be \"vertical\", \"always\", or \"never\", got {other:?}"
+            ));
+        }
+    };
     let config = Config {
         indent_width: file.indent.unwrap_or(default.indent_width),
         max_width: file.max_width.unwrap_or(default.max_width),
@@ -154,6 +168,7 @@ fn parse_config(text: &str, name: &str) -> Result<Config, String> {
         },
         line_ending,
         brace_style,
+        trailing_comma,
     };
     if config.max_width == 0 {
         return Err(format!("{name}: max_width must be at least 1"));
@@ -680,6 +695,32 @@ mod tests {
     fn parse_config_rejects_unknown_brace_style() {
         let err = parse_config("brace_style = \"allman\"", "x").unwrap_err();
         assert!(err.contains("brace_style"), "{err}");
+    }
+
+    #[test]
+    fn parse_config_defaults_trailing_comma_to_vertical() {
+        assert_eq!(
+            parse_config("", "x").unwrap().trailing_comma,
+            TrailingComma::Vertical
+        );
+    }
+
+    #[test]
+    fn parse_config_reads_always_trailing_comma() {
+        let cfg = parse_config("trailing_comma = \"always\"", "x").unwrap();
+        assert_eq!(cfg.trailing_comma, TrailingComma::Always);
+    }
+
+    #[test]
+    fn parse_config_reads_never_trailing_comma() {
+        let cfg = parse_config("trailing_comma = \"never\"", "x").unwrap();
+        assert_eq!(cfg.trailing_comma, TrailingComma::Never);
+    }
+
+    #[test]
+    fn parse_config_rejects_unknown_trailing_comma() {
+        let err = parse_config("trailing_comma = \"sometimes\"", "x").unwrap_err();
+        assert!(err.contains("trailing_comma"), "{err}");
     }
 
     #[test]

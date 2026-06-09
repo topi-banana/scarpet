@@ -9,7 +9,7 @@ mod doc;
 mod lower;
 mod trivia;
 
-pub use config::{BraceStyle, Config, LineEnding};
+pub use config::{BraceStyle, Config, LineEnding, TrailingComma};
 use scarpet_syntax::parser::{Cst, ParseError, parse_source};
 
 /// Format Scarpet source text. Parses, then renders per `config`.
@@ -151,7 +151,7 @@ mod tests {
 /// Round-trip the whole `example/` corpus to prove the formatter is safe.
 #[cfg(test)]
 mod corpus {
-    use crate::{BraceStyle, Config, format_cst};
+    use crate::{BraceStyle, Config, TrailingComma, format_cst};
     use scarpet_syntax::parser::{parse_source, strip_trivia};
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
@@ -267,6 +267,41 @@ mod corpus {
         assert!(
             failures.is_empty(),
             "next-line corpus round-trip failures ({}):\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// The same guarantee under `trailing_comma = always`, which adds a comma to
+    /// flat one-line collections too — the layout that departs furthest from the
+    /// default and so most needs the non-destructive + idempotent proof.
+    #[test]
+    fn roundtrip_always_trailing_comma_is_nondestructive_and_idempotent() {
+        let config = Config {
+            trailing_comma: TrailingComma::Always,
+            ..Config::default()
+        };
+        let failures = roundtrip_failures(&config);
+        assert!(
+            failures.is_empty(),
+            "always-trailing-comma corpus round-trip failures ({}):\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// The same guarantee under `trailing_comma = never`, which strips the comma
+    /// the default adds to a broken collection.
+    #[test]
+    fn roundtrip_never_trailing_comma_is_nondestructive_and_idempotent() {
+        let config = Config {
+            trailing_comma: TrailingComma::Never,
+            ..Config::default()
+        };
+        let failures = roundtrip_failures(&config);
+        assert!(
+            failures.is_empty(),
+            "never-trailing-comma corpus round-trip failures ({}):\n{}",
             failures.len(),
             failures.join("\n")
         );

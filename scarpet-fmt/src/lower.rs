@@ -13,7 +13,7 @@ use crate::doc::{
     space, text,
 };
 use crate::trivia::{has_blank_before, own_line_comments, same_line_comment};
-use crate::{BraceStyle, Config};
+use crate::{BraceStyle, Config, TrailingComma};
 
 /// Lower a whole program (the CST root) to a document.
 pub fn program(root: &Cst, config: &Config) -> Doc {
@@ -197,7 +197,7 @@ impl Lowerer<'_> {
         let body = self.comma_separated(&items.iter().collect::<Vec<_>>());
         group(concat([
             self.open_delim(open, hug),
-            nest(concat([softline(), body, if_break(text(","), nil())])),
+            nest(concat([softline(), body, self.trailing_comma()])),
             softline(),
             text(close),
         ]))
@@ -257,6 +257,20 @@ impl Lowerer<'_> {
             concat([softline(), text(open)])
         } else {
             text(open)
+        }
+    }
+
+    /// The trailing comma after the last item of a [`Lowerer::collection`], per
+    /// [`TrailingComma`]: only when broken (`Vertical`), in both layouts
+    /// (`Always`, so a flat `[1, 2,]` keeps its comma), or never (`Never`).
+    /// `Always` emits an unconditional comma rather than an `if_break`, so it
+    /// shows in the flat rendering too — that keeps the flat/broken fit decision,
+    /// and thus the output, idempotent.
+    fn trailing_comma(&self) -> Doc {
+        match self.config.trailing_comma {
+            TrailingComma::Vertical => if_break(text(","), nil()),
+            TrailingComma::Always => text(","),
+            TrailingComma::Never => nil(),
         }
     }
 }
@@ -359,7 +373,7 @@ fn unary_op_str(op: UnaryOp) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use crate::{BraceStyle, Config, format_source};
+    use crate::{BraceStyle, Config, TrailingComma, format_source};
 
     fn fmt(src: &str) -> String {
         format_source(src, &Config::default()).unwrap()
@@ -381,6 +395,17 @@ mod tests {
             src,
             &Config {
                 comment_width: Some(width),
+                ..Config::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn fmt_tc(src: &str, trailing_comma: TrailingComma) -> String {
+        format_source(
+            src,
+            &Config {
+                trailing_comma,
                 ..Config::default()
             },
         )
@@ -487,6 +512,57 @@ mod tests {
         }
         expected.push_str("]\n");
         assert_eq!(fmt(&src), expected);
+    }
+
+    // ---- trailing comma --------------------------------------------
+
+    #[test]
+    fn trailing_comma_vertical_matches_the_default() {
+        // `Vertical` is the default: a comma only when the collection breaks.
+        assert_eq!(fmt_tc("[1, 2, 3]", TrailingComma::Vertical), "[1, 2, 3]\n");
+        assert_eq!(fmt("[1, 2, 3]"), "[1, 2, 3]\n");
+    }
+
+    #[test]
+    fn trailing_comma_always_adds_to_flat_collections() {
+        assert_eq!(fmt_tc("[1, 2, 3]", TrailingComma::Always), "[1, 2, 3,]\n");
+        assert_eq!(fmt_tc("f(a, b)", TrailingComma::Always), "f(a, b,)\n");
+        assert_eq!(
+            fmt_tc("{'a' -> 1, 'b' -> 2}", TrailingComma::Always),
+            "{'a' -> 1, 'b' -> 2,}\n"
+        );
+    }
+
+    #[test]
+    fn trailing_comma_always_leaves_empty_collections_bare() {
+        // The empty-collection early return keeps a stray comma out of `[]`/`f()`.
+        assert_eq!(fmt_tc("[]", TrailingComma::Always), "[]\n");
+        assert_eq!(fmt_tc("f()", TrailingComma::Always), "f()\n");
+    }
+
+    #[test]
+    fn trailing_comma_never_drops_it_when_broken() {
+        let nums = [
+            "1111111111",
+            "2222222222",
+            "3333333333",
+            "4444444444",
+            "5555555555",
+            "6666666666",
+            "7777777777",
+            "8888888888",
+            "9999999999",
+        ];
+        let src = format!("[{}]", nums.join(", "));
+        let mut expected = String::from("[\n");
+        for (i, n) in nums.iter().enumerate() {
+            // `Never` drops only the trailing comma; the separators between
+            // items remain, so every line but the last keeps its comma.
+            let sep = if i + 1 < nums.len() { "," } else { "" };
+            expected.push_str(&format!("    {n}{sep}\n"));
+        }
+        expected.push_str("]\n");
+        assert_eq!(fmt_tc(&src, TrailingComma::Never), expected);
     }
 
     // ---- brace style -----------------------------------------------

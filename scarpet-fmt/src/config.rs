@@ -79,6 +79,24 @@ pub enum BraceStyle {
     NextLine,
 }
 
+/// Whether a trailing comma is emitted after the last item of a `(...)`,
+/// `[...]`, or `{...}`.
+///
+/// The rough analogue of rustfmt's `trailing_comma`. An empty collection never
+/// gets one regardless of this setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrailingComma {
+    /// A trailing comma only when the collection is broken across lines — `[\n
+    /// 1,\n 2,\n]` but a flat `[1, 2]` without (the default, reproducing the
+    /// original fixed style).
+    #[default]
+    Vertical,
+    /// A trailing comma in both layouts, including a one-line `[1, 2,]`.
+    Always,
+    /// Never a trailing comma, even when the collection is broken.
+    Never,
+}
+
 /// Formatting style knobs, threaded through lowering and rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
@@ -93,6 +111,8 @@ pub struct Config {
     pub line_ending: LineEnding,
     /// Placement of the opening delimiter of a broken `()`/`[]`/`{}` block.
     pub brace_style: BraceStyle,
+    /// Whether the last item of a `()`/`[]`/`{}` carries a trailing comma.
+    pub trailing_comma: TrailingComma,
 }
 
 impl Default for Config {
@@ -103,6 +123,7 @@ impl Default for Config {
             comment_width: None,
             line_ending: LineEnding::Lf,
             brace_style: BraceStyle::SameLine,
+            trailing_comma: TrailingComma::Vertical,
         }
     }
 }
@@ -160,5 +181,10 @@ mod tests {
     #[test]
     fn default_config_leaves_comments_unwrapped() {
         assert_eq!(Config::default().comment_width, None);
+    }
+
+    #[test]
+    fn default_config_uses_vertical_trailing_comma() {
+        assert_eq!(Config::default().trailing_comma, TrailingComma::Vertical);
     }
 }
