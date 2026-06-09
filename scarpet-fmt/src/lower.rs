@@ -6,13 +6,13 @@
 //! preceding token by [`Lowerer::child_after`] (same-line / trailing comments).
 //! Blank lines are reconstructed as statement separators.
 
-use scarpet_syntax::parser::{BinOp, Cst, CstKind, UnaryOp};
+use scarpet_syntax::parser::{BinOp, Cst, CstKind, Trivia, UnaryOp};
 
 use crate::doc::{
-    Doc, blank_line, comment, concat, group, hardline, if_break, join, line, nest, nil, softline,
+    Doc, blank_lines, comment, concat, group, hardline, if_break, join, line, nest, nil, softline,
     space, text,
 };
-use crate::trivia::{has_blank_before, has_comment, own_line_comments, same_line_comment};
+use crate::trivia::{blank_lines_before, has_comment, own_line_comments, same_line_comment};
 use crate::{BinopSeparator, BraceStyle, Config, TrailingComma};
 
 /// Lower a whole program (the CST root) to a document.
@@ -157,16 +157,30 @@ impl Lowerer<'_> {
             if i == 0 {
                 parts.push(self.expr(s));
             } else {
-                let sep = if has_blank_before(&s.leading) {
-                    blank_line()
-                } else {
-                    hardline()
-                };
-                parts.push(self.child_after(sep, s));
+                parts.push(self.child_after(self.blank_separator(&s.leading), s));
             }
             parts.push(text(";"));
         }
         concat(parts)
+    }
+
+    /// The separator before a statement: a plain [`hardline`] when no blank line
+    /// is wanted, else `n` [`blank_lines`]. The source's blank-line count is
+    /// clamped into `[blank_lines_lower_bound, blank_lines_upper_bound]` —
+    /// truncating long runs (the upper bound, default 1) and inserting blanks
+    /// between adjacent statements (the lower bound, default 0). The
+    /// `.min(upper).max(lower)` order lets the lower bound win under a
+    /// misconfigured `lower > upper`, which the CLI rejects anyway.
+    ///
+    /// Note this is bypassed when the statement's line begins with a trailing
+    /// comment lifted onto the previous token: [`Lowerer::child_after`] then
+    /// drops the separator entirely, so the lower bound is not enforced across
+    /// such a comment (its leading break run is empty, so the count is 0 too).
+    fn blank_separator(&self, leading: &[Trivia]) -> Doc {
+        let n = blank_lines_before(leading)
+            .min(self.config.blank_lines_upper_bound)
+            .max(self.config.blank_lines_lower_bound);
+        if n == 0 { hardline() } else { blank_lines(n) }
     }
 
     /// A right-associative `->` chain (`a -> b -> c`). The arrow stays on the
@@ -452,6 +466,18 @@ mod tests {
         .unwrap()
     }
 
+    fn fmt_bl(src: &str, upper: usize, lower: usize) -> String {
+        format_source(
+            src,
+            &Config {
+                blank_lines_upper_bound: upper,
+                blank_lines_lower_bound: lower,
+                ..Config::default()
+            },
+        )
+        .unwrap()
+    }
+
     #[test]
     fn arithmetic_spacing() {
         assert_eq!(fmt("2+3*4"), "2 + 3 * 4\n");
@@ -684,6 +710,47 @@ mod tests {
         let b = "b".repeat(60);
         let once = fmt_bs(&format!("{a} + {b}"), BinopSeparator::Front);
         assert_eq!(fmt_bs(&once, BinopSeparator::Front), once);
+    }
+
+    // ---- blank lines -----------------------------------------------
+
+    #[test]
+    fn blank_lines_upper_bound_truncates_long_runs() {
+        // Three blank lines collapse to the upper bound of two...
+        assert_eq!(fmt_bl("a;\n\n\n\nb", 2, 0), "a;\n\n\nb;\n");
+        // ...and to a single one under the default upper bound of one.
+        assert_eq!(fmt_bl("a;\n\n\n\nb", 1, 0), "a;\n\nb;\n");
+    }
+
+    #[test]
+    fn blank_lines_upper_bound_keeps_runs_within_the_cap() {
+        // A run already at or under the cap is left untouched.
+        assert_eq!(fmt_bl("a;\n\nb", 2, 0), "a;\n\nb;\n");
+    }
+
+    #[test]
+    fn blank_lines_lower_bound_inserts_between_adjacent_statements() {
+        // Adjacent statements get a blank line forced between them.
+        assert_eq!(fmt_bl("a;\nb", 1, 1), "a;\n\nb;\n");
+    }
+
+    #[test]
+    fn blank_lines_lower_bound_applies_inside_paren_blocks() {
+        // A `(a;b)` block lowers through the same statement sequence, so the
+        // lower bound inserts a blank between its statements too.
+        assert_eq!(
+            fmt_bl("foo()->(a;b)", 1, 1),
+            "foo() -> (\n    a;\n\n    b;\n)\n"
+        );
+    }
+
+    #[test]
+    fn blank_lines_bounds_are_idempotent() {
+        // Both truncation and insertion reach a fixpoint in one reformat.
+        let upper = fmt_bl("a;\n\n\n\nb", 2, 0);
+        assert_eq!(fmt_bl(&upper, 2, 0), upper);
+        let lower = fmt_bl("a;\nb", 1, 1);
+        assert_eq!(fmt_bl(&lower, 1, 1), lower);
     }
 
     // ---- brace style -----------------------------------------------

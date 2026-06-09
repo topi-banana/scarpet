@@ -324,4 +324,40 @@ mod corpus {
             failures.join("\n")
         );
     }
+
+    /// The same guarantee under `blank_lines_upper_bound = 2`, which keeps runs
+    /// of up to two blank lines instead of collapsing every run to one.
+    #[test]
+    fn roundtrip_blank_lines_upper_bound_is_nondestructive_and_idempotent() {
+        let config = Config {
+            blank_lines_upper_bound: 2,
+            ..Config::default()
+        };
+        let failures = roundtrip_failures(&config);
+        assert!(
+            failures.is_empty(),
+            "blank-lines-upper-bound corpus round-trip failures ({}):\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// The same guarantee under `blank_lines_lower_bound = 1`, which forces a
+    /// blank line between every pair of adjacent statements — the layout that
+    /// inserts the most trivia, so the strongest test of the non-destructive
+    /// (trivia-stripping) and idempotent proofs.
+    #[test]
+    fn roundtrip_blank_lines_lower_bound_is_nondestructive_and_idempotent() {
+        let config = Config {
+            blank_lines_lower_bound: 1,
+            ..Config::default()
+        };
+        let failures = roundtrip_failures(&config);
+        assert!(
+            failures.is_empty(),
+            "blank-lines-lower-bound corpus round-trip failures ({}):\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
 }

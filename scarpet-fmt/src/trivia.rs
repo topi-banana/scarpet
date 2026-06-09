@@ -4,7 +4,7 @@
 //! on their own line by [`own_line_comments`] (the same-line / trailing-comment
 //! case is lifted by the chain/collection lowering — see `lower`). Blank lines
 //! are not emitted here; they are reconstructed by statement separators via
-//! [`has_blank_before`].
+//! [`blank_lines_before`].
 
 use scarpet_syntax::parser::Trivia;
 
@@ -19,14 +19,16 @@ pub fn own_line_comments(leading: &[Trivia]) -> Doc {
     }))
 }
 
-/// Whether a blank line (two or more consecutive breaks before any comment)
-/// precedes the node — i.e. the user left a blank line above it.
-pub fn has_blank_before(leading: &[Trivia]) -> bool {
+/// The number of blank lines directly above the node: consecutive leading
+/// breaks, less the one that merely ends the previous line. Zero when the node
+/// abuts the previous one or sits on the very next line. Only breaks *before*
+/// any comment are counted, so a leading own-line comment terminates the run.
+pub fn blank_lines_before(leading: &[Trivia]) -> usize {
     leading
         .iter()
         .take_while(|t| matches!(t, Trivia::Break))
         .count()
-        >= 2
+        .saturating_sub(1)
 }
 
 /// Whether `leading` contains any comment (same-line or own-line). Used to keep
@@ -42,5 +44,46 @@ pub fn same_line_comment<'s>(leading: &[Trivia<'s>]) -> Option<&'s str> {
     match leading.first() {
         Some(Trivia::Comment(c)) => Some(c),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::blank_lines_before;
+    use scarpet_syntax::parser::Trivia;
+
+    #[test]
+    fn counts_leading_breaks_minus_one() {
+        // N consecutive breaks span N-1 blank lines (one break ends the line).
+        assert_eq!(blank_lines_before(&[]), 0);
+        assert_eq!(blank_lines_before(&[Trivia::Break]), 0);
+        assert_eq!(blank_lines_before(&[Trivia::Break, Trivia::Break]), 1);
+        assert_eq!(
+            blank_lines_before(&[Trivia::Break, Trivia::Break, Trivia::Break]),
+            2
+        );
+    }
+
+    #[test]
+    fn stops_at_the_first_comment() {
+        // A same-line comment (comment first) reports zero blanks above; an
+        // own-line comment terminates the leading break run after counting it.
+        assert_eq!(
+            blank_lines_before(&[Trivia::Comment("// c"), Trivia::Break]),
+            0
+        );
+        assert_eq!(
+            blank_lines_before(&[Trivia::Break, Trivia::Comment("// c"), Trivia::Break]),
+            0
+        );
+        assert_eq!(
+            blank_lines_before(&[
+                Trivia::Break,
+                Trivia::Break,
+                Trivia::Comment("// c"),
+                Trivia::Break,
+            ]),
+            1
+        );
     }
 }
