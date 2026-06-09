@@ -15,3 +15,6 @@ comment_width = -1
 line_ending = "lf"
 # Opening delimiter of a broken (), [] or {} block: "same_line" (default) or "next_line".
 brace_style = "same_line"
+# Trailing comma after the last item of a block: "vertical" (only when the block
+# breaks across lines), "always" (also on one-liners), or "never".
+trailing_comma = "vertical"
