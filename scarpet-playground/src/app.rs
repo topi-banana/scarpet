@@ -1,14 +1,18 @@
-//! The root component: a header that toggles between the two-pane editor and the
-//! notebook, the shared formatter-options bar, and the active view's body. Both
-//! views share one [`Config`]; the notebook also owns a persistent [`Session`].
+//! The root component: it owns all state and composes the presentational
+//! components — [`Header`], [`OptionsBar`], the editor's
+//! [`EditorActions`]/[`EditorView`], and the notebook's
+//! [`NotebookActions`]/[`NotebookView`] — wiring each to a [`Msg`] via callbacks.
+//! Both views share one [`Config`]; the notebook also owns a persistent
+//! [`Session`].
 
 use scarpet_fmt::{BraceStyle, Config, LineEnding};
 use yew::prelude::*;
 
-use crate::editor::{Mode, SAMPLE};
-use crate::notebook::Notebook;
+use crate::editor::{EditorActions, EditorView, Mode, SAMPLE};
+use crate::header::Header;
+use crate::notebook::{Notebook, NotebookActions, NotebookView};
+use crate::options::OptionsBar;
 use crate::session::{CellOutput, Session};
-use crate::shared::{BTN_BASE, BTN_BORDERED, BTN_INK};
 
 /// Which screen is showing.
 #[derive(Clone, Copy, PartialEq)]
@@ -52,8 +56,6 @@ pub enum Msg {
     SetLineEnding(LineEnding),
     /// Set where an opening delimiter sits on a broken block.
     SetBraceStyle(BraceStyle),
-    /// A numeric control fired with an unparseable value; keep the current config.
-    Noop,
     /// Switch between the editor and the notebook.
     SwitchView(View),
     /// A cell's textarea changed (tracked without re-rendering).
@@ -112,46 +114,6 @@ impl App {
             }
         }
     }
-
-    /// The header: brand, the Editor/Notebook toggle, and the active view's
-    /// actions on the right.
-    fn view_header(&self, ctx: &Context<Self>) -> Html {
-        let link = ctx.link();
-        let on_editor = link.callback(|_| Msg::SwitchView(View::Editor));
-        let on_notebook = link.callback(|_| Msg::SwitchView(View::Notebook));
-
-        let editor_cls = if self.view == View::Editor {
-            classes!(BTN_BASE, BTN_INK)
-        } else {
-            classes!(BTN_BASE, BTN_BORDERED)
-        };
-        let notebook_cls = if self.view == View::Notebook {
-            classes!(BTN_BASE, BTN_INK)
-        } else {
-            classes!(BTN_BASE, BTN_BORDERED)
-        };
-
-        let actions = match self.view {
-            View::Editor => self.view_editor_actions(ctx),
-            View::Notebook => self.view_notebook_actions(ctx),
-        };
-
-        html! {
-            <header class="flex h-16 shrink-0 items-center justify-between border-b border-hairline bg-canvas px-6">
-                <div class="flex items-center gap-4">
-                    <div class="flex items-baseline gap-2">
-                        <span class="text-base font-semibold tracking-tight">{ "scarpet" }</span>
-                        <span class="text-sm text-mute">{ "playground" }</span>
-                    </div>
-                    <div class="flex items-center gap-1">
-                        <button onclick={on_editor} class={editor_cls}>{ "Editor" }</button>
-                        <button onclick={on_notebook} class={notebook_cls}>{ "Notebook" }</button>
-                    </div>
-                </div>
-                <div class="flex items-center gap-2">{ actions }</div>
-            </header>
-        }
-    }
 }
 
 impl Component for App {
@@ -187,12 +149,12 @@ impl Component for App {
                 true
             }
             Msg::SetIndentWidth(w) => {
-                self.config.indent_width = w;
+                self.config.indent_width = w.clamp(1, 16);
                 self.reformat_if_showing();
                 true
             }
             Msg::SetMaxWidth(w) => {
-                self.config.max_width = w;
+                self.config.max_width = w.max(1);
                 self.reformat_if_showing();
                 true
             }
@@ -211,7 +173,6 @@ impl Component for App {
                 self.reformat_if_showing();
                 true
             }
-            Msg::Noop => false,
             Msg::SwitchView(view) => {
                 self.view = view;
                 if view == View::Notebook {
@@ -261,14 +222,58 @@ impl Component for App {
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
+        let link = ctx.link();
+
+        // The active view's header actions and body.
+        let actions = match self.view {
+            View::Editor => html! { <EditorActions on_run={link.callback(Msg::Run)} /> },
+            View::Notebook => html! {
+                <NotebookActions
+                    on_add={link.callback(|_: ()| Msg::NbAddCell)}
+                    on_run_all={link.callback(|_: ()| Msg::NbRunAll)}
+                    on_restart={link.callback(|_: ()| Msg::NbRestart)}
+                />
+            },
+        };
+        let body = match self.view {
+            View::Editor => html! {
+                <EditorView
+                    input={self.input.clone()}
+                    output={self.output.clone()}
+                    diagnostics={self.diagnostics.clone()}
+                    diagnostics_title={self.diagnostics_title}
+                    mode={self.mode}
+                    on_input={link.callback(Msg::Input)}
+                />
+            },
+            View::Notebook => html! {
+                <NotebookView
+                    cells={self.notebook.snapshot()}
+                    on_add={link.callback(|_: ()| Msg::NbAddCell)}
+                    on_edit={link.callback(|(id, source)| Msg::NbEditCell { id, source })}
+                    on_run={link.callback(Msg::NbRunCell)}
+                    on_format={link.callback(Msg::NbFormatCell)}
+                    on_delete={link.callback(Msg::NbDeleteCell)}
+                    on_move_up={link.callback(Msg::NbMoveUp)}
+                    on_move_down={link.callback(Msg::NbMoveDown)}
+                />
+            },
+        };
+
         html! {
             <div class="flex h-screen flex-col bg-canvas-soft text-ink">
-                { self.view_header(ctx) }
-                { self.view_options(ctx) }
-                { match self.view {
-                    View::Editor => self.view_editor(ctx),
-                    View::Notebook => self.view_notebook(ctx),
-                } }
+                <Header view={self.view} on_switch={link.callback(Msg::SwitchView)}>
+                    { actions }
+                </Header>
+                <OptionsBar
+                    config={self.config}
+                    on_indent={link.callback(Msg::SetIndentWidth)}
+                    on_max={link.callback(Msg::SetMaxWidth)}
+                    on_comment={link.callback(Msg::SetCommentWidth)}
+                    on_line_ending={link.callback(Msg::SetLineEnding)}
+                    on_brace={link.callback(Msg::SetBraceStyle)}
+                />
+                { body }
             </div>
         }
     }

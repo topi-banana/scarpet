@@ -1,17 +1,19 @@
-//! The original two-pane editor view: type Scarpet on the left, then run the
-//! formatter, dump the CST, lower to the AST, or evaluate it (a one-shot run,
-//! independent of the notebook's persistent kernel) on the right.
+//! The two-pane editor: type Scarpet on the left, then run the formatter, dump
+//! the CST, lower to the AST, or evaluate it once on the right.
+//!
+//! The view is split into two presentational components — [`EditorActions`] (the
+//! header buttons) and [`EditorView`] (the panes) — while the tool logic stays
+//! on [`App`], which the components reach only through callbacks.
 
-use scarpet_fmt::{BraceStyle, LineEnding};
 use scarpet_syntax::ast::Code;
 use scarpet_syntax::parser::ParseError;
 use scarpet_vm::{Evalute, GlobalState};
 use std::cell::RefCell;
 use std::rc::Rc;
-use web_sys::{HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement};
+use web_sys::HtmlTextAreaElement;
 use yew::prelude::*;
 
-use crate::app::{App, Msg};
+use crate::app::App;
 use crate::shared::{
     BTN_BASE, BTN_BORDERED, BTN_INK, BTN_LINK, EDITOR, LABEL, SharedBuffer, diagnostics_for,
 };
@@ -144,148 +146,81 @@ impl App {
             self.run(Mode::Format);
         }
     }
+}
 
-    /// The editor view's tool buttons (shown in the header on the right).
-    pub(crate) fn view_editor_actions(&self, ctx: &Context<Self>) -> Html {
-        let link = ctx.link();
-        let on_format = link.callback(|_| Msg::Run(Mode::Format));
-        let on_syntax = link.callback(|_| Msg::Run(Mode::Syntax));
-        let on_ast = link.callback(|_| Msg::Run(Mode::Ast));
-        let on_run = link.callback(|_| Msg::Run(Mode::Run));
-        html! {
-            <button onclick={on_syntax} class={classes!(BTN_BASE, BTN_BORDERED)}>{ "Syntax tree" }</button>
-            <button onclick={on_ast} class={classes!(BTN_BASE, BTN_BORDERED)}>{ "AST" }</button>
-            <button onclick={on_format} class={classes!(BTN_BASE, BTN_INK)}>{ "Format" }</button>
-            <button onclick={on_run} class={classes!(BTN_BASE, BTN_LINK)}>{ "Run" }</button>
-        }
+#[derive(Properties, PartialEq)]
+pub struct EditorActionsProps {
+    /// Fired with the tool to run.
+    pub on_run: Callback<Mode>,
+}
+
+/// The editor's header buttons (Syntax tree / AST / Format / Run).
+#[function_component(EditorActions)]
+pub fn editor_actions(props: &EditorActionsProps) -> Html {
+    let run = |mode: Mode| {
+        let cb = props.on_run.clone();
+        Callback::from(move |_: web_sys::MouseEvent| cb.emit(mode))
+    };
+    html! {
+        <button onclick={run(Mode::Syntax)} class={classes!(BTN_BASE, BTN_BORDERED)}>{ "Syntax tree" }</button>
+        <button onclick={run(Mode::Ast)} class={classes!(BTN_BASE, BTN_BORDERED)}>{ "AST" }</button>
+        <button onclick={run(Mode::Format)} class={classes!(BTN_BASE, BTN_INK)}>{ "Format" }</button>
+        <button onclick={run(Mode::Run)} class={classes!(BTN_BASE, BTN_LINK)}>{ "Run" }</button>
     }
+}
 
-    /// The two-pane editor body: input textarea on the left, output on the right.
-    pub(crate) fn view_editor(&self, ctx: &Context<Self>) -> Html {
-        let link = ctx.link();
-        let oninput = link.callback(|e: InputEvent| {
+#[derive(Properties, PartialEq)]
+pub struct EditorViewProps {
+    pub input: AttrValue,
+    pub output: AttrValue,
+    pub diagnostics: Vec<String>,
+    pub diagnostics_title: AttrValue,
+    pub mode: Option<Mode>,
+    /// Fired with the textarea's new value on every edit.
+    pub on_input: Callback<String>,
+}
+
+/// The two-pane body: input textarea on the left, output (and any diagnostics)
+/// on the right.
+#[function_component(EditorView)]
+pub fn editor_view(props: &EditorViewProps) -> Html {
+    let oninput = {
+        let cb = props.on_input.clone();
+        Callback::from(move |e: web_sys::InputEvent| {
             let textarea: HtmlTextAreaElement = e.target_unchecked_into();
-            Msg::Input(textarea.value())
-        });
-        let output_title = self.mode.map_or("Output", Mode::output_title);
+            cb.emit(textarea.value());
+        })
+    };
+    let output_title = props.mode.map_or("Output", Mode::output_title);
 
-        html! {
-            <main class="grid min-h-0 flex-1 grid-cols-1 md:grid-cols-2">
-                <section class="flex min-h-0 flex-col border-b border-hairline md:border-b-0 md:border-r">
-                    <div class={LABEL}>{ "Input" }</div>
-                    <textarea
-                        class={EDITOR}
-                        spellcheck="false"
-                        placeholder="Type Scarpet source here…"
-                        value={self.input.clone()}
-                        oninput={oninput}
-                    />
-                </section>
-                <section class="flex min-h-0 flex-col">
-                    <div class={LABEL}>{ output_title }</div>
-                    <pre class={EDITOR}>{ &self.output }</pre>
-                    { self.view_diagnostics() }
-                </section>
-            </main>
-        }
-    }
-
-    /// The diagnostics strip below the editor output, or nothing when it parsed.
-    fn view_diagnostics(&self) -> Html {
-        if self.diagnostics.is_empty() {
-            return html! {};
-        }
+    let diagnostics = if props.diagnostics.is_empty() {
+        html! {}
+    } else {
         html! {
             <div class="max-h-40 shrink-0 overflow-auto border-t border-hairline bg-canvas px-4 py-2 font-mono text-xs text-error">
-                <div class="pb-1 font-medium">{ self.diagnostics_title }</div>
-                { for self.diagnostics.iter().map(|d| html! { <div class="py-0.5">{ d }</div> }) }
+                <div class="pb-1 font-medium">{ props.diagnostics_title.clone() }</div>
+                { for props.diagnostics.iter().map(|d| html! { <div class="py-0.5">{ d }</div> }) }
             </div>
         }
-    }
+    };
 
-    /// The formatter-options bar between the header and the body. Edits apply
-    /// live to the editor's Format view and to per-cell Format in the notebook.
-    pub(crate) fn view_options(&self, ctx: &Context<Self>) -> Html {
-        let link = ctx.link();
-
-        let on_indent = link.callback(|e: InputEvent| {
-            let input: HtmlInputElement = e.target_unchecked_into();
-            match input.value().parse::<usize>() {
-                Ok(v) => Msg::SetIndentWidth(v.clamp(1, 16)),
-                Err(_) => Msg::Noop,
-            }
-        });
-        let on_max = link.callback(|e: InputEvent| {
-            let input: HtmlInputElement = e.target_unchecked_into();
-            match input.value().parse::<usize>() {
-                Ok(v) => Msg::SetMaxWidth(v.max(1)),
-                Err(_) => Msg::Noop,
-            }
-        });
-        let on_comment = link.callback(|e: InputEvent| {
-            let input: HtmlInputElement = e.target_unchecked_into();
-            match input.value().parse::<usize>() {
-                Ok(0) => Msg::SetCommentWidth(None),
-                Ok(v) => Msg::SetCommentWidth(Some(v)),
-                Err(_) => Msg::Noop,
-            }
-        });
-        let on_line_ending = link.callback(|e: Event| {
-            let select: HtmlSelectElement = e.target_unchecked_into();
-            Msg::SetLineEnding(match select.value().as_str() {
-                "crlf" => LineEnding::Crlf,
-                "auto" => LineEnding::Auto,
-                "native" => LineEnding::Native,
-                _ => LineEnding::Lf,
-            })
-        });
-        let on_brace = link.callback(|e: Event| {
-            let select: HtmlSelectElement = e.target_unchecked_into();
-            Msg::SetBraceStyle(match select.value().as_str() {
-                "next" => BraceStyle::NextLine,
-                _ => BraceStyle::SameLine,
-            })
-        });
-
-        let bar = "flex flex-wrap items-center gap-x-5 gap-y-2 border-b border-hairline bg-canvas px-6 py-2";
-        let lbl = "flex items-center gap-2 font-mono text-xs uppercase tracking-wider text-mute";
-        let num = "w-14 rounded-md border border-hairline bg-canvas px-2 py-1 text-right font-mono text-xs normal-case text-ink outline-none focus:border-link";
-        let sel = "rounded-md border border-hairline bg-canvas px-2 py-1 font-mono text-xs normal-case text-ink outline-none focus:border-link";
-
-        html! {
-            <div class={bar}>
-                <label class={lbl}>
-                    { "Indent" }
-                    <input type="number" min="1" max="16" class={num}
-                        value={self.config.indent_width.to_string()} oninput={on_indent} />
-                </label>
-                <label class={lbl}>
-                    { "Width" }
-                    <input type="number" min="1" class={num}
-                        value={self.config.max_width.to_string()} oninput={on_max} />
-                </label>
-                <label class={lbl} title="0 leaves comments unwrapped">
-                    { "Comment" }
-                    <input type="number" min="0" class={num}
-                        value={self.config.comment_width.unwrap_or(0).to_string()} oninput={on_comment} />
-                </label>
-                <label class={lbl}>
-                    { "Endings" }
-                    <select class={sel} onchange={on_line_ending}>
-                        <option value="lf" selected={self.config.line_ending == LineEnding::Lf}>{ "LF" }</option>
-                        <option value="crlf" selected={self.config.line_ending == LineEnding::Crlf}>{ "CRLF" }</option>
-                        <option value="auto" selected={self.config.line_ending == LineEnding::Auto}>{ "Auto" }</option>
-                        <option value="native" selected={self.config.line_ending == LineEnding::Native}>{ "Native" }</option>
-                    </select>
-                </label>
-                <label class={lbl}>
-                    { "Braces" }
-                    <select class={sel} onchange={on_brace}>
-                        <option value="same" selected={self.config.brace_style == BraceStyle::SameLine}>{ "Same line" }</option>
-                        <option value="next" selected={self.config.brace_style == BraceStyle::NextLine}>{ "Next line" }</option>
-                    </select>
-                </label>
-            </div>
-        }
+    html! {
+        <main class="grid min-h-0 flex-1 grid-cols-1 md:grid-cols-2">
+            <section class="flex min-h-0 flex-col border-b border-hairline md:border-b-0 md:border-r">
+                <div class={LABEL}>{ "Input" }</div>
+                <textarea
+                    class={EDITOR}
+                    spellcheck="false"
+                    placeholder="Type Scarpet source here…"
+                    value={props.input.clone()}
+                    oninput={oninput}
+                />
+            </section>
+            <section class="flex min-h-0 flex-col">
+                <div class={LABEL}>{ output_title }</div>
+                <pre class={EDITOR}>{ props.output.clone() }</pre>
+                { diagnostics }
+            </section>
+        </main>
     }
 }

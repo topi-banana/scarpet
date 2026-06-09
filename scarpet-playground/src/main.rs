@@ -12,7 +12,9 @@
 
 mod app;
 mod editor;
+mod header;
 mod notebook;
+mod options;
 mod session;
 mod shared;
 

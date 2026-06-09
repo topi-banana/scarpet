@@ -1,12 +1,15 @@
 //! The notebook view: a column of cells run against a persistent kernel, so a
-//! binding made in one cell is visible to the next. Each cell shows its `print`
-//! output, its result value, and any error beneath it.
+//! binding made in one cell is visible to the next.
+//!
+//! [`Notebook`] is the model (cells, id allocator, sample loading); the rendering
+//! is three presentational components — [`NotebookActions`] (header buttons),
+//! [`NotebookView`] (the column), and [`CellView`] (one cell) — that reach
+//! [`App`](crate::app::App) only through callbacks.
 
 use scarpet_fmt::Config;
-use web_sys::{HtmlTextAreaElement, KeyboardEvent};
+use web_sys::HtmlTextAreaElement;
 use yew::prelude::*;
 
-use crate::app::{App, Msg};
 use crate::session::CellOutput;
 use crate::shared::{BTN_BASE, BTN_BORDERED, BTN_INK, BTN_LINK, BTN_SM, diagnostics_for};
 
@@ -29,7 +32,9 @@ const NB_SAMPLE: &[&str] = &[
 ];
 
 /// One notebook cell: its source, the result of its last run, and the execution
-/// number to badge it with.
+/// number to badge it with. `Clone`/`PartialEq` let a snapshot ride in
+/// [`NotebookView`]/[`CellView`] props and skip re-rendering when unchanged.
+#[derive(Clone, PartialEq)]
 pub struct Cell {
     /// Stable identity for the list `key`, so reorder/delete never recreates a
     /// textarea (preserving its DOM value and focus). Never reused.
@@ -56,6 +61,11 @@ impl Notebook {
             next_id: 0,
             loaded: false,
         }
+    }
+
+    /// A clone of the cells, to hand to [`NotebookView`] as props.
+    pub(crate) fn snapshot(&self) -> Vec<Cell> {
+        self.cells.clone()
     }
 
     /// Append a new cell holding `source`, assigning it a fresh id.
@@ -165,73 +175,146 @@ impl Notebook {
     }
 }
 
-impl App {
-    /// The notebook view's header actions (shown on the right of the header).
-    pub(crate) fn view_notebook_actions(&self, ctx: &Context<Self>) -> Html {
-        let link = ctx.link();
-        let on_add = link.callback(|_| Msg::NbAddCell);
-        let on_run_all = link.callback(|_| Msg::NbRunAll);
-        let on_restart = link.callback(|_| Msg::NbRestart);
-        html! {
-            <button onclick={on_add} class={classes!(BTN_BASE, BTN_BORDERED)}>{ "Add cell" }</button>
-            <button onclick={on_restart} class={classes!(BTN_BASE, BTN_BORDERED)}>{ "Restart" }</button>
-            <button onclick={on_run_all} class={classes!(BTN_BASE, BTN_LINK)}>{ "Run all" }</button>
-        }
-    }
+#[derive(Properties, PartialEq)]
+pub struct NotebookActionsProps {
+    pub on_add: Callback<()>,
+    pub on_run_all: Callback<()>,
+    pub on_restart: Callback<()>,
+}
 
-    /// The scrollable column of cells, with a trailing "Add cell" button.
-    pub(crate) fn view_notebook(&self, ctx: &Context<Self>) -> Html {
-        let link = ctx.link();
-        let on_add = link.callback(|_| Msg::NbAddCell);
-        html! {
-            <main class="min-h-0 flex-1 overflow-auto bg-canvas-soft p-6">
-                <div class="mx-auto flex max-w-4xl flex-col gap-4">
-                    { for self.notebook.cells.iter().map(|cell| view_cell(ctx, cell)) }
-                    <div>
-                        <button onclick={on_add} class={classes!(BTN_SM, BTN_BORDERED)}>{ "+ Add cell" }</button>
-                    </div>
-                </div>
-            </main>
-        }
+/// The notebook's header buttons (Add cell / Restart / Run all).
+#[function_component(NotebookActions)]
+pub fn notebook_actions(props: &NotebookActionsProps) -> Html {
+    let on_add = {
+        let cb = props.on_add.clone();
+        Callback::from(move |_: web_sys::MouseEvent| cb.emit(()))
+    };
+    let on_restart = {
+        let cb = props.on_restart.clone();
+        Callback::from(move |_: web_sys::MouseEvent| cb.emit(()))
+    };
+    let on_run_all = {
+        let cb = props.on_run_all.clone();
+        Callback::from(move |_: web_sys::MouseEvent| cb.emit(()))
+    };
+    html! {
+        <button onclick={on_add} class={classes!(BTN_BASE, BTN_BORDERED)}>{ "Add cell" }</button>
+        <button onclick={on_restart} class={classes!(BTN_BASE, BTN_BORDERED)}>{ "Restart" }</button>
+        <button onclick={on_run_all} class={classes!(BTN_BASE, BTN_LINK)}>{ "Run all" }</button>
     }
 }
 
-/// Render one cell: badge gutter, editor textarea, the per-cell controls, and
-/// its output.
-fn view_cell(ctx: &Context<App>, cell: &Cell) -> Html {
-    let link = ctx.link();
-    let id = cell.id;
+#[derive(Properties, PartialEq)]
+pub struct NotebookViewProps {
+    pub cells: Vec<Cell>,
+    pub on_add: Callback<()>,
+    pub on_edit: Callback<(u64, String)>,
+    pub on_run: Callback<u64>,
+    pub on_format: Callback<u64>,
+    pub on_delete: Callback<u64>,
+    pub on_move_up: Callback<u64>,
+    pub on_move_down: Callback<u64>,
+}
 
-    let oninput = link.callback(move |e: InputEvent| {
-        let textarea: HtmlTextAreaElement = e.target_unchecked_into();
-        Msg::NbEditCell {
-            id,
-            source: textarea.value(),
-        }
-    });
-    // Shift+Enter runs the cell instead of inserting a newline.
-    let onkeydown = link.callback(move |e: KeyboardEvent| {
-        if e.key() == "Enter" && e.shift_key() {
-            e.prevent_default();
-            Msg::NbRunCell(id)
-        } else {
-            Msg::Noop
-        }
-    });
-    let on_run = link.callback(move |_| Msg::NbRunCell(id));
-    let on_fmt = link.callback(move |_| Msg::NbFormatCell(id));
-    let on_del = link.callback(move |_| Msg::NbDeleteCell(id));
-    let on_up = link.callback(move |_| Msg::NbMoveUp(id));
-    let on_down = link.callback(move |_| Msg::NbMoveDown(id));
+/// The scrollable column of cells, with a trailing "Add cell" button.
+#[function_component(NotebookView)]
+pub fn notebook_view(props: &NotebookViewProps) -> Html {
+    let on_add = {
+        let cb = props.on_add.clone();
+        Callback::from(move |_: web_sys::MouseEvent| cb.emit(()))
+    };
+    html! {
+        <main class="min-h-0 flex-1 overflow-auto bg-canvas-soft p-6">
+            <div class="mx-auto flex max-w-4xl flex-col gap-4">
+                { for props.cells.iter().map(|cell| html! {
+                    <CellView
+                        key={cell.id.to_string()}
+                        id={cell.id}
+                        source={cell.source.clone()}
+                        output={cell.output.clone()}
+                        exec={cell.exec}
+                        on_edit={props.on_edit.clone()}
+                        on_run={props.on_run.clone()}
+                        on_format={props.on_format.clone()}
+                        on_delete={props.on_delete.clone()}
+                        on_move_up={props.on_move_up.clone()}
+                        on_move_down={props.on_move_down.clone()}
+                    />
+                }) }
+                <div>
+                    <button onclick={on_add} class={classes!(BTN_SM, BTN_BORDERED)}>{ "+ Add cell" }</button>
+                </div>
+            </div>
+        </main>
+    }
+}
 
-    let badge = match cell.exec {
+#[derive(Properties, PartialEq)]
+pub struct CellViewProps {
+    pub id: u64,
+    pub source: AttrValue,
+    pub output: CellOutput,
+    pub exec: Option<u32>,
+    pub on_edit: Callback<(u64, String)>,
+    pub on_run: Callback<u64>,
+    pub on_format: Callback<u64>,
+    pub on_delete: Callback<u64>,
+    pub on_move_up: Callback<u64>,
+    pub on_move_down: Callback<u64>,
+}
+
+/// One cell: badge gutter, editor textarea, per-cell controls, and its output.
+#[function_component(CellView)]
+pub fn cell_view(props: &CellViewProps) -> Html {
+    let id = props.id;
+
+    let oninput = {
+        let cb = props.on_edit.clone();
+        Callback::from(move |e: web_sys::InputEvent| {
+            let textarea: HtmlTextAreaElement = e.target_unchecked_into();
+            cb.emit((id, textarea.value()));
+        })
+    };
+    // Shift+Enter runs the cell instead of inserting a newline; other keys fall
+    // through to the textarea untouched.
+    let onkeydown = {
+        let cb = props.on_run.clone();
+        Callback::from(move |e: web_sys::KeyboardEvent| {
+            if e.key() == "Enter" && e.shift_key() {
+                e.prevent_default();
+                cb.emit(id);
+            }
+        })
+    };
+    let on_run = {
+        let cb = props.on_run.clone();
+        Callback::from(move |_: web_sys::MouseEvent| cb.emit(id))
+    };
+    let on_fmt = {
+        let cb = props.on_format.clone();
+        Callback::from(move |_: web_sys::MouseEvent| cb.emit(id))
+    };
+    let on_del = {
+        let cb = props.on_delete.clone();
+        Callback::from(move |_: web_sys::MouseEvent| cb.emit(id))
+    };
+    let on_up = {
+        let cb = props.on_move_up.clone();
+        Callback::from(move |_: web_sys::MouseEvent| cb.emit(id))
+    };
+    let on_down = {
+        let cb = props.on_move_down.clone();
+        Callback::from(move |_: web_sys::MouseEvent| cb.emit(id))
+    };
+
+    let badge = match props.exec {
         Some(n) => format!("[{n}]"),
         None => "[ ]".to_owned(),
     };
-    let rows = cell.source.lines().count().clamp(3, 24);
+    let rows = props.source.lines().count().clamp(3, 24);
 
     html! {
-        <div key={cell.id.to_string()} class="overflow-hidden rounded-md border border-hairline bg-canvas">
+        <div class="overflow-hidden rounded-md border border-hairline bg-canvas">
             <div class="flex items-stretch">
                 <div class="flex w-12 shrink-0 select-none items-start justify-center border-r border-hairline py-3 font-mono text-xs text-mute">
                     { badge }
@@ -241,7 +324,7 @@ fn view_cell(ctx: &Context<App>, cell: &Cell) -> Html {
                     rows={rows.to_string()}
                     spellcheck="false"
                     placeholder="Scarpet…"
-                    value={cell.source.clone()}
+                    value={props.source.clone()}
                     oninput={oninput}
                     onkeydown={onkeydown}
                 />
@@ -254,15 +337,15 @@ fn view_cell(ctx: &Context<App>, cell: &Cell) -> Html {
                 <button onclick={on_down} class={classes!(BTN_SM, BTN_BORDERED)} title="Move down">{ "↓" }</button>
                 <button onclick={on_del} class={classes!(BTN_SM, BTN_BORDERED)}>{ "Delete" }</button>
             </div>
-            { view_cell_output(cell) }
+            { cell_output_view(&props.output) }
         </div>
     }
 }
 
 /// The output area beneath a cell: `print` text, the result value, an error
 /// strip, or a faint "(no output)" — separated by hairlines via `divide-y`.
-fn view_cell_output(cell: &Cell) -> Html {
-    match &cell.output {
+fn cell_output_view(output: &CellOutput) -> Html {
+    match output {
         CellOutput::NotRun => html! {},
         CellOutput::Ok { printed, value } => {
             let mut rows: Vec<Html> = Vec::new();
