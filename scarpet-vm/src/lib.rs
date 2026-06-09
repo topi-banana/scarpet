@@ -4,6 +4,9 @@ mod function;
 mod value;
 mod vm;
 
+#[cfg(test)]
+mod test_util;
+
 pub use error::VmError;
 pub use eval::Evalute;
 pub use function::{DefFunction, Function};
