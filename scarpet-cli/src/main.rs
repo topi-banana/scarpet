@@ -26,6 +26,8 @@ struct Cli {
 enum Cmd {
     /// Format Scarpet source.
     Format(FormatArgs),
+    /// Run the Scarpet language server over stdio.
+    Lsp,
     /// Start an interactive REPL: read a statement, evaluate it in a session VM
     /// whose variables and function definitions persist across submissions, and
     /// print the resulting value (or a parse / lowering / evaluation
@@ -201,7 +203,18 @@ fn parse_config(text: &str, name: &str) -> Result<Config, String> {
 fn main() -> ExitCode {
     match Cli::parse().cmd {
         Cmd::Format(args) => run_format(args),
+        Cmd::Lsp => run_lsp(),
         Cmd::Repl => run_repl(),
+    }
+}
+
+fn run_lsp() -> ExitCode {
+    match scarpet_lsp::run_stdio() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("lsp: {e}");
+            ExitCode::from(2)
+        }
     }
 }
 

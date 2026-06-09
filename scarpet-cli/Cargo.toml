@@ -8,6 +8,7 @@ ariadne.workspace = true
 clap.workspace = true
 rustyline.workspace = true
 scarpet-fmt.workspace = true
+scarpet-lsp = { path = "../scarpet-lsp" }
 scarpet-syntax.workspace = true
 scarpet-vm.workspace = true
 serde.workspace = true

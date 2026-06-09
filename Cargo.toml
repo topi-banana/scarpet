@@ -2,7 +2,7 @@
 resolver = "3"
 members = [
   "scarpet-cli",
-  "scarpet-fmt",
+  "scarpet-fmt", "scarpet-lsp",
   "scarpet-playground",
   "scarpet-syntax",
   "scarpet-vm",
