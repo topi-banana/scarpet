@@ -306,4 +306,41 @@ mod corpus {
             failures.join("\n")
         );
     }
+
+    /// The non-destructive + idempotent guarantee must also hold with
+    /// `overflow_delimited_expr` on — the layout that reshapes block / `;`-chain
+    /// last arguments most aggressively, hugging them onto the call line.
+    #[test]
+    fn roundtrip_overflow_delimited_expr_is_nondestructive_and_idempotent() {
+        let config = Config {
+            overflow_delimited_expr: true,
+            ..Config::default()
+        };
+        let failures = roundtrip_failures(&config);
+        assert!(
+            failures.is_empty(),
+            "overflow-delimited-expr corpus round-trip failures ({}):\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// And the same with `overflow_delimited_expr` combined with
+    /// `brace_style = next_line` — the pair that most stresses delimiter
+    /// placement around a hugged block.
+    #[test]
+    fn roundtrip_overflow_delimited_expr_next_line_is_nondestructive_and_idempotent() {
+        let config = Config {
+            overflow_delimited_expr: true,
+            brace_style: BraceStyle::NextLine,
+            ..Config::default()
+        };
+        let failures = roundtrip_failures(&config);
+        assert!(
+            failures.is_empty(),
+            "overflow-delimited-expr next-line corpus round-trip failures ({}):\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
 }
