@@ -100,6 +100,12 @@ struct ConfigFile {
     /// Where a wrapping binary operator sits: `"back"` (default, at the line's
     /// tail) or `"front"` (at the head of the wrapped line).
     binop_separator: Option<String>,
+    /// The maximum number of consecutive blank lines kept between statements
+    /// (default `1`); longer runs are truncated.
+    blank_lines_upper_bound: Option<usize>,
+    /// The minimum number of blank lines forced between statements (default
+    /// `0`). Must not exceed `blank_lines_upper_bound`.
+    blank_lines_lower_bound: Option<usize>,
 }
 
 /// Resolve the formatting [`Config`]. An explicit `--config` path must exist
@@ -191,9 +197,21 @@ fn parse_config(text: &str, name: &str) -> Result<Config, String> {
             .overflow_delimited_expr
             .unwrap_or(default.overflow_delimited_expr),
         binop_separator,
+        blank_lines_upper_bound: file
+            .blank_lines_upper_bound
+            .unwrap_or(default.blank_lines_upper_bound),
+        blank_lines_lower_bound: file
+            .blank_lines_lower_bound
+            .unwrap_or(default.blank_lines_lower_bound),
     };
     if config.max_width == 0 {
         return Err(format!("{name}: max_width must be at least 1"));
+    }
+    if config.blank_lines_lower_bound > config.blank_lines_upper_bound {
+        return Err(format!(
+            "{name}: blank_lines_lower_bound ({}) must not exceed blank_lines_upper_bound ({})",
+            config.blank_lines_lower_bound, config.blank_lines_upper_bound
+        ));
     }
     Ok(config)
 }
@@ -780,6 +798,34 @@ mod tests {
     fn parse_config_rejects_unknown_binop_separator() {
         let err = parse_config("binop_separator = \"middle\"", "x").unwrap_err();
         assert!(err.contains("binop_separator"), "{err}");
+    }
+
+    #[test]
+    fn parse_config_defaults_blank_lines_bounds() {
+        let cfg = parse_config("", "x").unwrap();
+        assert_eq!(cfg.blank_lines_upper_bound, 1);
+        assert_eq!(cfg.blank_lines_lower_bound, 0);
+    }
+
+    #[test]
+    fn parse_config_reads_blank_lines_bounds() {
+        let cfg = parse_config(
+            "blank_lines_upper_bound = 2\nblank_lines_lower_bound = 1",
+            "x",
+        )
+        .unwrap();
+        assert_eq!(cfg.blank_lines_upper_bound, 2);
+        assert_eq!(cfg.blank_lines_lower_bound, 1);
+    }
+
+    #[test]
+    fn parse_config_rejects_lower_exceeding_upper_blank_lines() {
+        let err = parse_config(
+            "blank_lines_upper_bound = 1\nblank_lines_lower_bound = 2",
+            "x",
+        )
+        .unwrap_err();
+        assert!(err.contains("blank_lines"), "{err}");
     }
 
     #[test]

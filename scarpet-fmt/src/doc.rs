@@ -25,8 +25,9 @@ pub enum Doc {
     SoftLine,
     /// Always a newline + indent. Forces the enclosing group to break.
     HardLine,
-    /// A blank line (two newlines) + indent. Forces the enclosing group to break.
-    BlankLine,
+    /// One or more blank lines (`n` ≥ 1, rendered as `n + 1` newlines) + indent.
+    /// Forces the enclosing group to break.
+    BlankLine(usize),
     /// `broken` when the enclosing group breaks, `flat` otherwise.
     IfBreak(Box<Doc>, Box<Doc>),
     /// A sequence of documents.
@@ -71,7 +72,14 @@ pub fn hardline() -> Doc {
 }
 
 pub fn blank_line() -> Doc {
-    Doc::BlankLine
+    blank_lines(1)
+}
+
+/// `n` blank lines (`n` ≥ 1), rendered as `n + 1` newlines + indent. Use
+/// [`hardline`] for a plain break with no blank line.
+pub fn blank_lines(n: usize) -> Doc {
+    debug_assert!(n >= 1, "blank_lines requires n >= 1");
+    Doc::BlankLine(n)
 }
 
 pub fn if_break(broken: Doc, flat: Doc) -> Doc {
@@ -151,23 +159,23 @@ impl Doc {
                         col += 1;
                     }
                     Mode::Break => {
-                        newline(&mut out, indent, false, line_ending);
+                        newline(&mut out, indent, 0, line_ending);
                         col = indent;
                     }
                 },
                 Doc::SoftLine => match mode {
                     Mode::Flat => {}
                     Mode::Break => {
-                        newline(&mut out, indent, false, line_ending);
+                        newline(&mut out, indent, 0, line_ending);
                         col = indent;
                     }
                 },
                 Doc::HardLine => {
-                    newline(&mut out, indent, false, line_ending);
+                    newline(&mut out, indent, 0, line_ending);
                     col = indent;
                 }
-                Doc::BlankLine => {
-                    newline(&mut out, indent, true, line_ending);
+                Doc::BlankLine(n) => {
+                    newline(&mut out, indent, *n, line_ending);
                     col = indent;
                 }
                 Doc::IfBreak(broken, flat) => {
@@ -194,14 +202,15 @@ impl Doc {
     }
 }
 
-/// Append the break `nl` (or a blank line: two of them) followed by `indent`
-/// spaces, trimming any trailing spaces from the line just finished.
-fn newline(out: &mut String, indent: isize, blank: bool, nl: &str) {
+/// Append a break (the line ending `nl`) followed by `indent` spaces, trimming
+/// any trailing spaces from the line just finished. `blanks` extra line endings
+/// are inserted first, so `blanks = 0` is a plain break and `blanks = n` leaves
+/// `n` blank lines.
+fn newline(out: &mut String, indent: isize, blanks: usize, nl: &str) {
     while out.ends_with(' ') {
         out.pop();
     }
-    out.push_str(nl);
-    if blank {
+    for _ in 0..=blanks {
         out.push_str(nl);
     }
     for _ in 0..indent {
@@ -241,7 +250,7 @@ fn fits(mut remaining: isize, doc: &Doc) -> bool {
                 }
             }
             Doc::SoftLine => {}
-            Doc::HardLine | Doc::BlankLine => return false,
+            Doc::HardLine | Doc::BlankLine(_) => return false,
             Doc::IfBreak(_, flat) => work.push(flat),
             Doc::Concat(parts) => {
                 for p in parts.iter().rev() {
@@ -282,7 +291,7 @@ fn push_comment(
     let lines = wrap_comment_body(prefix, body, col as usize, indent.max(0) as usize, width);
     for (i, line) in lines.iter().enumerate() {
         if i > 0 {
-            newline(out, indent, false, nl);
+            newline(out, indent, 0, nl);
         }
         out.push_str(line);
     }
@@ -384,6 +393,13 @@ mod tests {
     fn blank_line_emits_two_newlines() {
         let d = concat([text("a"), blank_line(), text("b")]);
         assert_eq!(d.render(80, None, W, "\n"), "a\n\nb");
+    }
+
+    #[test]
+    fn blank_lines_emit_n_plus_one_newlines() {
+        // `blank_lines(n)` leaves `n` blank lines, i.e. `n + 1` newlines.
+        let d = concat([text("a"), blank_lines(2), text("b")]);
+        assert_eq!(d.render(80, None, W, "\n"), "a\n\n\nb");
     }
 
     #[test]

@@ -25,3 +25,9 @@ overflow_delimited_expr = false
 # "front" (the head of the wrapped line). Assignment-like operators (=, +=, <>)
 # always stay "back".
 binop_separator = "back"
+# Maximum number of consecutive blank lines kept between statements; longer runs
+# are truncated to it.
+blank_lines_upper_bound = 1
+# Minimum number of blank lines forced between statements. Must not exceed
+# blank_lines_upper_bound.
+blank_lines_lower_bound = 0

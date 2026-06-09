@@ -24,7 +24,7 @@ These invariants are the crate's hard constraints: every feature below must pres
 
 | File | Responsibility |
 | --- | --- |
-| `config.rs` | The `Config` style struct (`indent_width`, `max_width`, `comment_width`, `line_ending`, `brace_style`, `trailing_comma`, `overflow_delimited_expr`) and its `Default`. |
+| `config.rs` | The `Config` style struct (`indent_width`, `max_width`, `comment_width`, `line_ending`, `brace_style`, `trailing_comma`, `overflow_delimited_expr`, `binop_separator`, `blank_lines_upper_bound`, `blank_lines_lower_bound`) and its `Default`. |
 | `lower.rs` | Walks the CST, one arm per `CstKind`, emitting `Doc` nodes. Threads `Config` through so layout knobs are reachable everywhere. Handles trivia placement (own-line vs trailing comments, blank-line reconstruction). |
 | `doc.rs` | The pretty-printing IR and its renderer. |
 | `trivia.rs` | Helpers for laying out a node's leading trivia. |
@@ -55,7 +55,7 @@ Three capabilities are intentionally absent today; several roadmap items below d
 
 ## Configuration today
 
-Seven knobs, parsed from `scarpet-fmt.toml` by the CLI (TOML parsing lives in `scarpet-cli` so this crate stays file-I/O-free and `wasm`-clean):
+Ten knobs, parsed from `scarpet-fmt.toml` by the CLI (TOML parsing lives in `scarpet-cli` so this crate stays file-I/O-free and `wasm`-clean):
 
 | Config field | TOML key | Default | rustfmt analogue |
 | --- | --- | --- | --- |
@@ -67,6 +67,8 @@ Seven knobs, parsed from `scarpet-fmt.toml` by the CLI (TOML parsing lives in `s
 | `trailing_comma` | `trailing_comma` | `"vertical"` | `trailing_comma` (`vertical` / `always` / `never`) |
 | `overflow_delimited_expr` | `overflow_delimited_expr` | `false` | `overflow_delimited_expr` |
 | `binop_separator` | `binop_separator` | `"back"` | `binop_separator` (`back` / `front`; rustfmt defaults `front`) |
+| `blank_lines_upper_bound` | `blank_lines_upper_bound` | `1` | `blank_lines_upper_bound` |
+| `blank_lines_lower_bound` | `blank_lines_lower_bound` | `0` | `blank_lines_lower_bound` |
 
 Everything else about the layout is currently fixed. The roadmap is to make the fixed choices configurable, matching rustfmt wherever an option has a Scarpet analogue.
 
@@ -107,8 +109,8 @@ Legend: ✅ done · 🟡 planned (has a Scarpet analogue) · ⬜ out of scope (R
 | rustfmt option | Status | Scarpet analogue / note |
 | --- | --- | --- |
 | `newline_style` | ✅ | `line_ending` — `lf` / `crlf` / `auto` / `native` |
-| `blank_lines_upper_bound` | 🟡 | currently fixed at 1 |
-| `blank_lines_lower_bound` | 🟡 | not enforced |
+| `blank_lines_upper_bound` | ✅ | max consecutive blank lines (default 1) |
+| `blank_lines_lower_bound` | ✅ | min blank lines between statements (default 0) |
 
 **Layout & delimiters**
 

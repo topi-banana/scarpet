@@ -140,6 +140,16 @@ pub struct Config {
     pub overflow_delimited_expr: bool,
     /// Where a binary operator sits when its expression wraps across lines.
     pub binop_separator: BinopSeparator,
+    /// The maximum number of consecutive blank lines kept between statements;
+    /// longer runs are truncated to it. The analogue of rustfmt's
+    /// `blank_lines_upper_bound`. Defaults to `1`, reproducing the original
+    /// fixed style (any run of blank lines collapses to a single one).
+    pub blank_lines_upper_bound: usize,
+    /// The minimum number of blank lines forced between statements; adjacent
+    /// statements get blanks inserted up to it. The analogue of rustfmt's
+    /// `blank_lines_lower_bound`. Defaults to `0` (no minimum). Assumed not to
+    /// exceed `blank_lines_upper_bound` (the CLI rejects that).
+    pub blank_lines_lower_bound: usize,
 }
 
 impl Default for Config {
@@ -153,6 +163,8 @@ impl Default for Config {
             trailing_comma: TrailingComma::Vertical,
             overflow_delimited_expr: false,
             binop_separator: BinopSeparator::Back,
+            blank_lines_upper_bound: 1,
+            blank_lines_lower_bound: 0,
         }
     }
 }
@@ -225,5 +237,15 @@ mod tests {
     #[test]
     fn default_config_uses_back_binop_separator() {
         assert_eq!(Config::default().binop_separator, BinopSeparator::Back);
+    }
+
+    #[test]
+    fn default_config_keeps_one_blank_line_upper_bound() {
+        assert_eq!(Config::default().blank_lines_upper_bound, 1);
+    }
+
+    #[test]
+    fn default_config_uses_zero_blank_line_lower_bound() {
+        assert_eq!(Config::default().blank_lines_lower_bound, 0);
     }
 }
