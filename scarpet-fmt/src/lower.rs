@@ -9,8 +9,8 @@
 use scarpet_syntax::parser::{BinOp, Cst, CstKind, Trivia, UnaryOp};
 
 use crate::doc::{
-    Doc, blank_lines, comment, concat, group, hardline, if_break, join, line, nest, nil, softline,
-    space, text,
+    Doc, blank_lines, comment, concat, group, group_capped, hardline, if_break, join, line, nest,
+    nil, softline, space, text,
 };
 use crate::trivia::{blank_lines_before, has_comment, own_line_comments, same_line_comment};
 use crate::{BinopSeparator, BraceStyle, Config, TrailingComma};
@@ -292,12 +292,38 @@ impl Lowerer<'_> {
             return concat([text(open), text(close)]);
         }
         let body = self.comma_separated(&items.iter().collect::<Vec<_>>());
-        group(concat([
-            self.open_delim(open, hug),
-            nest(concat([softline(), body, self.trailing_comma()])),
-            softline(),
-            text(close),
-        ]))
+        group_capped(
+            concat([
+                self.open_delim(open, hug),
+                nest(concat([softline(), body, self.trailing_comma()])),
+                softline(),
+                text(close),
+            ]),
+            self.width_cap(open),
+        )
+    }
+
+    /// The per-construct flat-width cap for a delimited collection, keyed by its
+    /// opening delimiter: `(` is a call's argument list ([`fn_call_width`]), `[`
+    /// a list ([`array_width`]), `{` a map ([`struct_lit_width`]). `(` reaches
+    /// [`collection`](Self::collection) only from [`call`](Self::call) — grouping
+    /// parens go through [`paren`](Self::paren) — so the mapping is unambiguous.
+    /// `None` leaves only `max_width` binding.
+    ///
+    /// The `overflow_delimited_expr` hug layout ([`call_hug_last`](Self::call_hug_last))
+    /// bypasses `collection`, so it is intentionally not capped: that knob already
+    /// dictates the layout.
+    ///
+    /// [`fn_call_width`]: Config::fn_call_width
+    /// [`array_width`]: Config::array_width
+    /// [`struct_lit_width`]: Config::struct_lit_width
+    fn width_cap(&self, open: &str) -> Option<usize> {
+        match open {
+            "(" => self.config.fn_call_width,
+            "[" => self.config.array_width,
+            "{" => self.config.struct_lit_width,
+            _ => None,
+        }
     }
 
     /// Join items with `, ` (breakable after each comma), lifting trailing
@@ -564,6 +590,39 @@ mod tests {
             &Config {
                 blank_lines_upper_bound: upper,
                 blank_lines_lower_bound: lower,
+                ..Config::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn fmt_fcw(src: &str, w: usize) -> String {
+        format_source(
+            src,
+            &Config {
+                fn_call_width: Some(w),
+                ..Config::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn fmt_aw(src: &str, w: usize) -> String {
+        format_source(
+            src,
+            &Config {
+                array_width: Some(w),
+                ..Config::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn fmt_slw(src: &str, w: usize) -> String {
+        format_source(
+            src,
+            &Config {
+                struct_lit_width: Some(w),
                 ..Config::default()
             },
         )
@@ -1052,5 +1111,62 @@ mod tests {
             fmt("// one two three four\nx"),
             "// one two three four\nx\n"
         );
+    }
+
+    // ---- width caps ------------------------------------------------
+
+    #[test]
+    fn fn_call_width_breaks_a_call_that_fits_the_line() {
+        // `f(a, b, c)` fits the 100-col line, but its `(a, b, c)` arg list is
+        // 9 cols — over the 5-col cap — so the call breaks one-arg-per-line.
+        assert_eq!(fmt_fcw("f(a, b, c)", 5), "f(\n    a,\n    b,\n    c,\n)\n");
+    }
+
+    #[test]
+    fn fn_call_width_unset_keeps_calls_flat() {
+        // The default (no cap) is unchanged: only `max_width` binds.
+        assert_eq!(fmt("f(a, b, c)"), "f(a, b, c)\n");
+    }
+
+    #[test]
+    fn fn_call_width_leaves_a_call_within_the_cap_flat() {
+        // `(a, b, c)` is 9 cols; a 20-col cap is looser, so it stays flat.
+        assert_eq!(fmt_fcw("f(a, b, c)", 20), "f(a, b, c)\n");
+    }
+
+    #[test]
+    fn array_width_breaks_a_list_that_fits_the_line() {
+        assert_eq!(fmt_aw("[1, 2, 3]", 5), "[\n    1,\n    2,\n    3,\n]\n");
+    }
+
+    #[test]
+    fn struct_lit_width_breaks_a_map_that_fits_the_line() {
+        assert_eq!(
+            fmt_slw("{'a' -> 1, 'b' -> 2}", 8),
+            "{\n    'a' -> 1,\n    'b' -> 2,\n}\n"
+        );
+    }
+
+    #[test]
+    fn width_caps_are_routed_by_delimiter() {
+        // A tight `fn_call_width` must not touch a list — it has its own cap, so
+        // the list stays flat...
+        assert_eq!(fmt_fcw("[1, 2, 3]", 1), "[1, 2, 3]\n");
+        // ...and a tight `array_width` leaves calls alone.
+        assert_eq!(fmt_aw("f(a, b, c)", 1), "f(a, b, c)\n");
+    }
+
+    #[test]
+    fn zero_fn_call_width_forces_every_nonempty_call_to_break() {
+        assert_eq!(fmt_fcw("f(a)", 0), "f(\n    a,\n)\n");
+        // An empty call has no items, so the early return keeps it bare.
+        assert_eq!(fmt_fcw("f()", 0), "f()\n");
+    }
+
+    #[test]
+    fn width_cap_is_idempotent() {
+        // Reformatting a cap-broken call must be a no-op.
+        let once = fmt_fcw("f(a, b, c)", 5);
+        assert_eq!(fmt_fcw(&once, 5), once);
     }
 }

@@ -35,8 +35,12 @@ pub enum Doc {
     /// Increase the indent of the contained document by `n` levels; each level
     /// is `indent_width` spaces, applied at render time.
     Nest(isize, Box<Doc>),
-    /// A group: rendered flat if it fits the remaining width, else broken.
-    Group(Box<Doc>),
+    /// A group: rendered flat if it fits the remaining width, else broken. The
+    /// optional `usize` is a per-construct cap on the group's *flat* width: it
+    /// stays flat only if its flat rendering fits within `min(remaining, cap)`,
+    /// so it can break before the global `max_width` is reached. `None` is
+    /// uncapped — only `max_width` binds.
+    Group(Box<Doc>, Option<usize>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,7 +95,14 @@ pub fn space() -> Doc {
 }
 
 pub fn group(d: Doc) -> Doc {
-    Doc::Group(Box::new(d))
+    Doc::Group(Box::new(d), None)
+}
+
+/// A group with an optional per-construct cap on its flat width: it stays flat
+/// only if its flat rendering fits within `min(remaining, cap)`, so it can
+/// break before the global `max_width`. `None` is identical to [`group`].
+pub fn group_capped(d: Doc, cap: Option<usize>) -> Doc {
+    Doc::Group(Box::new(d), cap)
 }
 
 /// Indent the contained document by one level. A level's width in spaces is
@@ -188,8 +199,16 @@ impl Doc {
                     }
                 }
                 Doc::Nest(n, d) => stack.push((indent + n * step, mode, d)),
-                Doc::Group(d) => {
-                    let m = if fits(width as isize - col, d) {
+                Doc::Group(d, cap) => {
+                    // The group fits only if its flat rendering is within the
+                    // remaining width *and* its own cap (if any) — `min` of the
+                    // two. The cap lets a construct break before `max_width`.
+                    let remaining = width as isize - col;
+                    let budget = match cap {
+                        Some(c) => remaining.min(*c as isize),
+                        None => remaining,
+                    };
+                    let m = if fits(budget, d) {
                         Mode::Flat
                     } else {
                         Mode::Break
@@ -261,7 +280,10 @@ fn fits(mut remaining: isize, doc: &Doc) -> bool {
             // broken, so the break/flat choice is independent of `indent_width`
             // — which is what keeps formatting idempotent per config.
             Doc::Nest(_, d) => work.push(d),
-            Doc::Group(d) => work.push(d),
+            // An inner group's own cap is ignored while measuring an enclosing
+            // group: the break/flat decision is local, so a cap forces only its
+            // own group — the parent sees the inner's flat width regardless.
+            Doc::Group(d, _) => work.push(d),
         }
     }
     true
@@ -469,5 +491,36 @@ mod tests {
             d.render(80, Some(13), W, "\n"),
             "(\n    // one\n    // two\n    // three"
         );
+    }
+
+    #[test]
+    fn capped_group_stays_flat_within_cap() {
+        // Flat body "a b" is 3 cols; both the 5-col cap and the 80-col line
+        // allow it, so the group stays flat.
+        let d = group_capped(concat([text("a"), line(), text("b")]), Some(5));
+        assert_eq!(d.render(80, None, W, "\n"), "a b");
+    }
+
+    #[test]
+    fn capped_group_breaks_below_global_width() {
+        // Flat body "aaa bbb" is 7 cols: it fits the 80-col line but exceeds
+        // the 5-col cap, so the cap alone forces the break.
+        let d = group_capped(concat([text("aaa"), line(), text("bbb")]), Some(5));
+        assert_eq!(d.render(80, None, W, "\n"), "aaa\nbbb");
+    }
+
+    #[test]
+    fn capped_group_ignores_cap_above_flat_width() {
+        // A cap looser than the body leaves only the global width binding, so
+        // the group behaves exactly like an uncapped one.
+        let d = group_capped(concat([text("aaa"), line(), text("bbb")]), Some(100));
+        assert_eq!(d.clone().render(80, None, W, "\n"), "aaa bbb");
+        assert_eq!(d.render(4, None, W, "\n"), "aaa\nbbb");
+    }
+
+    #[test]
+    fn zero_cap_forces_nonempty_group_to_break() {
+        let d = group_capped(concat([text("a"), line(), text("b")]), Some(0));
+        assert_eq!(d.render(80, None, W, "\n"), "a\nb");
     }
 }
