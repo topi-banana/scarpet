@@ -24,7 +24,7 @@ These invariants are the crate's hard constraints: every feature below must pres
 
 | File | Responsibility |
 | --- | --- |
-| `config.rs` | The `Config` style struct (`indent_width`, `max_width`, `comment_width`, `line_ending`, `brace_style`, `trailing_comma`, `binop_separator`, `blank_lines_upper_bound`, `blank_lines_lower_bound`) and its `Default`. |
+| `config.rs` | The `Config` style struct (`indent_width`, `max_width`, `comment_width`, `line_ending`, `brace_style`, `trailing_comma`, `overflow_delimited_expr`, `binop_separator`, `blank_lines_upper_bound`, `blank_lines_lower_bound`) and its `Default`. |
 | `lower.rs` | Walks the CST, one arm per `CstKind`, emitting `Doc` nodes. Threads `Config` through so layout knobs are reachable everywhere. Handles trivia placement (own-line vs trailing comments, blank-line reconstruction). |
 | `doc.rs` | The pretty-printing IR and its renderer. |
 | `trivia.rs` | Helpers for laying out a node's leading trivia. |
@@ -55,7 +55,7 @@ Three capabilities are intentionally absent today; several roadmap items below d
 
 ## Configuration today
 
-Nine knobs, parsed from `scarpet-fmt.toml` by the CLI (TOML parsing lives in `scarpet-cli` so this crate stays file-I/O-free and `wasm`-clean):
+Ten knobs, parsed from `scarpet-fmt.toml` by the CLI (TOML parsing lives in `scarpet-cli` so this crate stays file-I/O-free and `wasm`-clean):
 
 | Config field | TOML key | Default | rustfmt analogue |
 | --- | --- | --- | --- |
@@ -65,6 +65,7 @@ Nine knobs, parsed from `scarpet-fmt.toml` by the CLI (TOML parsing lives in `sc
 | `line_ending` | `line_ending` | `"lf"` | `newline_style` (`lf` / `crlf` / `auto` / `native`) |
 | `brace_style` | `brace_style` | `"same_line"` | partial `brace_style` / `indent_style` |
 | `trailing_comma` | `trailing_comma` | `"vertical"` | `trailing_comma` (`vertical` / `always` / `never`) |
+| `overflow_delimited_expr` | `overflow_delimited_expr` | `false` | `overflow_delimited_expr` |
 | `binop_separator` | `binop_separator` | `"back"` | `binop_separator` (`back` / `front`; rustfmt defaults `front`) |
 | `blank_lines_upper_bound` | `blank_lines_upper_bound` | `1` | `blank_lines_upper_bound` |
 | `blank_lines_lower_bound` | `blank_lines_lower_bound` | `0` | `blank_lines_lower_bound` |
@@ -119,7 +120,7 @@ Legend: ✅ done · 🟡 planned (has a Scarpet analogue) · ⬜ out of scope (R
 | `trailing_comma` | ✅ | `vertical` / `always` / `never` |
 | `fn_params_layout` | 🟡 | collection layout `Tall`/`Vertical`/`Compressed` (needs `Fill`) |
 | `fn_single_line` | 🟡 | collapse `f(x) -> (expr)` to one line |
-| `overflow_delimited_expr` | 🟡 | last-arg block/lambda hug (idiomatic in Scarpet) |
+| `overflow_delimited_expr` | ✅ | last-arg block / `;`-chain hug (idiomatic in Scarpet); arrow-lambda & list/map last args deferred |
 | `struct_lit_single_line` | 🟡 | map on one line (mostly already done) |
 
 **Literals & strings**

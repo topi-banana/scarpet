@@ -219,7 +219,68 @@ impl Lowerer<'_> {
     /// A call `callee(args)`. The argument list hugs the callee, so under
     /// [`BraceStyle::NextLine`] its `(` moves onto its own line.
     fn call(&self, callee: &Cst, args: &[Cst]) -> Doc {
+        // With `overflow_delimited_expr`, a call whose last argument is a
+        // block-like delimited expression keeps its leading args on the opening
+        // line and lets that block hug the closing `)` (see `call_hug_last`). A
+        // comment anywhere in the args falls back to the plain layout, where
+        // trivia placement is already settled.
+        if self.config.overflow_delimited_expr
+            && let Some((last, leading)) = args.split_last()
+            && is_huggable_last(last)
+            && !args.iter().any(has_leading_comment)
+        {
+            return self.call_hug_last(callee, leading, last);
+        }
         concat([self.expr(callee), self.collection("(", args, ")", true)])
+    }
+
+    /// Lower a call whose last argument is a block-like delimited expression
+    /// that "hugs" the closing `)`: the leading args stay on the opening line,
+    /// the block's body breaks inside, and no trailing comma follows it. A
+    /// `Paren` arg keeps its own `(`…`)` (`foo(x, ( … ))`); a bare `;`-chain
+    /// reuses the call's own `(`…`)` as the block delimiters (`loop(count, … )`).
+    /// Gated by [`is_huggable_last`].
+    fn call_hug_last(&self, callee: &Cst, leading: &[Cst], last: &Cst) -> Doc {
+        // The leading args plus their separating comma, kept flat in their own
+        // group so a wide block does not explode them; they break one-per-line
+        // only if they themselves overflow.
+        let head = if leading.is_empty() {
+            nil()
+        } else {
+            concat([
+                nest(group(
+                    self.comma_separated(&leading.iter().collect::<Vec<_>>()),
+                )),
+                text(","),
+            ])
+        };
+        match &last.kind {
+            CstKind::Paren(inner) => concat([
+                self.expr(callee),
+                text("("),
+                head,
+                // A space before the hugging `(` only when leading args precede it.
+                if leading.is_empty() { nil() } else { space() },
+                self.paren(inner, false),
+                text(")"),
+            ]),
+            CstKind::Binary {
+                op: BinOp::Semi, ..
+            } => {
+                let stmts = flatten_left(BinOp::Semi, last);
+                concat([
+                    self.expr(callee),
+                    group(concat([
+                        text("("),
+                        head,
+                        nest(concat([hardline(), self.statement_seq(&stmts)])),
+                        hardline(),
+                        text(")"),
+                    ])),
+                ])
+            }
+            _ => unreachable!("is_huggable_last restricts the last arg to these"),
+        }
     }
 
     /// A delimited, comma-separated sequence (`(...)`, `[...]`, `{...}`). Laid
@@ -337,6 +398,26 @@ fn is_semi_chain(cst: &Cst) -> bool {
     )
 }
 
+/// Whether `cst` may "hug" a call's closing `)` as the last argument under
+/// `overflow_delimited_expr`: a `(a;b)` paren block or a bare `a;b` semi-chain.
+/// `List`/`Map` and non-block parens are deliberately excluded for now.
+fn is_huggable_last(cst: &Cst) -> bool {
+    match &cst.kind {
+        CstKind::Paren(inner) => is_semi_chain(inner),
+        CstKind::Binary {
+            op: BinOp::Semi, ..
+        } => true,
+        _ => false,
+    }
+}
+
+/// Whether `cst` carries any leading comment trivia. The hug layout bails when
+/// an argument has one, deferring to the plain `collection` path whose comment
+/// placement is already settled.
+fn has_leading_comment(cst: &Cst) -> bool {
+    cst.leading.iter().any(|t| matches!(t, Trivia::Comment(_)))
+}
+
 // ---- chain flattening ----------------------------------------------
 
 /// Collect the operands of a left-nested chain of `op` (`((a op b) op c)` →
@@ -449,6 +530,17 @@ mod tests {
             src,
             &Config {
                 trailing_comma,
+                ..Config::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn fmt_ode(src: &str) -> String {
+        format_source(
+            src,
+            &Config {
+                overflow_delimited_expr: true,
                 ..Config::default()
             },
         )
@@ -629,6 +721,96 @@ mod tests {
         }
         expected.push_str("]\n");
         assert_eq!(fmt_tc(&src, TrailingComma::Never), expected);
+    }
+
+    // ---- overflow_delimited_expr (last-arg hug) --------------------
+
+    #[test]
+    fn hug_bare_semi_last_arg() {
+        // The call's own parens become the block delimiters: `count` stays on
+        // the opening line, the body indents, and no trailing comma follows.
+        assert_eq!(
+            fmt_ode("loop(count, a; b)"),
+            "loop(count,\n    a;\n    b;\n)\n"
+        );
+    }
+
+    #[test]
+    fn hug_paren_block_last_arg() {
+        // A `(…)` arg keeps its own parens, hugging after `x, ` and closing `))`.
+        assert_eq!(fmt_ode("foo(x, (a; b))"), "foo(x, (\n    a;\n    b;\n))\n");
+    }
+
+    #[test]
+    fn hug_single_arg_block() {
+        // A lone block arg has no leading args: just `if(` then the body.
+        assert_eq!(fmt_ode("if(a; b)"), "if(\n    a;\n    b;\n)\n");
+    }
+
+    #[test]
+    fn hug_off_by_default() {
+        // Without the knob, every arg explodes one-per-line with a trailing comma.
+        assert_eq!(
+            fmt("loop(count, a; b)"),
+            "loop(\n    count,\n    a;\n    b;,\n)\n"
+        );
+    }
+
+    #[test]
+    fn hug_keeps_short_call_flat() {
+        // No block-like last arg, and it fits: untouched.
+        assert_eq!(fmt_ode("f(a, b, c)"), "f(a, b, c)\n");
+    }
+
+    #[test]
+    fn hug_multiple_leading_args() {
+        // Several leading args stay on the opening line before the block.
+        assert_eq!(fmt_ode("foo(x, y, a; b)"), "foo(x, y,\n    a;\n    b;\n)\n");
+    }
+
+    #[test]
+    fn hug_overrides_trailing_comma_always() {
+        // The hugged block never gets a trailing comma, even under `Always`.
+        let out = format_source(
+            "loop(count, a; b)",
+            &Config {
+                overflow_delimited_expr: true,
+                trailing_comma: TrailingComma::Always,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(out, "loop(count,\n    a;\n    b;\n)\n");
+    }
+
+    #[test]
+    fn hug_bails_on_comment() {
+        // A comment among the args falls back to the plain (non-hug) layout.
+        let src = "loop(count, // note\na; b)";
+        assert_eq!(fmt_ode(src), fmt(src));
+    }
+
+    #[test]
+    fn hug_ignores_non_block_last_arg() {
+        // A `[…]` last arg is not block-like, so the plain layout applies even
+        // when it is wide enough to break.
+        let wide = format!("foo(x, [{}])", ["1"; 60].join(", "));
+        assert_eq!(fmt_ode(&wide), fmt(&wide));
+    }
+
+    #[test]
+    fn hug_under_next_line_braces() {
+        // Hugging keeps the block on the head line regardless of brace style.
+        let out = format_source(
+            "loop(count, a; b)",
+            &Config {
+                overflow_delimited_expr: true,
+                brace_style: BraceStyle::NextLine,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(out, "loop(count,\n    a;\n    b;\n)\n");
     }
 
     // ---- binop separator -------------------------------------------
