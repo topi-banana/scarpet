@@ -12,8 +12,8 @@ use crate::doc::{
     Doc, blank_line, comment, concat, group, hardline, if_break, join, line, nest, nil, softline,
     space, text,
 };
-use crate::trivia::{has_blank_before, own_line_comments, same_line_comment};
-use crate::{BraceStyle, Config, TrailingComma};
+use crate::trivia::{has_blank_before, has_comment, own_line_comments, same_line_comment};
+use crate::{BinopSeparator, BraceStyle, Config, TrailingComma};
 
 /// Lower a whole program (the CST root) to a document.
 pub fn program(root: &Cst, config: &Config) -> Doc {
@@ -101,10 +101,32 @@ impl Lowerer<'_> {
                 self.node_body(rhs),
             ]);
         }
+        let op_doc = text(bin_op_str(op));
+        // `Front` moves the operator to the head of the wrapped line. It only
+        // applies to the non-assignment operators (an assignment's RHS reads
+        // better hugging the `=` line) and only when the RHS carries no leading
+        // comment: the operator's leading trivia binds to the RHS on re-parse,
+        // so a comment there would rebind to a different anchor under `Front` and
+        // break idempotency. A comment leaves it to the `Back` path below, where
+        // `child_after` already lifts both comment shapes non-destructively. The
+        // flat rendering is byte-identical to `Back` (`a op b`), so the
+        // break/flat fit decision — and thus the corpus output — is unchanged.
+        if self.config.binop_separator == BinopSeparator::Front
+            && !is_assign_like(op)
+            && !has_comment(&rhs.leading)
+        {
+            return group(concat([
+                self.expr(lhs),
+                line(),
+                op_doc,
+                space(),
+                self.expr(rhs),
+            ]));
+        }
         group(concat([
             self.expr(lhs),
             space(),
-            text(bin_op_str(op)),
+            op_doc,
             self.child_after(line(), rhs),
         ]))
     }
@@ -345,6 +367,13 @@ fn is_atom(cst: &Cst) -> bool {
     )
 }
 
+/// Whether `op` is an assignment-like operator (`=`, `+=`, `<>`). These keep the
+/// operator in tail position regardless of [`BinopSeparator`], so their RHS hugs
+/// the operator line (`x =` ⏎ `value`) rather than dropping the `=` below.
+fn is_assign_like(op: BinOp) -> bool {
+    matches!(op, BinOp::Assign | BinOp::AddAssign | BinOp::Swap)
+}
+
 fn is_semi_chain(cst: &Cst) -> bool {
     matches!(
         &cst.kind,
@@ -454,7 +483,7 @@ fn unary_op_str(op: UnaryOp) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use crate::{BraceStyle, Config, TrailingComma, format_source};
+    use crate::{BinopSeparator, BraceStyle, Config, TrailingComma, format_source};
 
     fn fmt(src: &str) -> String {
         format_source(src, &Config::default()).unwrap()
@@ -498,6 +527,17 @@ mod tests {
             src,
             &Config {
                 overflow_delimited_expr: true,
+                ..Config::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn fmt_bs(src: &str, binop_separator: BinopSeparator) -> String {
+        format_source(
+            src,
+            &Config {
+                binop_separator,
                 ..Config::default()
             },
         )
@@ -745,6 +785,87 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, "loop(count,\n    a;\n    b;\n)\n");
+    }
+
+    // ---- binop separator -------------------------------------------
+
+    #[test]
+    fn binop_separator_defaults_to_back() {
+        // `Back` is the default, and a flat expression is identical either way.
+        assert_eq!(fmt("a + b"), "a + b\n");
+        assert_eq!(fmt_bs("a + b", BinopSeparator::Back), "a + b\n");
+        assert_eq!(fmt_bs("a + b", BinopSeparator::Front), "a + b\n");
+    }
+
+    #[test]
+    fn binop_separator_back_breaks_operator_at_tail() {
+        // Too wide to fit: `Back` leaves the operator at the end of the line.
+        let a = "a".repeat(60);
+        let b = "b".repeat(60);
+        let src = format!("{a} + {b}");
+        assert_eq!(fmt_bs(&src, BinopSeparator::Back), format!("{a} +\n{b}\n"));
+    }
+
+    #[test]
+    fn binop_separator_front_breaks_operator_at_head() {
+        // The same expression under `Front`: the operator leads the wrapped line.
+        let a = "a".repeat(60);
+        let b = "b".repeat(60);
+        let src = format!("{a} + {b}");
+        assert_eq!(fmt_bs(&src, BinopSeparator::Front), format!("{a}\n+ {b}\n"));
+    }
+
+    #[test]
+    fn binop_separator_front_keeps_assignment_back() {
+        // Assignment-like operators stay `Back` even under `Front`, so the RHS
+        // keeps hugging the operator line rather than dropping the `=` below.
+        let a = "a".repeat(60);
+        let b = "b".repeat(60);
+        assert_eq!(
+            fmt_bs(&format!("{a} = {b}"), BinopSeparator::Front),
+            format!("{a} =\n{b}\n")
+        );
+        assert_eq!(
+            fmt_bs(&format!("{a} += {b}"), BinopSeparator::Front),
+            format!("{a} +=\n{b}\n")
+        );
+    }
+
+    #[test]
+    fn binop_separator_front_breaks_only_the_wide_group_in_a_chain() {
+        // `((a + b) + c)`: the outer chain overflows and breaks, but the inner
+        // `a + b` still fits, so only the outer operator leads a new line. Each
+        // operator sits in its own group, so the break is per-group.
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        let c = "c".repeat(40);
+        let src = format!("{a} + {b} + {c}");
+        assert_eq!(
+            fmt_bs(&src, BinopSeparator::Front),
+            format!("{a} + {b}\n+ {c}\n")
+        );
+    }
+
+    #[test]
+    fn binop_separator_front_inside_assignment() {
+        // `x = a + b`: the outer `=` stays `Back` (RHS on its own line), and the
+        // inner `+` chain breaks `Front`.
+        let a = "a".repeat(50);
+        let b = "b".repeat(50);
+        let src = format!("x = {a} + {b}");
+        assert_eq!(
+            fmt_bs(&src, BinopSeparator::Front),
+            format!("x =\n{a}\n+ {b}\n")
+        );
+    }
+
+    #[test]
+    fn binop_separator_front_is_idempotent() {
+        // Formatting the broken `Front` output again must be a no-op.
+        let a = "a".repeat(60);
+        let b = "b".repeat(60);
+        let once = fmt_bs(&format!("{a} + {b}"), BinopSeparator::Front);
+        assert_eq!(fmt_bs(&once, BinopSeparator::Front), once);
     }
 
     // ---- brace style -----------------------------------------------

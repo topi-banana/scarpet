@@ -6,7 +6,9 @@ use ariadne::{Label, Report, ReportKind, Source};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rustyline::error::ReadlineError;
 use rustyline::{DefaultEditor, EventHandler, KeyCode, KeyEvent, Modifiers};
-use scarpet_fmt::{BraceStyle, Config, FmtError, LineEnding, TrailingComma, format_source};
+use scarpet_fmt::{
+    BinopSeparator, BraceStyle, Config, FmtError, LineEnding, TrailingComma, format_source,
+};
 use scarpet_syntax::ast::{Code, LowerError};
 use scarpet_syntax::parser::{ParseError, has_open_delimiter, parse_source};
 use scarpet_vm::{Evalute, GlobalState, ScarpetVm};
@@ -95,6 +97,9 @@ struct ConfigFile {
     /// Whether a call's last `(…)` block or bare `;`-chain argument hugs the
     /// closing `)` instead of exploding every argument. Defaults to `false`.
     overflow_delimited_expr: Option<bool>,
+    /// Where a wrapping binary operator sits: `"back"` (default, at the line's
+    /// tail) or `"front"` (at the head of the wrapped line).
+    binop_separator: Option<String>,
 }
 
 /// Resolve the formatting [`Config`]. An explicit `--config` path must exist
@@ -156,6 +161,16 @@ fn parse_config(text: &str, name: &str) -> Result<Config, String> {
             ));
         }
     };
+    let binop_separator = match file.binop_separator.as_deref() {
+        None => default.binop_separator,
+        Some("back") => BinopSeparator::Back,
+        Some("front") => BinopSeparator::Front,
+        Some(other) => {
+            return Err(format!(
+                "{name}: binop_separator must be \"back\" or \"front\", got {other:?}"
+            ));
+        }
+    };
     let config = Config {
         indent_width: file.indent.unwrap_or(default.indent_width),
         max_width: file.max_width.unwrap_or(default.max_width),
@@ -175,6 +190,7 @@ fn parse_config(text: &str, name: &str) -> Result<Config, String> {
         overflow_delimited_expr: file
             .overflow_delimited_expr
             .unwrap_or(default.overflow_delimited_expr),
+        binop_separator,
     };
     if config.max_width == 0 {
         return Err(format!("{name}: max_width must be at least 1"));
@@ -738,6 +754,32 @@ mod tests {
     fn parse_config_reads_overflow_delimited_expr() {
         let cfg = parse_config("overflow_delimited_expr = true", "x").unwrap();
         assert!(cfg.overflow_delimited_expr);
+    }
+
+    #[test]
+    fn parse_config_defaults_binop_separator_to_back() {
+        assert_eq!(
+            parse_config("", "x").unwrap().binop_separator,
+            BinopSeparator::Back
+        );
+    }
+
+    #[test]
+    fn parse_config_reads_back_binop_separator() {
+        let cfg = parse_config("binop_separator = \"back\"", "x").unwrap();
+        assert_eq!(cfg.binop_separator, BinopSeparator::Back);
+    }
+
+    #[test]
+    fn parse_config_reads_front_binop_separator() {
+        let cfg = parse_config("binop_separator = \"front\"", "x").unwrap();
+        assert_eq!(cfg.binop_separator, BinopSeparator::Front);
+    }
+
+    #[test]
+    fn parse_config_rejects_unknown_binop_separator() {
+        let err = parse_config("binop_separator = \"middle\"", "x").unwrap_err();
+        assert!(err.contains("binop_separator"), "{err}");
     }
 
     #[test]
