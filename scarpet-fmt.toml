@@ -18,6 +18,9 @@ brace_style = "same_line"
 # Trailing comma after the last item of a block: "vertical" (only when the block
 # breaks across lines), "always" (also on one-liners), or "never".
 trailing_comma = "vertical"
+# Hug a call's last block / ;-chain argument onto the opening line instead of
+# exploding every argument one-per-line: false (default) or true.
+overflow_delimited_expr = false
 # Where a wrapping binary operator sits: "back" (default, at the line's tail) or
 # "front" (the head of the wrapped line). Assignment-like operators (=, +=, <>)
 # always stay "back".

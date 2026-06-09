@@ -133,6 +133,11 @@ pub struct Config {
     pub brace_style: BraceStyle,
     /// Whether the last item of a `()`/`[]`/`{}` carries a trailing comma.
     pub trailing_comma: TrailingComma,
+    /// Whether a call's last argument — when it is a `(…)` block or a bare
+    /// `;`-chain — "hugs" the closing `)`, keeping the leading arguments on the
+    /// opening line instead of exploding every argument one-per-line. The rough
+    /// analogue of rustfmt's `overflow_delimited_expr`; off by default.
+    pub overflow_delimited_expr: bool,
     /// Where a binary operator sits when its expression wraps across lines.
     pub binop_separator: BinopSeparator,
 }
@@ -146,6 +151,7 @@ impl Default for Config {
             line_ending: LineEnding::Lf,
             brace_style: BraceStyle::SameLine,
             trailing_comma: TrailingComma::Vertical,
+            overflow_delimited_expr: false,
             binop_separator: BinopSeparator::Back,
         }
     }
@@ -209,6 +215,11 @@ mod tests {
     #[test]
     fn default_config_uses_vertical_trailing_comma() {
         assert_eq!(Config::default().trailing_comma, TrailingComma::Vertical);
+    }
+
+    #[test]
+    fn default_config_disables_overflow_delimited_expr() {
+        assert!(!Config::default().overflow_delimited_expr);
     }
 
     #[test]

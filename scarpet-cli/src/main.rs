@@ -94,6 +94,9 @@ struct ConfigFile {
     /// Trailing comma after the last item of a block: `"vertical"` (default),
     /// `"always"`, or `"never"`.
     trailing_comma: Option<String>,
+    /// Whether a call's last `(…)` block or bare `;`-chain argument hugs the
+    /// closing `)` instead of exploding every argument. Defaults to `false`.
+    overflow_delimited_expr: Option<bool>,
     /// Where a wrapping binary operator sits: `"back"` (default, at the line's
     /// tail) or `"front"` (at the head of the wrapped line).
     binop_separator: Option<String>,
@@ -184,6 +187,9 @@ fn parse_config(text: &str, name: &str) -> Result<Config, String> {
         line_ending,
         brace_style,
         trailing_comma,
+        overflow_delimited_expr: file
+            .overflow_delimited_expr
+            .unwrap_or(default.overflow_delimited_expr),
         binop_separator,
     };
     if config.max_width == 0 {
@@ -737,6 +743,17 @@ mod tests {
     fn parse_config_rejects_unknown_trailing_comma() {
         let err = parse_config("trailing_comma = \"sometimes\"", "x").unwrap_err();
         assert!(err.contains("trailing_comma"), "{err}");
+    }
+
+    #[test]
+    fn parse_config_defaults_overflow_delimited_expr_to_false() {
+        assert!(!parse_config("", "x").unwrap().overflow_delimited_expr);
+    }
+
+    #[test]
+    fn parse_config_reads_overflow_delimited_expr() {
+        let cfg = parse_config("overflow_delimited_expr = true", "x").unwrap();
+        assert!(cfg.overflow_delimited_expr);
     }
 
     #[test]
