@@ -9,7 +9,10 @@ use scarpet_vm::{Evalute, GlobalState, ScarpetVm};
 
 use crate::shared::{SharedBuffer, diagnostics_for};
 
-/// The outcome of running one cell, as rendered beneath it.
+/// The outcome of running one cell, as rendered beneath it. `Clone`/`PartialEq`
+/// let it ride in a [`CellView`](crate::notebook::CellView)'s props and skip
+/// re-rendering when unchanged.
+#[derive(Clone, PartialEq)]
 pub enum CellOutput {
     /// Never run, or cleared by a restart.
     NotRun,
