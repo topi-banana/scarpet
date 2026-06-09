@@ -1,0 +1,11 @@
+[package]
+name = "scarpet-lsp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-lsp = { version = "0.2.4", features = ["tokio"] }
+scarpet-fmt = { path = "../scarpet-fmt" }
+scarpet-syntax = { path = "../scarpet-syntax" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
+tower = "0.5"
