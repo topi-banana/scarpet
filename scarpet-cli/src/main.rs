@@ -636,7 +636,7 @@ mod tests {
     fn parse_format(argv: &[&str]) -> Result<FormatArgs, clap::Error> {
         Cli::try_parse_from(argv.iter().copied()).map(|cli| match cli.cmd {
             Cmd::Format(args) => args,
-            Cmd::Repl => unreachable!("parse_format only parses `format` invocations"),
+            Cmd::Repl | Cmd::Lsp => unreachable!("parse_format only parses `format` invocations"),
         })
     }
 
