@@ -8,11 +8,11 @@
 use scarpet_fmt::{BraceStyle, Config, LineEnding};
 use yew::prelude::*;
 
+use crate::components::header::Header;
+use crate::components::options::OptionsBar;
 use crate::editor::{EditorActions, EditorView, Mode, SAMPLE};
-use crate::header::Header;
+use crate::notebook::session::{CellOutput, Session};
 use crate::notebook::{Notebook, NotebookActions, NotebookView};
-use crate::options::OptionsBar;
-use crate::session::{CellOutput, Session};
 
 /// Which screen is showing.
 #[derive(Clone, Copy, PartialEq)]
