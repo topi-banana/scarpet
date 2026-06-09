@@ -155,17 +155,28 @@ pub struct EditorActionsProps {
 }
 
 /// The editor's header buttons (Syntax tree / AST / Format / Run).
-#[function_component(EditorActions)]
-pub fn editor_actions(props: &EditorActionsProps) -> Html {
-    let run = |mode: Mode| {
-        let cb = props.on_run.clone();
-        Callback::from(move |_: web_sys::MouseEvent| cb.emit(mode))
-    };
-    html! {
-        <button onclick={run(Mode::Syntax)} class={classes!(BTN_BASE, BTN_BORDERED)}>{ "Syntax tree" }</button>
-        <button onclick={run(Mode::Ast)} class={classes!(BTN_BASE, BTN_BORDERED)}>{ "AST" }</button>
-        <button onclick={run(Mode::Format)} class={classes!(BTN_BASE, BTN_INK)}>{ "Format" }</button>
-        <button onclick={run(Mode::Run)} class={classes!(BTN_BASE, BTN_LINK)}>{ "Run" }</button>
+pub struct EditorActions;
+
+impl Component for EditorActions {
+    type Message = ();
+    type Properties = EditorActionsProps;
+
+    fn create(_ctx: &Context<Self>) -> Self {
+        Self
+    }
+
+    fn view(&self, ctx: &Context<Self>) -> Html {
+        let props = ctx.props();
+        let run = |mode: Mode| {
+            let cb = props.on_run.clone();
+            Callback::from(move |_: web_sys::MouseEvent| cb.emit(mode))
+        };
+        html! {
+            <button onclick={run(Mode::Syntax)} class={classes!(BTN_BASE, BTN_BORDERED)}>{ "Syntax tree" }</button>
+            <button onclick={run(Mode::Ast)} class={classes!(BTN_BASE, BTN_BORDERED)}>{ "AST" }</button>
+            <button onclick={run(Mode::Format)} class={classes!(BTN_BASE, BTN_INK)}>{ "Format" }</button>
+            <button onclick={run(Mode::Run)} class={classes!(BTN_BASE, BTN_LINK)}>{ "Run" }</button>
+        }
     }
 }
 
@@ -182,45 +193,56 @@ pub struct EditorViewProps {
 
 /// The two-pane body: input textarea on the left, output (and any diagnostics)
 /// on the right.
-#[function_component(EditorView)]
-pub fn editor_view(props: &EditorViewProps) -> Html {
-    let oninput = {
-        let cb = props.on_input.clone();
-        Callback::from(move |e: web_sys::InputEvent| {
-            let textarea: HtmlTextAreaElement = e.target_unchecked_into();
-            cb.emit(textarea.value());
-        })
-    };
-    let output_title = props.mode.map_or("Output", Mode::output_title);
+pub struct EditorView;
 
-    let diagnostics = if props.diagnostics.is_empty() {
-        html! {}
-    } else {
+impl Component for EditorView {
+    type Message = ();
+    type Properties = EditorViewProps;
+
+    fn create(_ctx: &Context<Self>) -> Self {
+        Self
+    }
+
+    fn view(&self, ctx: &Context<Self>) -> Html {
+        let props = ctx.props();
+        let oninput = {
+            let cb = props.on_input.clone();
+            Callback::from(move |e: web_sys::InputEvent| {
+                let textarea: HtmlTextAreaElement = e.target_unchecked_into();
+                cb.emit(textarea.value());
+            })
+        };
+        let output_title = props.mode.map_or("Output", Mode::output_title);
+
+        let diagnostics = if props.diagnostics.is_empty() {
+            html! {}
+        } else {
+            html! {
+                <div class="max-h-40 shrink-0 overflow-auto border-t border-hairline bg-canvas px-4 py-2 font-mono text-xs text-error">
+                    <div class="pb-1 font-medium">{ props.diagnostics_title.clone() }</div>
+                    { for props.diagnostics.iter().map(|d| html! { <div class="py-0.5">{ d }</div> }) }
+                </div>
+            }
+        };
+
         html! {
-            <div class="max-h-40 shrink-0 overflow-auto border-t border-hairline bg-canvas px-4 py-2 font-mono text-xs text-error">
-                <div class="pb-1 font-medium">{ props.diagnostics_title.clone() }</div>
-                { for props.diagnostics.iter().map(|d| html! { <div class="py-0.5">{ d }</div> }) }
-            </div>
+            <main class="grid min-h-0 flex-1 grid-cols-1 md:grid-cols-2">
+                <section class="flex min-h-0 flex-col border-b border-hairline md:border-b-0 md:border-r">
+                    <div class={LABEL}>{ "Input" }</div>
+                    <textarea
+                        class={EDITOR}
+                        spellcheck="false"
+                        placeholder="Type Scarpet source here…"
+                        value={props.input.clone()}
+                        oninput={oninput}
+                    />
+                </section>
+                <section class="flex min-h-0 flex-col">
+                    <div class={LABEL}>{ output_title }</div>
+                    <pre class={EDITOR}>{ props.output.clone() }</pre>
+                    { diagnostics }
+                </section>
+            </main>
         }
-    };
-
-    html! {
-        <main class="grid min-h-0 flex-1 grid-cols-1 md:grid-cols-2">
-            <section class="flex min-h-0 flex-col border-b border-hairline md:border-b-0 md:border-r">
-                <div class={LABEL}>{ "Input" }</div>
-                <textarea
-                    class={EDITOR}
-                    spellcheck="false"
-                    placeholder="Type Scarpet source here…"
-                    value={props.input.clone()}
-                    oninput={oninput}
-                />
-            </section>
-            <section class="flex min-h-0 flex-col">
-                <div class={LABEL}>{ output_title }</div>
-                <pre class={EDITOR}>{ props.output.clone() }</pre>
-                { diagnostics }
-            </section>
-        </main>
     }
 }

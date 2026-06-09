@@ -183,24 +183,35 @@ pub struct NotebookActionsProps {
 }
 
 /// The notebook's header buttons (Add cell / Restart / Run all).
-#[function_component(NotebookActions)]
-pub fn notebook_actions(props: &NotebookActionsProps) -> Html {
-    let on_add = {
-        let cb = props.on_add.clone();
-        Callback::from(move |_: web_sys::MouseEvent| cb.emit(()))
-    };
-    let on_restart = {
-        let cb = props.on_restart.clone();
-        Callback::from(move |_: web_sys::MouseEvent| cb.emit(()))
-    };
-    let on_run_all = {
-        let cb = props.on_run_all.clone();
-        Callback::from(move |_: web_sys::MouseEvent| cb.emit(()))
-    };
-    html! {
-        <button onclick={on_add} class={classes!(BTN_BASE, BTN_BORDERED)}>{ "Add cell" }</button>
-        <button onclick={on_restart} class={classes!(BTN_BASE, BTN_BORDERED)}>{ "Restart" }</button>
-        <button onclick={on_run_all} class={classes!(BTN_BASE, BTN_LINK)}>{ "Run all" }</button>
+pub struct NotebookActions;
+
+impl Component for NotebookActions {
+    type Message = ();
+    type Properties = NotebookActionsProps;
+
+    fn create(_ctx: &Context<Self>) -> Self {
+        Self
+    }
+
+    fn view(&self, ctx: &Context<Self>) -> Html {
+        let props = ctx.props();
+        let on_add = {
+            let cb = props.on_add.clone();
+            Callback::from(move |_: web_sys::MouseEvent| cb.emit(()))
+        };
+        let on_restart = {
+            let cb = props.on_restart.clone();
+            Callback::from(move |_: web_sys::MouseEvent| cb.emit(()))
+        };
+        let on_run_all = {
+            let cb = props.on_run_all.clone();
+            Callback::from(move |_: web_sys::MouseEvent| cb.emit(()))
+        };
+        html! {
+            <button onclick={on_add} class={classes!(BTN_BASE, BTN_BORDERED)}>{ "Add cell" }</button>
+            <button onclick={on_restart} class={classes!(BTN_BASE, BTN_BORDERED)}>{ "Restart" }</button>
+            <button onclick={on_run_all} class={classes!(BTN_BASE, BTN_LINK)}>{ "Run all" }</button>
+        }
     }
 }
 
@@ -217,35 +228,46 @@ pub struct NotebookViewProps {
 }
 
 /// The scrollable column of cells, with a trailing "Add cell" button.
-#[function_component(NotebookView)]
-pub fn notebook_view(props: &NotebookViewProps) -> Html {
-    let on_add = {
-        let cb = props.on_add.clone();
-        Callback::from(move |_: web_sys::MouseEvent| cb.emit(()))
-    };
-    html! {
-        <main class="min-h-0 flex-1 overflow-auto bg-canvas-soft p-6">
-            <div class="mx-auto flex max-w-4xl flex-col gap-4">
-                { for props.cells.iter().map(|cell| html! {
-                    <CellView
-                        key={cell.id.to_string()}
-                        id={cell.id}
-                        source={cell.source.clone()}
-                        output={cell.output.clone()}
-                        exec={cell.exec}
-                        on_edit={props.on_edit.clone()}
-                        on_run={props.on_run.clone()}
-                        on_format={props.on_format.clone()}
-                        on_delete={props.on_delete.clone()}
-                        on_move_up={props.on_move_up.clone()}
-                        on_move_down={props.on_move_down.clone()}
-                    />
-                }) }
-                <div>
-                    <button onclick={on_add} class={classes!(BTN_SM, BTN_BORDERED)}>{ "+ Add cell" }</button>
+pub struct NotebookView;
+
+impl Component for NotebookView {
+    type Message = ();
+    type Properties = NotebookViewProps;
+
+    fn create(_ctx: &Context<Self>) -> Self {
+        Self
+    }
+
+    fn view(&self, ctx: &Context<Self>) -> Html {
+        let props = ctx.props();
+        let on_add = {
+            let cb = props.on_add.clone();
+            Callback::from(move |_: web_sys::MouseEvent| cb.emit(()))
+        };
+        html! {
+            <main class="min-h-0 flex-1 overflow-auto bg-canvas-soft p-6">
+                <div class="mx-auto flex max-w-4xl flex-col gap-4">
+                    { for props.cells.iter().map(|cell| html! {
+                        <CellView
+                            key={cell.id.to_string()}
+                            id={cell.id}
+                            source={cell.source.clone()}
+                            output={cell.output.clone()}
+                            exec={cell.exec}
+                            on_edit={props.on_edit.clone()}
+                            on_run={props.on_run.clone()}
+                            on_format={props.on_format.clone()}
+                            on_delete={props.on_delete.clone()}
+                            on_move_up={props.on_move_up.clone()}
+                            on_move_down={props.on_move_down.clone()}
+                        />
+                    }) }
+                    <div>
+                        <button onclick={on_add} class={classes!(BTN_SM, BTN_BORDERED)}>{ "+ Add cell" }</button>
+                    </div>
                 </div>
-            </div>
-        </main>
+            </main>
+        }
     }
 }
 
@@ -264,81 +286,92 @@ pub struct CellViewProps {
 }
 
 /// One cell: badge gutter, editor textarea, per-cell controls, and its output.
-#[function_component(CellView)]
-pub fn cell_view(props: &CellViewProps) -> Html {
-    let id = props.id;
+pub struct CellView;
 
-    let oninput = {
-        let cb = props.on_edit.clone();
-        Callback::from(move |e: web_sys::InputEvent| {
-            let textarea: HtmlTextAreaElement = e.target_unchecked_into();
-            cb.emit((id, textarea.value()));
-        })
-    };
-    // Shift+Enter runs the cell instead of inserting a newline; other keys fall
-    // through to the textarea untouched.
-    let onkeydown = {
-        let cb = props.on_run.clone();
-        Callback::from(move |e: web_sys::KeyboardEvent| {
-            if e.key() == "Enter" && e.shift_key() {
-                e.prevent_default();
-                cb.emit(id);
-            }
-        })
-    };
-    let on_run = {
-        let cb = props.on_run.clone();
-        Callback::from(move |_: web_sys::MouseEvent| cb.emit(id))
-    };
-    let on_fmt = {
-        let cb = props.on_format.clone();
-        Callback::from(move |_: web_sys::MouseEvent| cb.emit(id))
-    };
-    let on_del = {
-        let cb = props.on_delete.clone();
-        Callback::from(move |_: web_sys::MouseEvent| cb.emit(id))
-    };
-    let on_up = {
-        let cb = props.on_move_up.clone();
-        Callback::from(move |_: web_sys::MouseEvent| cb.emit(id))
-    };
-    let on_down = {
-        let cb = props.on_move_down.clone();
-        Callback::from(move |_: web_sys::MouseEvent| cb.emit(id))
-    };
+impl Component for CellView {
+    type Message = ();
+    type Properties = CellViewProps;
 
-    let badge = match props.exec {
-        Some(n) => format!("[{n}]"),
-        None => "[ ]".to_owned(),
-    };
-    let rows = props.source.lines().count().clamp(3, 24);
+    fn create(_ctx: &Context<Self>) -> Self {
+        Self
+    }
 
-    html! {
-        <div class="overflow-hidden rounded-md border border-hairline bg-canvas">
-            <div class="flex items-stretch">
-                <div class="flex w-12 shrink-0 select-none items-start justify-center border-r border-hairline py-3 font-mono text-xs text-mute">
-                    { badge }
+    fn view(&self, ctx: &Context<Self>) -> Html {
+        let props = ctx.props();
+        let id = props.id;
+
+        let oninput = {
+            let cb = props.on_edit.clone();
+            Callback::from(move |e: web_sys::InputEvent| {
+                let textarea: HtmlTextAreaElement = e.target_unchecked_into();
+                cb.emit((id, textarea.value()));
+            })
+        };
+        // Shift+Enter runs the cell instead of inserting a newline; other keys fall
+        // through to the textarea untouched.
+        let onkeydown = {
+            let cb = props.on_run.clone();
+            Callback::from(move |e: web_sys::KeyboardEvent| {
+                if e.key() == "Enter" && e.shift_key() {
+                    e.prevent_default();
+                    cb.emit(id);
+                }
+            })
+        };
+        let on_run = {
+            let cb = props.on_run.clone();
+            Callback::from(move |_: web_sys::MouseEvent| cb.emit(id))
+        };
+        let on_fmt = {
+            let cb = props.on_format.clone();
+            Callback::from(move |_: web_sys::MouseEvent| cb.emit(id))
+        };
+        let on_del = {
+            let cb = props.on_delete.clone();
+            Callback::from(move |_: web_sys::MouseEvent| cb.emit(id))
+        };
+        let on_up = {
+            let cb = props.on_move_up.clone();
+            Callback::from(move |_: web_sys::MouseEvent| cb.emit(id))
+        };
+        let on_down = {
+            let cb = props.on_move_down.clone();
+            Callback::from(move |_: web_sys::MouseEvent| cb.emit(id))
+        };
+
+        let badge = match props.exec {
+            Some(n) => format!("[{n}]"),
+            None => "[ ]".to_owned(),
+        };
+        let rows = props.source.lines().count().clamp(3, 24);
+
+        html! {
+            <div class="overflow-hidden rounded-md border border-hairline bg-canvas">
+                <div class="flex items-stretch">
+                    <div class="flex w-12 shrink-0 select-none items-start justify-center border-r border-hairline py-3 font-mono text-xs text-mute">
+                        { badge }
+                    </div>
+                    <textarea
+                        class={CELL_EDITOR}
+                        rows={rows.to_string()}
+                        spellcheck="false"
+                        placeholder="Scarpet…"
+                        value={props.source.clone()}
+                        oninput={oninput}
+                        onkeydown={onkeydown}
+                    />
                 </div>
-                <textarea
-                    class={CELL_EDITOR}
-                    rows={rows.to_string()}
-                    spellcheck="false"
-                    placeholder="Scarpet…"
-                    value={props.source.clone()}
-                    oninput={oninput}
-                    onkeydown={onkeydown}
-                />
+                <div class="flex items-center gap-2 border-t border-hairline bg-canvas-soft px-3 py-2">
+                    <button onclick={on_run} class={classes!(BTN_SM, BTN_LINK)}>{ "Run" }</button>
+                    <button onclick={on_fmt} class={classes!(BTN_SM, BTN_INK)}>{ "Format" }</button>
+                    <div class="flex-1" />
+                    <button onclick={on_up} class={classes!(BTN_SM, BTN_BORDERED)} title="Move up">{ "↑" }</button>
+                    <button onclick={on_down} class={classes!(BTN_SM, BTN_BORDERED)} title="Move down">{ "↓" }</button>
+                    <button onclick={on_del} class={classes!(BTN_SM, BTN_BORDERED)}>{ "Delete" }</button>
+                </div>
+                { cell_output_view(&props.output) }
             </div>
-            <div class="flex items-center gap-2 border-t border-hairline bg-canvas-soft px-3 py-2">
-                <button onclick={on_run} class={classes!(BTN_SM, BTN_LINK)}>{ "Run" }</button>
-                <button onclick={on_fmt} class={classes!(BTN_SM, BTN_INK)}>{ "Format" }</button>
-                <div class="flex-1" />
-                <button onclick={on_up} class={classes!(BTN_SM, BTN_BORDERED)} title="Move up">{ "↑" }</button>
-                <button onclick={on_down} class={classes!(BTN_SM, BTN_BORDERED)} title="Move down">{ "↓" }</button>
-                <button onclick={on_del} class={classes!(BTN_SM, BTN_BORDERED)}>{ "Delete" }</button>
-            </div>
-            { cell_output_view(&props.output) }
-        </div>
+        }
     }
 }
 
