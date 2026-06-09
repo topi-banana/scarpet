@@ -108,6 +108,16 @@ struct ConfigFile {
     /// The minimum number of blank lines forced between statements (default
     /// `0`). Must not exceed `blank_lines_upper_bound`.
     blank_lines_lower_bound: Option<usize>,
+    /// Maximum flat width of a call's argument list `(…)` before it breaks
+    /// vertically; unset leaves only `max_width` binding. `0` forces every
+    /// non-empty call to break.
+    fn_call_width: Option<usize>,
+    /// Maximum flat width of a list `[…]` before it breaks vertically; unset
+    /// leaves only `max_width` binding.
+    array_width: Option<usize>,
+    /// Maximum flat width of a map `{…}` before it breaks vertically; unset
+    /// leaves only `max_width` binding.
+    struct_lit_width: Option<usize>,
 }
 
 /// Resolve the formatting [`Config`]. An explicit `--config` path must exist
@@ -205,6 +215,9 @@ fn parse_config(text: &str, name: &str) -> Result<Config, String> {
         blank_lines_lower_bound: file
             .blank_lines_lower_bound
             .unwrap_or(default.blank_lines_lower_bound),
+        fn_call_width: file.fn_call_width.or(default.fn_call_width),
+        array_width: file.array_width.or(default.array_width),
+        struct_lit_width: file.struct_lit_width.or(default.struct_lit_width),
     };
     if config.max_width == 0 {
         return Err(format!("{name}: max_width must be at least 1"));
@@ -839,6 +852,34 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("blank_lines"), "{err}");
+    }
+
+    #[test]
+    fn parse_config_defaults_width_caps_to_none() {
+        let cfg = parse_config("", "x").unwrap();
+        assert_eq!(cfg.fn_call_width, None);
+        assert_eq!(cfg.array_width, None);
+        assert_eq!(cfg.struct_lit_width, None);
+    }
+
+    #[test]
+    fn parse_config_reads_width_caps() {
+        let cfg = parse_config(
+            "fn_call_width = 60\narray_width = 40\nstruct_lit_width = 20",
+            "x",
+        )
+        .unwrap();
+        assert_eq!(cfg.fn_call_width, Some(60));
+        assert_eq!(cfg.array_width, Some(40));
+        assert_eq!(cfg.struct_lit_width, Some(20));
+    }
+
+    #[test]
+    fn parse_config_accepts_zero_width_cap() {
+        // `0` is a valid cap (force every non-empty collection to break), not an
+        // error — distinct from an unset key, which leaves the cap unbounded.
+        let cfg = parse_config("fn_call_width = 0", "x").unwrap();
+        assert_eq!(cfg.fn_call_width, Some(0));
     }
 
     #[test]

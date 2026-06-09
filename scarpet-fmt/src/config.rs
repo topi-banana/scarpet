@@ -150,6 +150,19 @@ pub struct Config {
     /// `blank_lines_lower_bound`. Defaults to `0` (no minimum). Assumed not to
     /// exceed `blank_lines_upper_bound` (the CLI rejects that).
     pub blank_lines_lower_bound: usize,
+    /// Maximum flat width of a call's argument list `(…)` before it breaks
+    /// vertically. `None` (the default) leaves only `max_width` binding,
+    /// reproducing the original fixed style. The analogue of rustfmt's
+    /// `fn_call_width`. A cap of `0` forces every non-empty call to break.
+    pub fn_call_width: Option<usize>,
+    /// Maximum flat width of a list `[…]` before it breaks vertically. `None`
+    /// (the default) leaves only `max_width` binding. The analogue of rustfmt's
+    /// `array_width`.
+    pub array_width: Option<usize>,
+    /// Maximum flat width of a map `{…}` before it breaks vertically. `None`
+    /// (the default) leaves only `max_width` binding. The analogue of rustfmt's
+    /// `struct_lit_width`.
+    pub struct_lit_width: Option<usize>,
 }
 
 impl Default for Config {
@@ -165,6 +178,9 @@ impl Default for Config {
             binop_separator: BinopSeparator::Back,
             blank_lines_upper_bound: 1,
             blank_lines_lower_bound: 0,
+            fn_call_width: None,
+            array_width: None,
+            struct_lit_width: None,
         }
     }
 }
@@ -247,5 +263,13 @@ mod tests {
     #[test]
     fn default_config_uses_zero_blank_line_lower_bound() {
         assert_eq!(Config::default().blank_lines_lower_bound, 0);
+    }
+
+    #[test]
+    fn default_config_leaves_width_caps_unbounded() {
+        let c = Config::default();
+        assert_eq!(c.fn_call_width, None);
+        assert_eq!(c.array_width, None);
+        assert_eq!(c.struct_lit_width, None);
     }
 }

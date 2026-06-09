@@ -46,16 +46,15 @@ The break/flat decision is **local**: a `Group` is laid out flat iff its *own* f
 
 ### Known limitations of the IR
 
-Three capabilities are intentionally absent today; several roadmap items below depend on adding them:
+Three capabilities are intentionally absent today; several roadmap items below depend on adding them (a fourth — per-construct width caps — has since landed: a `Group` now carries an optional flat-width cap, powering `fn_call_width` / `array_width` / `struct_lit_width`):
 
-- **No sub-width groups.** `fits` only ever measures against the single global `max_width`. Per-construct width targets (rustfmt's `fn_call_width`, `array_width`, …) need a `Group` that carries its own width cap.
 - **No alignment.** `Nest` indents by whole levels only. Aligning a continuation to an opening delimiter (`indent_style = "Visual"`) or aligning map values needs an `Align(column, doc)` primitive.
 - **No fill.** Items are laid out flat-or-one-per-line. A "pack as many as fit, then break" layout (`Compressed`) needs a `Fill` combinator.
 - **Spaces only.** `render` emits indentation as spaces; `hard_tabs` needs tab output and a tab-width convention for the column math in `fits` and comment wrapping.
 
 ## Configuration today
 
-Ten knobs, parsed from `scarpet-fmt.toml` by the CLI (TOML parsing lives in `scarpet-cli` so this crate stays file-I/O-free and `wasm`-clean):
+Thirteen knobs, parsed from `scarpet-fmt.toml` by the CLI (TOML parsing lives in `scarpet-cli` so this crate stays file-I/O-free and `wasm`-clean):
 
 | Config field | TOML key | Default | rustfmt analogue |
 | --- | --- | --- | --- |
@@ -69,6 +68,9 @@ Ten knobs, parsed from `scarpet-fmt.toml` by the CLI (TOML parsing lives in `sca
 | `binop_separator` | `binop_separator` | `"back"` | `binop_separator` (`back` / `front`; rustfmt defaults `front`) |
 | `blank_lines_upper_bound` | `blank_lines_upper_bound` | `1` | `blank_lines_upper_bound` |
 | `blank_lines_lower_bound` | `blank_lines_lower_bound` | `0` | `blank_lines_lower_bound` |
+| `fn_call_width` | `fn_call_width` (`0` = always break) | `none` | `fn_call_width` |
+| `array_width` | `array_width` | `none` | `array_width` |
+| `struct_lit_width` | `struct_lit_width` | `none` | `struct_lit_width` |
 
 Everything else about the layout is currently fixed. The roadmap is to make the fixed choices configurable, matching rustfmt wherever an option has a Scarpet analogue.
 
@@ -86,10 +88,10 @@ Legend: ✅ done · 🟡 planned (has a Scarpet analogue) · ⬜ out of scope (R
 | --- | --- | --- |
 | `max_width` | ✅ | line-length target |
 | `comment_width` | ✅ | merged with `wrap_comments` into one knob |
-| `use_small_heuristics` | 🟡 | umbrella over the sub-widths below |
-| `fn_call_width` | 🟡 | call `f(...)` argument width |
-| `array_width` | 🟡 | list `[...]` width |
-| `struct_lit_width` | 🟡 | map `{...}` width |
+| `use_small_heuristics` | 🟡 | umbrella over the sub-widths below (deferred — set them individually for now) |
+| `fn_call_width` | ✅ | call `f(...)` argument width |
+| `array_width` | ✅ | list `[...]` width |
+| `struct_lit_width` | ✅ | map `{...}` width |
 | `chain_width` | 🟡 | `:` get-chains (weak analogue) |
 | `short_array_element_width_threshold` | 🟡 | short-element fill (needs `Fill`) |
 
@@ -167,7 +169,7 @@ A few useful knobs have no rustfmt counterpart because they assume Rust syntax t
 
 Enabling work the rest depends on:
 
-1. **Sub-width `Group`** — give `Group` an optional width cap; `fits` measures against `min(remaining, cap)`. Unlocks all the per-construct widths.
+1. **Sub-width `Group`** ✅ — `Group` carries an optional width cap; `fits` measures against `min(remaining, cap)`. Landed with `fn_call_width` / `array_width` / `struct_lit_width`; still the foundation for the remaining per-construct widths (`chain_width`, short-element packing).
 2. **`Align` primitive** — set indent to the current column + n. Unlocks `indent_style = "Visual"` and map alignment.
 3. **`Fill` combinator** — pack-then-break layout. Unlocks `Compressed` and short-element packing.
 4. **Tab rendering** — `hard_tabs`, plus a tab-width convention for `fits` and comment wrapping.

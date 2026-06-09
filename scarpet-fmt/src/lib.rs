@@ -397,4 +397,56 @@ mod corpus {
             failures.join("\n")
         );
     }
+
+    /// The same guarantee under a tight `fn_call_width`, which breaks call
+    /// argument lists that would otherwise fit the line — exercising the new
+    /// per-construct width cap on the call path across the corpus.
+    #[test]
+    fn roundtrip_fn_call_width_is_nondestructive_and_idempotent() {
+        let config = Config {
+            fn_call_width: Some(40),
+            ..Config::default()
+        };
+        let failures = roundtrip_failures(&config);
+        assert!(
+            failures.is_empty(),
+            "fn-call-width corpus round-trip failures ({}):\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// The same guarantee under a tight `array_width`, breaking list literals
+    /// that would otherwise fit the line.
+    #[test]
+    fn roundtrip_array_width_is_nondestructive_and_idempotent() {
+        let config = Config {
+            array_width: Some(30),
+            ..Config::default()
+        };
+        let failures = roundtrip_failures(&config);
+        assert!(
+            failures.is_empty(),
+            "array-width corpus round-trip failures ({}):\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// The same guarantee under a tight `struct_lit_width`, breaking map
+    /// literals that would otherwise fit the line.
+    #[test]
+    fn roundtrip_struct_lit_width_is_nondestructive_and_idempotent() {
+        let config = Config {
+            struct_lit_width: Some(30),
+            ..Config::default()
+        };
+        let failures = roundtrip_failures(&config);
+        assert!(
+            failures.is_empty(),
+            "struct-lit-width corpus round-trip failures ({}):\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
 }
