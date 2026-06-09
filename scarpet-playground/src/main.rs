@@ -11,11 +11,9 @@
 //! Everything runs in the browser via `wasm32`; there is no server round-trip.
 
 mod app;
+mod components;
 mod editor;
-mod header;
 mod notebook;
-mod options;
-mod session;
 mod shared;
 
 fn main() {
