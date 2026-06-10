@@ -20,6 +20,7 @@ These mirror CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) — run
 ```sh
 cargo fmt --all -- --check
 taplo fmt --check --diff                          # TOML formatting (CI enforces it)
+typos                                             # spell check (config: typos.toml; example/ excluded)
 cargo clippy --workspace --all-targets -- -D warnings   # warnings are errors
 cargo check --workspace --all-targets
 cargo machete                                     # fails on unused dependencies

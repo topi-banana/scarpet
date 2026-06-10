@@ -32,8 +32,8 @@ jobs:
 
       - uses: cargo-bins/cargo-binstall@v1.20.0
 
-      - name: Install cargo-machete, taplo-cli
-        run: cargo binstall --no-confirm cargo-machete taplo-cli
+      - name: Install cargo-machete, taplo-cli, typos-cli
+        run: cargo binstall --no-confirm cargo-machete taplo-cli typos-cli
 
       - name: cargo fmt --check
         id: fmt
@@ -50,6 +50,15 @@ jobs:
         run: |
           start=$SECONDS
           taplo fmt --check --diff && code=0 || code=$?
+          echo "duration=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
+          exit $code
+
+      - name: typos
+        id: typos
+        continue-on-error: true
+        run: |
+          start=$SECONDS
+          typos && code=0 || code=$?
           echo "duration=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
           exit $code
 
@@ -159,6 +168,7 @@ jobs:
             echo "| --- | --- | --- |"
             echo "| cargo fmt --check | $(status '${{ steps.fmt.outcome }}') | $(dur '${{ steps.fmt.outputs.duration }}') |"
             echo "| taplo fmt --check | $(status '${{ steps.taplo.outcome }}') | $(dur '${{ steps.taplo.outputs.duration }}') |"
+            echo "| typos | $(status '${{ steps.typos.outcome }}') | $(dur '${{ steps.typos.outputs.duration }}') |"
             echo "| cargo clippy | $(status '${{ steps.clippy.outcome }}') | $(dur '${{ steps.clippy.outputs.duration }}') |"
             echo "| cargo check | $(status '${{ steps.check.outcome }}') | $(dur '${{ steps.check.outputs.duration }}') |"
             echo "| cargo machete | $(status '${{ steps.machete.outcome }}') | $(dur '${{ steps.machete.outputs.duration }}') |"
@@ -182,6 +192,7 @@ jobs:
         if: >-
           steps.fmt.outcome != 'success' ||
           steps.taplo.outcome != 'success' ||
+          steps.typos.outcome != 'success' ||
           steps.clippy.outcome != 'success' ||
           steps.check.outcome != 'success' ||
           steps.machete.outcome != 'success' ||

@@ -1,0 +1,4 @@
+[files]
+# example/ is a set of third-party git submodules (the formatter corpus);
+# their contents are not ours to fix.
+extend-exclude = ["example/"]
