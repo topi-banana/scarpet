@@ -6,6 +6,6 @@ mod operator;
 mod primary;
 mod stmt;
 
-pub trait Evalute<T> {
+pub trait Evaluate<T> {
     fn push(&mut self, st: T) -> Result<ValueContainer, VmError>;
 }

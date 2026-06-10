@@ -9,7 +9,7 @@ mod view;
 
 use scarpet_syntax::ast::Code;
 use scarpet_syntax::parser::ParseError;
-use scarpet_vm::{Evalute, GlobalState};
+use scarpet_vm::{Evaluate, GlobalState};
 use std::cell::RefCell;
 use std::rc::Rc;
 

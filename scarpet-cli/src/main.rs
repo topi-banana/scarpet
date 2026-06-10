@@ -11,7 +11,7 @@ use scarpet_fmt::{
 };
 use scarpet_syntax::ast::{Code, LowerError};
 use scarpet_syntax::parser::{ParseError, has_open_delimiter, parse_source};
-use scarpet_vm::{Evalute, GlobalState, ScarpetVm};
+use scarpet_vm::{Evaluate, GlobalState, ScarpetVm};
 use serde::Deserialize;
 use similar::{ChangeTag, TextDiff};
 

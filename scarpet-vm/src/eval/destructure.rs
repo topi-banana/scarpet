@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 
 use scarpet_syntax::ast::{AssignOp, Code, LPatterns, LRest, LValue, Place};
 
-use super::Evalute;
+use super::Evaluate;
 use crate::{
     error::VmError,
     value::{Value, ValueContainer},

@@ -1,7 +1,7 @@
 use scarpet_syntax::ast::{Args, Expr, Params};
 
 use super::Function;
-use crate::{Value, error::VmError, eval::Evalute, value::ValueContainer, vm::ScarpetVm};
+use crate::{Value, error::VmError, eval::Evaluate, value::ValueContainer, vm::ScarpetVm};
 
 /// A user-defined function, lowered from a validated [`Params`] signature: the
 /// positional parameter names, the `outer(x)` captures (each a shared slot grabbed

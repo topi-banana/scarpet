@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use scarpet_syntax::ast::Code;
-use scarpet_vm::{Evalute, GlobalState, ScarpetVm};
+use scarpet_vm::{Evaluate, GlobalState, ScarpetVm};
 
 use crate::shared::{SharedBuffer, diagnostics_for};
 

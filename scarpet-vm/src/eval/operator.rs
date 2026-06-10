@@ -2,10 +2,10 @@ use std::cmp::Ordering;
 
 use scarpet_syntax::ast::{Additive, Compare, Equality, Get, GetOp, Land, Lor, Mult, Power, Unary};
 
-use super::Evalute;
+use super::Evaluate;
 use crate::{error::VmError, value::ValueContainer, vm::ScarpetVm};
 
-impl<'src, 'state> Evalute<Lor<'src>> for ScarpetVm<'state, 'src> {
+impl<'src, 'state> Evaluate<Lor<'src>> for ScarpetVm<'state, 'src> {
     fn push(&mut self, st: Lor<'src>) -> Result<ValueContainer, VmError> {
         match st {
             Lor::Or { lhs, rhs } => Ok(ValueContainer::bool(
@@ -16,7 +16,7 @@ impl<'src, 'state> Evalute<Lor<'src>> for ScarpetVm<'state, 'src> {
     }
 }
 
-impl<'src, 'state> Evalute<Land<'src>> for ScarpetVm<'state, 'src> {
+impl<'src, 'state> Evaluate<Land<'src>> for ScarpetVm<'state, 'src> {
     fn push(&mut self, st: Land<'src>) -> Result<ValueContainer, VmError> {
         match st {
             Land::And { lhs, rhs } => Ok(ValueContainer::bool(
@@ -27,7 +27,7 @@ impl<'src, 'state> Evalute<Land<'src>> for ScarpetVm<'state, 'src> {
     }
 }
 
-impl<'src, 'state> Evalute<Equality<'src>> for ScarpetVm<'state, 'src> {
+impl<'src, 'state> Evaluate<Equality<'src>> for ScarpetVm<'state, 'src> {
     fn push(&mut self, st: Equality<'src>) -> Result<ValueContainer, VmError> {
         match st {
             Equality::Eq { lhs, rhs } => {
@@ -43,7 +43,7 @@ impl<'src, 'state> Evalute<Equality<'src>> for ScarpetVm<'state, 'src> {
     }
 }
 
-impl<'src, 'state> Evalute<Compare<'src>> for ScarpetVm<'state, 'src> {
+impl<'src, 'state> Evaluate<Compare<'src>> for ScarpetVm<'state, 'src> {
     fn push(&mut self, st: Compare<'src>) -> Result<ValueContainer, VmError> {
         match st {
             Compare::Lt { lhs, rhs } => {
@@ -75,7 +75,7 @@ impl<'src, 'state> Evalute<Compare<'src>> for ScarpetVm<'state, 'src> {
     }
 }
 
-impl<'src, 'state> Evalute<Additive<'src>> for ScarpetVm<'state, 'src> {
+impl<'src, 'state> Evaluate<Additive<'src>> for ScarpetVm<'state, 'src> {
     fn push(&mut self, st: Additive<'src>) -> Result<ValueContainer, VmError> {
         match st {
             Additive::Add { lhs, rhs } => self.push(*lhs)? + self.push(rhs)?,
@@ -85,7 +85,7 @@ impl<'src, 'state> Evalute<Additive<'src>> for ScarpetVm<'state, 'src> {
     }
 }
 
-impl<'src, 'state> Evalute<Mult<'src>> for ScarpetVm<'state, 'src> {
+impl<'src, 'state> Evaluate<Mult<'src>> for ScarpetVm<'state, 'src> {
     fn push(&mut self, st: Mult<'src>) -> Result<ValueContainer, VmError> {
         match st {
             Mult::Mul { lhs, rhs } => self.push(*lhs)? * self.push(rhs)?,
@@ -99,7 +99,7 @@ impl<'src, 'state> Evalute<Mult<'src>> for ScarpetVm<'state, 'src> {
     }
 }
 
-impl<'src, 'state> Evalute<Power<'src>> for ScarpetVm<'state, 'src> {
+impl<'src, 'state> Evaluate<Power<'src>> for ScarpetVm<'state, 'src> {
     fn push(&mut self, st: Power<'src>) -> Result<ValueContainer, VmError> {
         match st {
             Power::Pow { base, exp } => {
@@ -111,7 +111,7 @@ impl<'src, 'state> Evalute<Power<'src>> for ScarpetVm<'state, 'src> {
     }
 }
 
-impl<'src, 'state> Evalute<Unary<'src>> for ScarpetVm<'state, 'src> {
+impl<'src, 'state> Evaluate<Unary<'src>> for ScarpetVm<'state, 'src> {
     fn push(&mut self, st: Unary<'src>) -> Result<ValueContainer, VmError> {
         match st {
             Unary::Neg(v) => self.push(*v)?.scarpet_neg(),
@@ -126,7 +126,7 @@ impl<'src, 'state> Evalute<Unary<'src>> for ScarpetVm<'state, 'src> {
     }
 }
 
-impl<'src, 'state> Evalute<Get<'src>> for ScarpetVm<'state, 'src> {
+impl<'src, 'state> Evaluate<Get<'src>> for ScarpetVm<'state, 'src> {
     fn push(&mut self, st: Get<'src>) -> Result<ValueContainer, VmError> {
         match st {
             Get::Index { base, op, key } => {

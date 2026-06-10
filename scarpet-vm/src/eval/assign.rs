@@ -1,6 +1,6 @@
 use scarpet_syntax::ast::{AssignOp, LValue, Place, Primary};
 
-use super::Evalute;
+use super::Evaluate;
 use crate::{
     error::VmError,
     value::{Value, ValueContainer},

@@ -1,7 +1,7 @@
 use scarpet_syntax::ast::Args;
 
 use super::Function;
-use crate::{Value, error::VmError, eval::Evalute, value::ValueContainer, vm::ScarpetVm};
+use crate::{Value, error::VmError, eval::Evaluate, value::ValueContainer, vm::ScarpetVm};
 
 /// Evaluate the single argument of a one-arity builtin.
 fn arg1<'src>(

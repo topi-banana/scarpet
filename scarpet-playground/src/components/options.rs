@@ -1,5 +1,5 @@
 //! The formatter-options bar shared by both views. It parses each control's
-//! input and emits only well-formed values; an unparseable entry emits nothing,
+//! input and emits only well-formed values; an unparsable entry emits nothing,
 //! leaving the current config untouched.
 
 use scarpet_fmt::{BraceStyle, Config, LineEnding};

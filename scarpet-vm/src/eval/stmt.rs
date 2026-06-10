@@ -2,10 +2,10 @@ use std::rc::Rc;
 
 use scarpet_syntax::ast::{Assign, Code, Expr, ParamWord};
 
-use super::Evalute;
+use super::Evaluate;
 use crate::{error::VmError, function::DefFunction, value::ValueContainer, vm::ScarpetVm};
 
-impl<'src, 'state> Evalute<Code<'src>> for ScarpetVm<'state, 'src> {
+impl<'src, 'state> Evaluate<Code<'src>> for ScarpetVm<'state, 'src> {
     fn push(&mut self, Code(mut sts): Code<'src>) -> Result<ValueContainer, VmError> {
         let last = sts.pop();
         for st in sts {
@@ -19,7 +19,7 @@ impl<'src, 'state> Evalute<Code<'src>> for ScarpetVm<'state, 'src> {
     }
 }
 
-impl<'src, 'state> Evalute<Expr<'src>> for ScarpetVm<'state, 'src> {
+impl<'src, 'state> Evaluate<Expr<'src>> for ScarpetVm<'state, 'src> {
     fn push(&mut self, st: Expr<'src>) -> Result<ValueContainer, VmError> {
         match st {
             Expr::Def { name, params, body } => {
@@ -43,7 +43,7 @@ impl<'src, 'state> Evalute<Expr<'src>> for ScarpetVm<'state, 'src> {
     }
 }
 
-impl<'src, 'state> Evalute<Assign<'src>> for ScarpetVm<'state, 'src> {
+impl<'src, 'state> Evaluate<Assign<'src>> for ScarpetVm<'state, 'src> {
     fn push(&mut self, st: Assign<'src>) -> Result<ValueContainer, VmError> {
         match st {
             Assign::Set { target, op, value } => {

@@ -1,13 +1,13 @@
 use scarpet_syntax::ast::{Args, Code, Expr, Primary};
 
-use super::Evalute;
+use super::Evaluate;
 use crate::{
     error::VmError,
     value::{Value, ValueContainer},
     vm::ScarpetVm,
 };
 
-impl<'src, 'state> Evalute<Primary<'src>> for ScarpetVm<'state, 'src> {
+impl<'src, 'state> Evaluate<Primary<'src>> for ScarpetVm<'state, 'src> {
     fn push(&mut self, st: Primary<'src>) -> Result<ValueContainer, VmError> {
         match st {
             Primary::Number(v) => Ok(ValueContainer::new(Value::from_number_literal(v))),

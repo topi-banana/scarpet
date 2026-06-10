@@ -4,7 +4,7 @@ use super::Function;
 use crate::{
     Value,
     error::VmError,
-    eval::Evalute,
+    eval::Evaluate,
     value::{RangeList, ValueContainer},
     vm::ScarpetVm,
 };

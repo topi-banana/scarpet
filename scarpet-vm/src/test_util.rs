@@ -5,7 +5,7 @@ use scarpet_syntax::ast::Code;
 use scarpet_syntax::parser::parse_source;
 
 use crate::error::VmError;
-use crate::eval::Evalute;
+use crate::eval::Evaluate;
 use crate::value::Value;
 use crate::vm::GlobalState;
 
