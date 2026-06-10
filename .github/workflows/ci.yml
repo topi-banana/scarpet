@@ -10,6 +10,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CF_PAGES_PROJECT: scarpet
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -253,9 +254,82 @@ jobs:
           path: summary.md
           if-no-files-found: error
 
+  playground:
+    name: Deploy playground
+    # Fork PRs are skipped: the Cloudflare secrets are unavailable there, and
+    # the PR comment job is restricted to same-repo PRs anyway.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install trunk
+        uses: jetli/trunk-action@v0.5.0
+        with:
+          version: latest
+
+      - name: trunk build
+        id: build
+        working-directory: scarpet-playground
+        run: |
+          start=$SECONDS
+          trunk build --release && code=0 || code=$?
+          echo "duration=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
+          exit $code
+
+      - name: Deploy to Cloudflare Pages
+        id: deploy
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # Pushes to main publish the production deployment; PR branches get
+          # preview deployments with a per-branch alias URL.
+          command: >-
+            pages deploy scarpet-playground/dist
+            --project-name=${{ env.CF_PAGES_PROJECT }}
+            --branch=${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
+
+      - name: Write summary
+        if: always()
+        run: |
+          dur() {
+            if [ -z "$1" ]; then echo "—"; return; fi
+            if [ "$1" -ge 60 ]; then printf '%dm%02ds' $(($1 / 60)) $(($1 % 60)); else printf '%ds' "$1"; fi
+          }
+          if [ "${{ github.event_name }}" = "pull_request" ]; then label="Preview"; else label="Deployment"; fi
+          {
+            echo "## Playground (Cloudflare Pages)"
+            echo ""
+            echo "- Build (trunk): **${{ steps.build.outcome }}** ($(dur '${{ steps.build.outputs.duration }}'))"
+            echo "- Deploy: **${{ steps.deploy.outcome }}**"
+            if [ -n "${{ steps.deploy.outputs.deployment-url }}" ]; then
+              echo "- $label: ${{ steps.deploy.outputs.deployment-url }}"
+            fi
+            if [ -n "${{ steps.deploy.outputs.pages-deployment-alias-url }}" ]; then
+              echo "- Branch alias: ${{ steps.deploy.outputs.pages-deployment-alias-url }}"
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY" summary.md
+
+      - name: Upload summary
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-summary-3-playground
+          path: summary.md
+          if-no-files-found: error
+
   comment:
     name: PR summary comment
-    needs: [quality, build]
+    needs: [quality, build, playground]
     if: >-
       !cancelled() &&
       github.event_name == 'pull_request' &&
