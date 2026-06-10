@@ -30,9 +30,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-machete,taplo-cli
+      - uses: cargo-bins/cargo-binstall@v1.20.0
+
+      - name: Install cargo-machete, taplo-cli
+        run: cargo binstall --no-confirm cargo-machete taplo-cli
 
       - name: cargo fmt --check
         id: fmt
