@@ -4,10 +4,13 @@
 //! expression kinds) implementing [`rowan::ast::AstNode`], with accessors for
 //! its children. The definitions are generated from `scarpet.ungram` by
 //! `cargo xtask codegen` — edit the grammar and regenerate rather than
-//! editing `generated.rs`.
+//! editing `generated.rs`. Hand-written extensions (operator classification,
+//! chain/argument iteration, atom tests) live in `ext.rs`.
 
+mod ext;
 mod generated;
 
+pub use ext::*;
 pub use generated::*;
 
 #[cfg(test)]
