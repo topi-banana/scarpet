@@ -42,6 +42,14 @@
 //!
 //! Every borrowed `&'s str` points back into the original source, exactly as in
 //! the [`Cst`]; lowering allocates only the `Vec`/`Box` spine.
+//!
+//! During the rowan migration the AST has **two** producers: the legacy
+//! `TryFrom<&Cst>` impls below (the behavioral spec), and [`Code::lower`] /
+//! [`Args::lower`], which lower the rowan typed tree
+//! ([`crate::cst::SourceFile`], from [`crate::parse::parse_source`]) to the
+//! *same* types with identical semantics. A differential corpus test holds the
+//! two paths to equal output on every corpus file; the legacy path (and that
+//! test) disappear when the migration completes.
 
 use std::collections::VecDeque;
 
@@ -981,6 +989,656 @@ fn describe(kind: &CstKind<'_>) -> &'static str {
         CstKind::Empty => "an empty slot",
         CstKind::Unary { .. } => "a unary expression",
         CstKind::Binary { .. } => "an operator expression",
+    }
+}
+
+// ====================================================================
+// Lowering: rowan typed tree -> AST
+// ====================================================================
+
+impl<'s> Code<'s> {
+    /// Lower a parsed rowan tree ([`crate::parse::parse_source`]) into the
+    /// semantic AST, rooted at the `;`-statement sequence — the rowan
+    /// counterpart of `Code::try_from` on the legacy [`Cst`], with identical
+    /// semantics (in particular, a top-level `,` has nowhere to go and is a
+    /// [`LowerError`]).
+    ///
+    /// `src` MUST be the exact source the tree was parsed from
+    /// (`debug_assert!(root.syntax().text() == src)`). Every name and literal
+    /// in the AST is sliced out of `src` by token byte range, so the result
+    /// borrows `'s` from the source alone — the tree may be dropped
+    /// afterwards, and every consumer of the AST (the evaluator in
+    /// particular) keeps its lifetimes unchanged.
+    pub fn lower(root: &crate::cst::SourceFile, src: &'s str) -> Result<Code<'s>, LowerError> {
+        from_rowan::code_root(root, src)
+    }
+}
+
+impl<'s> Args<'s> {
+    /// Lower a parsed rowan tree ([`crate::parse::parse_source`]) into the
+    /// semantic AST, keeping the grammar's `top` (comma) level — the rowan
+    /// counterpart of `Args::try_from` on the legacy [`Cst`].
+    ///
+    /// `src` MUST be the exact source the tree was parsed from
+    /// (`debug_assert!(root.syntax().text() == src)`); see [`Code::lower`]
+    /// for the borrowing contract.
+    pub fn lower(root: &crate::cst::SourceFile, src: &'s str) -> Result<Args<'s>, LowerError> {
+        from_rowan::args_root(root, src)
+    }
+}
+
+/// Lowering from the rowan typed nodes ([`crate::cst`]) — the successor of the
+/// `TryFrom<&Cst>` path above. Both coexist until the migration completes; the
+/// differential corpus test below holds them to bit-identical ASTs.
+///
+/// The structure mirrors the `TryFrom` impls one to one ([`lower_expr`] ≙
+/// `Expr::try_from`, [`lower_assign`] ≙ `Assign::try_from`, …), including the
+/// order in which operands are lowered, so the *same* [`LowerError`] surfaces
+/// when several are possible. Two systematic differences:
+///
+/// - Strings are sliced from the original source by token byte range
+///   ([`token_text`]), not borrowed from the tree, so the AST's `&'s str`
+///   lifetime stays tied to the source exactly as in the legacy path.
+/// - The old parser *dropped* a trailing `,` / `;`, while the lossless rowan
+///   tree keeps it as a single-item `COMMA_CHAIN` / `SEMI_CHAIN` wrapper
+///   around what the old CST stored bare. [`strip_unit_chains`] unwraps those
+///   wrappers at every position where a separator-bearing item is inspected
+///   (statement roots, signature parameters, destructure elements, `var(…)` /
+///   `outer(…)` arguments), restoring the old shapes — so `f(a;) -> x` is
+///   still a definition and `[x;] = t` still destructures. Multi-item chains
+///   are *not* unwrapped: they correspond to the old `Binary{Comma/Semi}`
+///   nodes and lower — or fail — identically.
+///
+/// [`lower_expr`]: from_rowan::lower_expr
+/// [`lower_assign`]: from_rowan::lower_assign
+/// [`token_text`]: from_rowan::token_text
+/// [`strip_unit_chains`]: from_rowan::strip_unit_chains
+mod from_rowan {
+    use std::collections::VecDeque;
+
+    use rowan::ast::{AstChildren, AstNode as _};
+
+    use super::{
+        Additive, Args, Assign, AssignOp, Capture, Code, Compare, Equality, Expr, Get, GetOp,
+        LPatterns, LRest, LValue, Land, Lor, LowerError, Mult, Params, Place, Power, Primary,
+        Unary, param_word,
+    };
+    use crate::cst::{self, BinOpKind, PrefixOpKind};
+    use crate::syntax::SyntaxToken;
+
+    // --- roots -----------------------------------------------------
+
+    /// [`Code::lower`]: the program as a `;`-statement sequence.
+    pub(super) fn code_root<'s>(
+        root: &cst::SourceFile,
+        src: &'s str,
+    ) -> Result<Code<'s>, LowerError> {
+        debug_assert!(
+            root.syntax().text() == src,
+            "`src` must be the exact source the tree was parsed from"
+        );
+        let expr = root
+            .expr()
+            .ok_or(LowerError::Unexpected("an empty program"))?;
+        lower_code(&expr, src)
+    }
+
+    /// [`Args::lower`]: the program at the grammar's `top` (comma) level.
+    pub(super) fn args_root<'s>(
+        root: &cst::SourceFile,
+        src: &'s str,
+    ) -> Result<Args<'s>, LowerError> {
+        debug_assert!(
+            root.syntax().text() == src,
+            "`src` must be the exact source the tree was parsed from"
+        );
+        let expr = root
+            .expr()
+            .ok_or(LowerError::Unexpected("an empty program"))?;
+        lower_top(&expr, src)
+    }
+
+    // --- chains ------------------------------------------------------
+
+    /// A `top` / paren body: a possibly-comma-chained node flattened into an
+    /// [`Args`] (≙ `Args::try_from(&Cst)` / `collect_comma`). A comma-free
+    /// node is a one-element `Args` wrapping the statement [`Code`].
+    fn lower_top<'s>(e: &cst::Expr, src: &'s str) -> Result<Args<'s>, LowerError> {
+        let mut codes = VecDeque::new();
+        if let cst::Expr::CommaChain(chain) = e {
+            for item in chain.items() {
+                codes.push_back(lower_code(&item, src)?);
+            }
+        } else {
+            codes.push_back(lower_code(e, src)?);
+        }
+        Ok(Args(codes))
+    }
+
+    /// Bracketed contents (`[...]`, `{...}`, call args) — per-element
+    /// [`Code`]s (≙ `Args::try_from(&[Cst])`). `EMPTY_ARG` slots (omitted
+    /// arguments) carry no expression and are dropped, exactly like the old
+    /// phantom `CstKind::Empty` items.
+    fn lower_args_items<'s>(
+        items: impl Iterator<Item = cst::Expr>,
+        src: &'s str,
+    ) -> Result<Args<'s>, LowerError> {
+        let mut codes = VecDeque::new();
+        for item in items {
+            if matches!(item, cst::Expr::EmptyArg(_)) {
+                continue;
+            }
+            codes.push_back(lower_code(&item, src)?);
+        }
+        Ok(Args(codes))
+    }
+
+    /// A statement sequence: a possibly-semi-chained node flattened into a
+    /// [`Code`] (≙ `Code::try_from(&Cst)` / `collect_semi`).
+    fn lower_code<'s>(e: &cst::Expr, src: &'s str) -> Result<Code<'s>, LowerError> {
+        let e = strip_unit_chains(e);
+        let mut exprs = Vec::new();
+        if let cst::Expr::SemiChain(chain) = &e {
+            for item in chain.items() {
+                exprs.push(lower_expr(&item, src)?);
+            }
+        } else {
+            exprs.push(lower_expr(&e, src)?);
+        }
+        Ok(Code(exprs))
+    }
+
+    // --- the precedence ladder ---------------------------------------
+
+    /// `arrow_chain` (≙ `Expr::try_from`): a `->` whose left side is a call
+    /// with a valid signature is a function definition; any other `->` is a
+    /// generic arrow; no `->` falls through to the assignment level.
+    fn lower_expr<'s>(e: &cst::Expr, src: &'s str) -> Result<Expr<'s>, LowerError> {
+        if let cst::Expr::BinExpr(bin) = e
+            && bin_op(bin) == Some(BinOpKind::Arrow)
+        {
+            let (lhs, rhs) = operands(bin)?;
+            let body = Box::new(lower_expr(&rhs, src)?);
+            if let cst::Expr::CallExpr(call) = &lhs
+                && let Some(name) = callee_name(call, src)
+                && let Some(params) = lower_params(call, src)
+            {
+                Ok(Expr::Def { name, params, body })
+            } else {
+                Ok(Expr::Arrow {
+                    lhs: lower_assign(&lhs, src)?,
+                    body,
+                })
+            }
+        } else {
+            Ok(Expr::Assign(lower_assign(e, src)?))
+        }
+    }
+
+    /// `assign` (≙ `Assign::try_from`): `=`, `+=`, `<>`; right-associative,
+    /// with the left of the operator validated as an [`LValue`].
+    fn lower_assign<'s>(e: &cst::Expr, src: &'s str) -> Result<Assign<'s>, LowerError> {
+        if let cst::Expr::BinExpr(bin) = e
+            && let Some(op) = assign_op(bin)
+        {
+            let (lhs, rhs) = operands(bin)?;
+            Ok(Assign::Set {
+                target: lower_lvalue(&lhs, src)?,
+                op,
+                value: Box::new(lower_assign(&rhs, src)?),
+            })
+        } else {
+            Ok(Assign::Lor(lower_lor(e, src)?))
+        }
+    }
+
+    /// The assignment operator of a `BIN_EXPR`, or `None` when its operator
+    /// is not one (or is missing on a hand-built node).
+    fn assign_op(bin: &cst::BinExpr) -> Option<AssignOp> {
+        match bin_op(bin)? {
+            BinOpKind::Assign => Some(AssignOp::Assign),
+            BinOpKind::AddAssign => Some(AssignOp::Add),
+            BinOpKind::Swap => Some(AssignOp::Swap),
+            _ => None,
+        }
+    }
+
+    /// `lor` (≙ `Lor::try_from`): `||`, left-associative.
+    fn lower_lor<'s>(e: &cst::Expr, src: &'s str) -> Result<Lor<'s>, LowerError> {
+        if let cst::Expr::BinExpr(bin) = e
+            && bin_op(bin) == Some(BinOpKind::Or)
+        {
+            let (lhs, rhs) = operands(bin)?;
+            Ok(Lor::Or {
+                lhs: Box::new(lower_lor(&lhs, src)?),
+                rhs: lower_land(&rhs, src)?,
+            })
+        } else {
+            Ok(Lor::Land(lower_land(e, src)?))
+        }
+    }
+
+    /// `land` (≙ `Land::try_from`): `&&`, left-associative.
+    fn lower_land<'s>(e: &cst::Expr, src: &'s str) -> Result<Land<'s>, LowerError> {
+        if let cst::Expr::BinExpr(bin) = e
+            && bin_op(bin) == Some(BinOpKind::And)
+        {
+            let (lhs, rhs) = operands(bin)?;
+            Ok(Land::And {
+                lhs: Box::new(lower_land(&lhs, src)?),
+                rhs: lower_equality(&rhs, src)?,
+            })
+        } else {
+            Ok(Land::Equality(lower_equality(e, src)?))
+        }
+    }
+
+    /// `equality` (≙ `Equality::try_from`): `==`, `!=`; left-associative.
+    fn lower_equality<'s>(e: &cst::Expr, src: &'s str) -> Result<Equality<'s>, LowerError> {
+        if let cst::Expr::BinExpr(bin) = e
+            && let Some(op @ (BinOpKind::Eq | BinOpKind::NotEq)) = bin_op(bin)
+        {
+            let (lhs, rhs) = operands(bin)?;
+            let lhs = Box::new(lower_equality(&lhs, src)?);
+            let rhs = lower_compare(&rhs, src)?;
+            Ok(match op {
+                BinOpKind::Eq => Equality::Eq { lhs, rhs },
+                _ => Equality::Ne { lhs, rhs },
+            })
+        } else {
+            Ok(Equality::Compare(lower_compare(e, src)?))
+        }
+    }
+
+    /// `compare` (≙ `Compare::try_from`): `<`, `<=`, `>`, `>=`;
+    /// left-associative.
+    fn lower_compare<'s>(e: &cst::Expr, src: &'s str) -> Result<Compare<'s>, LowerError> {
+        if let cst::Expr::BinExpr(bin) = e
+            && let Some(op @ (BinOpKind::Lt | BinOpKind::LtEq | BinOpKind::Gt | BinOpKind::GtEq)) =
+                bin_op(bin)
+        {
+            let (lhs, rhs) = operands(bin)?;
+            let lhs = Box::new(lower_compare(&lhs, src)?);
+            let rhs = lower_additive(&rhs, src)?;
+            Ok(match op {
+                BinOpKind::Lt => Compare::Lt { lhs, rhs },
+                BinOpKind::LtEq => Compare::Le { lhs, rhs },
+                BinOpKind::Gt => Compare::Gt { lhs, rhs },
+                _ => Compare::Ge { lhs, rhs },
+            })
+        } else {
+            Ok(Compare::Additive(lower_additive(e, src)?))
+        }
+    }
+
+    /// `additive` (≙ `Additive::try_from`): `+`, `-`; left-associative.
+    fn lower_additive<'s>(e: &cst::Expr, src: &'s str) -> Result<Additive<'s>, LowerError> {
+        if let cst::Expr::BinExpr(bin) = e
+            && let Some(op @ (BinOpKind::Add | BinOpKind::Sub)) = bin_op(bin)
+        {
+            let (lhs, rhs) = operands(bin)?;
+            let lhs = Box::new(lower_additive(&lhs, src)?);
+            let rhs = lower_mult(&rhs, src)?;
+            Ok(match op {
+                BinOpKind::Add => Additive::Add { lhs, rhs },
+                _ => Additive::Sub { lhs, rhs },
+            })
+        } else {
+            Ok(Additive::Mult(lower_mult(e, src)?))
+        }
+    }
+
+    /// `multiplicative` (≙ `Mult::try_from`): `*`, `/`, `%`;
+    /// left-associative.
+    fn lower_mult<'s>(e: &cst::Expr, src: &'s str) -> Result<Mult<'s>, LowerError> {
+        if let cst::Expr::BinExpr(bin) = e
+            && let Some(op @ (BinOpKind::Mul | BinOpKind::Div | BinOpKind::Rem)) = bin_op(bin)
+        {
+            let (lhs, rhs) = operands(bin)?;
+            let lhs = Box::new(lower_mult(&lhs, src)?);
+            let rhs = lower_power(&rhs, src)?;
+            Ok(match op {
+                BinOpKind::Mul => Mult::Mul { lhs, rhs },
+                BinOpKind::Div => Mult::Div { lhs, rhs },
+                _ => Mult::Rem { lhs, rhs },
+            })
+        } else {
+            Ok(Mult::Power(lower_power(e, src)?))
+        }
+    }
+
+    /// `power` (≙ `Power::try_from`): `^`, right-associative.
+    fn lower_power<'s>(e: &cst::Expr, src: &'s str) -> Result<Power<'s>, LowerError> {
+        if let cst::Expr::BinExpr(bin) = e
+            && bin_op(bin) == Some(BinOpKind::Pow)
+        {
+            let (lhs, rhs) = operands(bin)?;
+            Ok(Power::Pow {
+                base: lower_unary(&lhs, src)?,
+                exp: Box::new(lower_power(&rhs, src)?),
+            })
+        } else {
+            Ok(Power::Unary(lower_unary(e, src)?))
+        }
+    }
+
+    /// `unary` (≙ `Unary::try_from`): prefix `-`, `+`, `!`, `...`; stacking.
+    fn lower_unary<'s>(e: &cst::Expr, src: &'s str) -> Result<Unary<'s>, LowerError> {
+        if let cst::Expr::PrefixExpr(prefix) = e
+            && let Some(op) = prefix_op(prefix)
+        {
+            let operand = prefix
+                .expr()
+                .ok_or(LowerError::Unexpected("a unary expression"))?;
+            let inner = Box::new(lower_unary(&operand, src)?);
+            return Ok(match op {
+                PrefixOpKind::Neg => Unary::Neg(inner),
+                PrefixOpKind::Pos => Unary::Pos(inner),
+                PrefixOpKind::Not => Unary::Not(inner),
+                PrefixOpKind::Unpack => Unary::Unpack(inner),
+            });
+        }
+        Ok(Unary::Get(lower_get(e, src)?))
+    }
+
+    /// `get` (≙ `Get::try_from`): `:`, `~`; left-associative; the right
+    /// operand is always a [`Primary`].
+    fn lower_get<'s>(e: &cst::Expr, src: &'s str) -> Result<Get<'s>, LowerError> {
+        if let cst::Expr::BinExpr(bin) = e
+            && let Some(op @ (BinOpKind::Get | BinOpKind::Match)) = bin_op(bin)
+        {
+            let (lhs, rhs) = operands(bin)?;
+            Ok(Get::Index {
+                base: Box::new(lower_get(&lhs, src)?),
+                op: match op {
+                    BinOpKind::Match => GetOp::Match,
+                    _ => GetOp::Get,
+                },
+                key: lower_primary(&rhs, src)?,
+            })
+        } else {
+            Ok(Get::Primary(lower_primary(e, src)?))
+        }
+    }
+
+    /// `primary` (≙ `Primary::try_from`): an atom, a call, or a bracketed
+    /// form. Anything looser-leveled that falls through to here is the same
+    /// [`LowerError::Unexpected`] the legacy path produced (a chain node is
+    /// "an operator expression", exactly like the old `Binary{Comma/Semi}`).
+    fn lower_primary<'s>(e: &cst::Expr, src: &'s str) -> Result<Primary<'s>, LowerError> {
+        match e {
+            cst::Expr::Literal(lit) => {
+                if let Some(tok) = lit.number_token() {
+                    Ok(Primary::Number(token_text(&tok, src)))
+                } else if let Some(tok) = lit.string_token() {
+                    Ok(Primary::Str(token_text(&tok, src)))
+                } else {
+                    Err(LowerError::Unexpected("a literal"))
+                }
+            }
+            cst::Expr::NameRef(name) => Ok(Primary::Ident(
+                name_text(name, src).ok_or(LowerError::Unexpected("an identifier"))?,
+            )),
+            cst::Expr::CallExpr(call) => Ok(Primary::Call {
+                name: callee_name(call, src).ok_or(LowerError::Unexpected("a call"))?,
+                args: lower_args_items(call_args(call), src)?,
+            }),
+            cst::Expr::ListExpr(list) => Ok(Primary::List(lower_args_items(list.args(), src)?)),
+            cst::Expr::MapExpr(map) => Ok(Primary::Map(lower_args_items(map.args(), src)?)),
+            cst::Expr::ParenExpr(paren) => {
+                let inner = paren
+                    .expr()
+                    .ok_or(LowerError::Unexpected("a parenthesized expression"))?;
+                Ok(Primary::Paren(lower_top(&inner, src)?))
+            }
+            other => Err(LowerError::Unexpected(describe(other))),
+        }
+    }
+
+    // --- assignment targets and function parameters -------------------
+
+    /// ≙ `lower_lvalue` over the legacy CST: `[...]` / `l(...)` is a
+    /// destructuring list; a call other than those (and `var(…)`) is a
+    /// dynamic [`LValue::Computed`] place; anything else must be a single
+    /// [`Place`].
+    fn lower_lvalue<'s>(e: &cst::Expr, src: &'s str) -> Result<LValue<'s>, LowerError> {
+        match e {
+            cst::Expr::ListExpr(list) => {
+                Ok(LValue::Destructure(lower_lpatterns(list.args(), src)?))
+            }
+            cst::Expr::CallExpr(call) if callee_name(call, src) == Some("l") => {
+                Ok(LValue::Destructure(lower_lpatterns(call_args(call), src)?))
+            }
+            // A call other than `l(…)` / `var(…)` may still be a place at
+            // runtime — `if(c, a, b) = …` returns one of its bound arguments.
+            cst::Expr::CallExpr(call) if callee_name(call, src) != Some("var") => {
+                Ok(LValue::Computed(Box::new(lower_primary(e, src)?)))
+            }
+            // `x`, `var(e)`, `a:b:c` — a single statically-known place.
+            _ => Ok(LValue::Place(lower_place(e, src)?)),
+        }
+    }
+
+    /// ≙ `lower_place` over the legacy CST: a variable, `var(<expr>)`, or a
+    /// (possibly nested) `:` index whose base is itself a place. Any other
+    /// shape is a [`LowerError::NotAssignable`].
+    fn lower_place<'s>(e: &cst::Expr, src: &'s str) -> Result<Place<'s>, LowerError> {
+        match e {
+            cst::Expr::NameRef(name) => Ok(Place::Var(
+                name_text(name, src).ok_or(LowerError::NotAssignable)?,
+            )),
+            // `var(<expr>)` names a variable dynamically; it takes exactly
+            // one argument.
+            cst::Expr::CallExpr(call) if callee_name(call, src) == Some("var") => {
+                let arg = single_arg(call).ok_or(LowerError::NotAssignable)?;
+                Ok(Place::DynVar(Box::new(lower_code(&arg, src)?)))
+            }
+            // `base:key` — a writable element; `~` (Match) is not a target.
+            cst::Expr::BinExpr(bin) if bin_op(bin) == Some(BinOpKind::Get) => {
+                let (lhs, rhs) = operands(bin)?;
+                Ok(Place::Index {
+                    base: Box::new(lower_place(&lhs, src)?),
+                    key: lower_primary(&rhs, src)?,
+                })
+            }
+            _ => Err(LowerError::NotAssignable),
+        }
+    }
+
+    /// ≙ `lower_lpatterns` over the legacy CST: the elements of a
+    /// destructuring list, dropping `EMPTY_ARG` slots, with at most one
+    /// `...x` rest binder per level.
+    fn lower_lpatterns<'s>(
+        items: impl Iterator<Item = cst::Expr>,
+        src: &'s str,
+    ) -> Result<LPatterns<'s>, LowerError> {
+        let mut before = Vec::new();
+        let mut rest: Option<LRest<'s>> = None;
+        for item in items {
+            let item = strip_unit_chains(&item);
+            if matches!(item, cst::Expr::EmptyArg(_)) {
+                continue;
+            }
+            if let cst::Expr::PrefixExpr(prefix) = &item
+                && prefix_op(prefix) == Some(PrefixOpKind::Unpack)
+            {
+                if rest.is_some() {
+                    return Err(LowerError::MultipleRest);
+                }
+                let operand = prefix.expr().ok_or(LowerError::NotAssignable)?;
+                rest = Some(LRest {
+                    binder: Box::new(lower_lvalue(&operand, src)?),
+                    after: Vec::new(),
+                });
+            } else {
+                let elem = lower_lvalue(&item, src)?;
+                match &mut rest {
+                    None => before.push(elem),
+                    Some(r) => r.after.push(elem),
+                }
+            }
+        }
+        Ok(LPatterns { before, rest })
+    }
+
+    /// ≙ `lower_params` over the legacy CST: try to read a call-arrow LHS's
+    /// arguments as a function signature, dropping `EMPTY_ARG` slots.
+    /// `None` when any of them is not a plain binder, an `outer(x)`-style
+    /// capture, or the single `...rest` — the arrow is then a generic
+    /// [`Expr::Arrow`], not a definition.
+    fn lower_params<'s>(call: &cst::CallExpr, src: &'s str) -> Option<Params<'s>> {
+        let args = call.arg_list()?;
+        let mut fixed = Vec::new();
+        let mut captures = Vec::new();
+        let mut rest: Option<&'s str> = None;
+        for item in args.args() {
+            match strip_unit_chains(&item) {
+                cst::Expr::EmptyArg(_) => {}
+                // `...rest` — the single vararg; its binder must be a plain
+                // name.
+                cst::Expr::PrefixExpr(prefix)
+                    if prefix_op(&prefix) == Some(PrefixOpKind::Unpack) =>
+                {
+                    if rest.is_some() {
+                        return None;
+                    }
+                    let cst::Expr::NameRef(name) = prefix.expr()? else {
+                        return None;
+                    };
+                    rest = Some(name_text(&name, src)?);
+                }
+                // A plain positional binder.
+                cst::Expr::NameRef(name) => fixed.push(name_text(&name, src)?),
+                // A reserved-word capture such as `outer(x)`: a known word
+                // wrapping one plain name.
+                cst::Expr::CallExpr(call) => {
+                    let word = param_word(callee_name(&call, src)?)?;
+                    let cst::Expr::NameRef(bound) = single_arg(&call)? else {
+                        return None;
+                    };
+                    captures.push(Capture {
+                        word,
+                        name: name_text(&bound, src)?,
+                    });
+                }
+                // Literals, operator expressions, nested lists, … are not
+                // parameters.
+                _ => return None,
+            }
+        }
+        Some(Params {
+            fixed,
+            captures,
+            rest,
+        })
+    }
+
+    // --- small helpers ------------------------------------------------
+
+    /// Slice a token's text out of the original source, so the returned
+    /// `&'s str` borrows from the source rather than from the rowan tree.
+    fn token_text<'s>(token: &SyntaxToken, src: &'s str) -> &'s str {
+        let range = token.text_range();
+        &src[usize::from(range.start())..usize::from(range.end())]
+    }
+
+    /// The identifier text of a `NAME_REF`, sliced from the source.
+    fn name_text<'s>(name: &cst::NameRef, src: &'s str) -> Option<&'s str> {
+        Some(token_text(&name.ident_token()?, src))
+    }
+
+    /// The callee name of a call, sliced from the source (≙ the old
+    /// `Ident` callee — the parser only ever builds `NAME_REF` callees).
+    fn callee_name<'s>(call: &cst::CallExpr, src: &'s str) -> Option<&'s str> {
+        name_text(&call.name_ref()?, src)
+    }
+
+    /// A call's argument nodes (including `EMPTY_ARG` slots), or no items
+    /// when the arg list is missing on a hand-built node.
+    fn call_args(call: &cst::CallExpr) -> impl Iterator<Item = cst::Expr> {
+        call.arg_list().into_iter().flat_map(|args| args.args())
+    }
+
+    /// The sole non-`EMPTY_ARG` argument of a single-argument call
+    /// (`var(e)`, `outer(x)`), or `None` when there is not exactly one. A
+    /// trailing `;` wrapper around the argument is stripped, like the old
+    /// parser dropped it.
+    fn single_arg(call: &cst::CallExpr) -> Option<cst::Expr> {
+        let mut it = call_args(call).filter(|a| !matches!(a, cst::Expr::EmptyArg(_)));
+        let first = it.next()?;
+        it.next().is_none().then(|| strip_unit_chains(&first))
+    }
+
+    /// The operator of a `BIN_EXPR`, or `None` on a hand-built node without
+    /// one (which then lowers — or fails — as a passthrough, reaching
+    /// [`lower_primary`]'s "an operator expression").
+    fn bin_op(bin: &cst::BinExpr) -> Option<BinOpKind> {
+        bin.op().map(|(_, kind)| kind)
+    }
+
+    /// The operator of a `PREFIX_EXPR`, or `None` on a hand-built node
+    /// without one.
+    fn prefix_op(prefix: &cst::PrefixExpr) -> Option<PrefixOpKind> {
+        prefix.op().map(|(_, kind)| kind)
+    }
+
+    /// Both operands of a `BIN_EXPR`. Parser-built nodes always have both;
+    /// a hand-built node missing one is a malformed tree.
+    fn operands(bin: &cst::BinExpr) -> Result<(cst::Expr, cst::Expr), LowerError> {
+        match (bin.lhs(), bin.rhs()) {
+            (Some(lhs), Some(rhs)) => Ok((lhs, rhs)),
+            _ => Err(LowerError::Unexpected("an operator expression")),
+        }
+    }
+
+    /// Unwrap single-item `COMMA_CHAIN` / `SEMI_CHAIN` wrappers — the rowan
+    /// tree's lossless encoding of a trailing `,` / `;`, which the old
+    /// parser dropped outright. Multi-item chains stay (they correspond to
+    /// the old `Binary{Comma/Semi}` nodes).
+    fn strip_unit_chains(e: &cst::Expr) -> cst::Expr {
+        let mut cur = e.clone();
+        loop {
+            let inner = match &cur {
+                cst::Expr::CommaChain(chain) => only_item(chain.items()),
+                cst::Expr::SemiChain(chain) => only_item(chain.items()),
+                _ => None,
+            };
+            match inner {
+                Some(item) => cur = item,
+                None => return cur,
+            }
+        }
+    }
+
+    /// The chain's sole item, or `None` when it has zero or several.
+    fn only_item(mut items: AstChildren<cst::Expr>) -> Option<cst::Expr> {
+        let first = items.next()?;
+        items.next().is_none().then_some(first)
+    }
+
+    /// A short, static name for a node kind, used in [`LowerError`]
+    /// messages — same vocabulary as the legacy `describe` (a chain node
+    /// reads as "an operator expression", like the old `Binary{Comma/Semi}`).
+    fn describe(e: &cst::Expr) -> &'static str {
+        match e {
+            cst::Expr::Literal(lit) => {
+                if lit.string_token().is_some() {
+                    "a string"
+                } else {
+                    "a number"
+                }
+            }
+            cst::Expr::NameRef(_) => "an identifier",
+            cst::Expr::CallExpr(_) => "a call",
+            cst::Expr::ListExpr(_) => "a list",
+            cst::Expr::MapExpr(_) => "a map",
+            cst::Expr::ParenExpr(_) => "a parenthesized expression",
+            cst::Expr::EmptyArg(_) => "an empty slot",
+            cst::Expr::PrefixExpr(_) => "a unary expression",
+            cst::Expr::BinExpr(_) | cst::Expr::CommaChain(_) | cst::Expr::SemiChain(_) => {
+                "an operator expression"
+            }
+        }
     }
 }
 
