@@ -213,8 +213,7 @@ pub fn parse_source(src: &str) -> Result<Parse, Box<ParseError>> {
         .start_node(ScarpetLanguage::kind_to_raw(SyntaxKind::SOURCE_FILE));
     comma_chain(&mut p)?;
     if p.peek().is_some() {
-        p.expected("end of input");
-        return Err(p.error());
+        return Err(p.fail("end of input"));
     }
     // Trailing trivia (e.g. a comment after the final expression) lands
     // directly in SOURCE_FILE so it isn't silently dropped.
@@ -330,7 +329,10 @@ fn closer_for(open: SyntaxKind) -> SyntaxKind {
 /// and separators are shown literally (`` `,` ``, `` `]` ``); the whole
 /// operator ladder collapses to a single `an operator`, so a position that
 /// accepts any of ~20 operators doesn't spell them all out; literals read as
-/// prose.
+/// prose. Today's grammar only asks for delimiter labels (the `an operator`
+/// and `expression` labels at error sites are literals at the recording
+/// points); the full table mirrors the old parser's `token_label` and is the
+/// vocabulary for the error-label-polish wave.
 fn kind_label(k: SyntaxKind) -> &'static str {
     match k {
         // Delimiters & separators — shown literally.
@@ -540,13 +542,23 @@ impl Parser<'_> {
     /// position past the previous farthest one resets the set.
     fn expected(&mut self, label: &'static str) {
         let at = self.cur_offset();
+        // Fail-fast parsing never rewinds, so `at` is monotone: it is either
+        // past the previous farthest point (reset the set) or exactly at it.
+        debug_assert!(at >= self.expected_at, "expected() rewound");
         if at > self.expected_at {
             self.expected_at = at;
             self.expected.clear();
         }
-        if at == self.expected_at && !self.expected.contains(&label) {
+        if !self.expected.contains(&label) {
             self.expected.push(label);
         }
+    }
+
+    /// Records `label` as expected and fails at the current position — the
+    /// one idiom for giving up on the parse.
+    fn fail(&mut self, label: &'static str) -> Box<ParseError> {
+        self.expected(label);
+        self.error()
     }
 
     /// Builds the error for a hard failure at the current position from the
@@ -588,6 +600,21 @@ impl Parser<'_> {
 // ====================================================================
 // Grammar
 // ====================================================================
+
+/// Runs `f` with room to recurse, growing the native stack when the red zone
+/// is hit. Every recursion cycle of the grammar passes through one of these
+/// guards, so deeply nested input parses instead of aborting the process.
+/// This is the same mechanism (the same crate, even) that backs the old
+/// chumsky parser via its default `spill-stack` feature, keeping the two
+/// parsers' depth tolerance at parity; on targets without stack manipulation
+/// (`wasm32`) it degrades to a plain call, also like the old parser.
+///
+/// The red zone must comfortably exceed one trip around the deepest cycle —
+/// a bracket level is ~26 frames (the full ladder plus `delimited`), which
+/// in unoptimized builds runs to the order of 100 KiB.
+fn with_stack<T>(f: impl FnOnce() -> T) -> T {
+    stacker::maybe_grow(256 * 1024, 4 * 1024 * 1024, f)
+}
 
 /// Whether the next token ends a comma chain: a closer or end of input.
 fn at_comma_chain_end(p: &Parser<'_>) -> bool {
@@ -676,12 +703,11 @@ fn left_assoc(
 }
 
 /// One right-associative binary level: `operand (op rhs)?` where `rhs`
-/// re-enters the level (or, for `->`, the whole arrow chain).
+/// re-enters the level — right associativity is the self-recursion.
 fn right_assoc(
     p: &mut Parser<'_>,
     ops: &[SyntaxKind],
     operand: fn(&mut Parser<'_>) -> PResult<()>,
-    rhs: fn(&mut Parser<'_>) -> PResult<()>,
 ) -> PResult<()> {
     let cp = p.checkpoint();
     operand(p)?;
@@ -689,7 +715,7 @@ fn right_assoc(
         Some(k) if ops.contains(&k) => {
             p.start_node_at(cp, SyntaxKind::BIN_EXPR);
             p.bump();
-            rhs(p)?;
+            with_stack(|| right_assoc(p, ops, operand))?;
             p.finish_node();
         }
         _ => p.expected("an operator"),
@@ -698,7 +724,7 @@ fn right_assoc(
 }
 
 fn arrow_chain(p: &mut Parser<'_>) -> PResult<()> {
-    right_assoc(p, &[SyntaxKind::ARROW], assign, arrow_chain)
+    right_assoc(p, &[SyntaxKind::ARROW], assign)
 }
 
 fn assign(p: &mut Parser<'_>) -> PResult<()> {
@@ -706,7 +732,6 @@ fn assign(p: &mut Parser<'_>) -> PResult<()> {
         p,
         &[SyntaxKind::EQ, SyntaxKind::PLUS_EQ, SyntaxKind::SWAP],
         lor,
-        assign,
     )
 }
 
@@ -748,7 +773,7 @@ fn multiplicative(p: &mut Parser<'_>) -> PResult<()> {
 }
 
 fn power(p: &mut Parser<'_>) -> PResult<()> {
-    right_assoc(p, &[SyntaxKind::CARET], unary, power)
+    right_assoc(p, &[SyntaxKind::CARET], unary)
 }
 
 /// `unary = (`+` | `-` | `!` | `...`)* get`. The innermost prefix wraps the
@@ -758,7 +783,7 @@ fn unary(p: &mut Parser<'_>) -> PResult<()> {
         Some(SyntaxKind::PLUS | SyntaxKind::MINUS | SyntaxKind::BANG | SyntaxKind::ELLIPSIS) => {
             p.start_node(SyntaxKind::PREFIX_EXPR);
             p.bump();
-            unary(p)?;
+            with_stack(|| unary(p))?;
             p.finish_node();
         }
         _ => get(p)?,
@@ -797,12 +822,16 @@ fn primary(p: &mut Parser<'_>) -> PResult<()> {
                 p.start_node(SyntaxKind::NAME_REF);
                 p.bump();
                 p.finish_node();
+                // The old parser tried an arg list here before settling for a
+                // bare name, so `(` joins the expected set of whatever error
+                // comes right after an identifier.
+                p.expected(kind_label(SyntaxKind::OPEN_PAREN));
             }
         }
         Some(SyntaxKind::OPEN_PAREN) => {
             p.start_node(SyntaxKind::PAREN_EXPR);
             p.bump();
-            comma_chain(p)?;
+            with_stack(|| comma_chain(p))?;
             expect(p, SyntaxKind::CLOSE_PAREN)?;
             p.finish_node();
         }
@@ -819,8 +848,7 @@ fn primary(p: &mut Parser<'_>) -> PResult<()> {
             SyntaxKind::CLOSE_BRACE,
         )?,
         _ => {
-            p.expected("expression");
-            return Err(p.error());
+            return Err(p.fail("expression"));
         }
     }
     Ok(())
@@ -832,8 +860,7 @@ fn expect(p: &mut Parser<'_>, kind: SyntaxKind) -> PResult<()> {
         p.bump();
         Ok(())
     } else {
-        p.expected(kind_label(kind));
-        Err(p.error())
+        Err(p.fail(kind_label(kind)))
     }
 }
 
@@ -861,8 +888,7 @@ fn delimited(
         if p.peek().is_none() {
             // Unreachable after `check_delimiters`, but fail cleanly rather
             // than loop forever if the pre-pass ever changes.
-            p.expected(kind_label(close));
-            return Err(p.error());
+            return Err(p.fail(kind_label(close)));
         }
         if p.peek() == Some(SyntaxKind::COMMA) {
             // Omitted entry: mark the slot with a zero-width EMPTY_ARG.
@@ -870,7 +896,7 @@ fn delimited(
             p.start_node(SyntaxKind::EMPTY_ARG);
             p.finish_node();
         } else {
-            seq_chain(p)?;
+            with_stack(|| seq_chain(p))?;
         }
         match p.peek() {
             Some(SyntaxKind::COMMA) => p.bump(),
@@ -878,8 +904,7 @@ fn delimited(
             // Mirrors the old parser's expected set: the `,` was peeked
             // structurally there too and never made it into the labels.
             _ => {
-                p.expected(kind_label(close));
-                return Err(p.error());
+                return Err(p.fail(kind_label(close)));
             }
         }
     }
@@ -1806,6 +1831,37 @@ SOURCE_FILE@0..3
     }
 
     #[test]
+    fn comment_after_trailing_separator_stays_in_chain() {
+        // Trivia after a trailing `;` stays inside the chain node (the old
+        // parser anchored it onto the chain accumulator), not in the
+        // enclosing PAREN_EXPR.
+        let root = parse_ok("(a; // tail\n)");
+        let chain = first_node(&root, SyntaxKind::SEMI_CHAIN);
+        assert_eq!(
+            child_kinds(&chain),
+            [
+                SyntaxKind::NAME_REF,
+                SyntaxKind::SEMICOLON,
+                SyntaxKind::WHITESPACE,
+                SyntaxKind::COMMENT,
+                SyntaxKind::NEWLINE,
+            ]
+        );
+        // Same for a trailing `,` at the end of input.
+        let root = parse_ok("a, // tail");
+        let chain = first_node(&root, SyntaxKind::COMMA_CHAIN);
+        assert_eq!(
+            child_kinds(&chain),
+            [
+                SyntaxKind::NAME_REF,
+                SyntaxKind::COMMA,
+                SyntaxKind::WHITESPACE,
+                SyntaxKind::COMMENT,
+            ]
+        );
+    }
+
+    #[test]
     fn comment_between_unary_prefix_and_operand() {
         // Trivia between the prefix operator and its operand sits inside the
         // PREFIX_EXPR, before the operand node.
@@ -1847,6 +1903,18 @@ SOURCE_FILE@0..3
         assert_eq!(e.message(), "expected an operator or `]`, found `2`");
     }
 
+    /// A bare identifier could have been a call, so `(` joins the expected
+    /// set of an error right after it — same as the old parser, whose
+    /// arg-list attempt recorded the label.
+    #[test]
+    fn error_after_identifier_offers_the_call_opener() {
+        let e = parse_source("a.b").unwrap_err();
+        assert_eq!(
+            e.message(),
+            "expected one of `(`, an operator, or end of input, found `.`"
+        );
+    }
+
     /// The ~20 infix/prefix operators collapse to one `an operator` rather than
     /// being spelled out across the whole precedence ladder.
     #[test]
@@ -1863,6 +1931,21 @@ SOURCE_FILE@0..3
         assert_eq!(
             e.message(),
             "expected an operator or end of input, found `2`"
+        );
+    }
+
+    /// Unlexable input — an [`ERROR_TOKEN`](SyntaxKind::ERROR_TOKEN) in the
+    /// stream — fails the parse with the offending text as `found`, mirroring
+    /// the old pipeline's lex-error behavior.
+    #[test]
+    fn error_token_surfaces_as_parse_error() {
+        let src = "a & b";
+        let e = parse_source(src).unwrap_err();
+        assert_eq!(&src[e.span.clone()], "&");
+        assert_eq!(e.found.as_deref(), Some("&"));
+        assert!(
+            crate::parser::parse_source(src).is_err(),
+            "old parser disagrees"
         );
     }
 
@@ -1947,11 +2030,41 @@ SOURCE_FILE@0..3
         assert_eq!(e.help.as_deref(), Some("missing `,`"));
     }
 
+    /// Deeply nested input parses instead of overflowing the native stack:
+    /// every recursion cycle of the grammar passes a `with_stack` guard that
+    /// grows the stack on demand, like the old chumsky parser's `spill-stack`
+    /// feature. Exercises all four cycles — brackets (via `primary` /
+    /// `delimited`), the assign family, `^`, and prefix operators.
+    #[test]
+    fn deep_nesting_does_not_overflow_the_stack() {
+        // The interspersed trivia keeps every node above rowan's small-node
+        // interning threshold (nodes with <= 3 children are hashed
+        // recursively by its node cache, which would make this test
+        // quadratic). Unguarded, a debug build aborts at ~10k bracket depth.
+        let depth = 50_000;
+        for src in [
+            format!("{}a{}", "( ".repeat(depth), " )".repeat(depth)),
+            format!("{}a{}", "[ ".repeat(depth), " ]".repeat(depth)),
+            format!("{}1", "a = \n".repeat(depth)),
+            format!("{}1", "2 ^ \n".repeat(depth)),
+            format!("{}x", "- \n".repeat(depth)),
+        ] {
+            let parse = parse_source(&src)
+                .unwrap_or_else(|e| panic!("deep input failed to parse: {}", e.message()));
+            assert_eq!(parse.syntax().text().to_string(), src, "lossless violated");
+            // *Dropping* a green tree this deep overflows the stack too —
+            // rowan's recursive drop is the tree's own depth limit,
+            // independent of how it was built. Leak it so this test pins
+            // only the parser's depth tolerance.
+            std::mem::forget(parse);
+        }
+    }
+
     // ----- corpus gates ---------------------------------------------------
 
-    /// Files the old parser cannot parse (kept in sync with the formatter's
-    /// `KNOWN_BAD` list in `scarpet-fmt/src/lib.rs`); the differential test
-    /// below still covers them.
+    /// Files the old parser cannot parse (kept in sync with the other copies
+    /// of this list, in `scarpet-fmt/src/lib.rs` and in the `ast` round-trip
+    /// test of this crate); the differential test below still covers them.
     const KNOWN_BAD: &[&str] = &[
         "gnembon/scarpet/programs/survival/portalorient.sc",
         "gnembon/scarpet/programs/survival/rifts/rifts.sc",

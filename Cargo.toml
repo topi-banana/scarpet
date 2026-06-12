@@ -20,6 +20,7 @@ regex = { version = "1" }
 rowan = { version = "0.16" }
 rustyline = { version = "18" }
 similar = { version = "3" }
+stacker = { version = "0.1" }
 scarpet-fmt = { path = "./scarpet-fmt" }
 scarpet-syntax = { path = "./scarpet-syntax" }
 scarpet-vm = { path = "./scarpet-vm" }
