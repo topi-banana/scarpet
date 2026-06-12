@@ -7,3 +7,4 @@ edition = "2024"
 chumsky.workspace = true
 logos.workspace = true
 logosky.workspace = true
+rowan.workspace = true
