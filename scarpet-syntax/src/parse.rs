@@ -2,10 +2,11 @@
 //!
 //! This is the successor of the chumsky parser in [`crate::parser`]; both
 //! coexist until the rowan migration completes (the old parser remains the
-//! behavioral spec, and the differential corpus test in this module holds the
-//! two to the same parse-success verdict on every corpus file). Like the old
-//! parser it is fail-fast: the first violation of the grammar aborts the
-//! parse with a [`ParseError`]; there is no error recovery.
+//! behavioral spec, and the differential tests in this module hold the two
+//! to the same parse-success verdict on every corpus file and to
+//! field-identical [`ParseError`]s on broken input). Like the old parser it
+//! is fail-fast: the first violation of the grammar aborts the parse with a
+//! [`ParseError`]; there is no error recovery.
 //!
 //! # Tree shape
 //!
@@ -331,8 +332,11 @@ fn closer_for(open: SyntaxKind) -> SyntaxKind {
 /// accepts any of ~20 operators doesn't spell them all out; literals read as
 /// prose. Today's grammar only asks for delimiter labels (the `an operator`
 /// and `expression` labels at error sites are literals at the recording
-/// points); the full table mirrors the old parser's `token_label` and is the
-/// vocabulary for the error-label-polish wave.
+/// points); the full table is ported verbatim from the old parser's
+/// `kind_label` so the two pipelines' messages stay at byte-parity until the
+/// old one is deleted. (`WHITESPACE` and `ERROR_TOKEN` have no old
+/// counterpart — the old lexer skipped whitespace and dropped lex-error
+/// placeholders from expected sets — and are never recorded as expected.)
 fn kind_label(k: SyntaxKind) -> &'static str {
     match k {
         // Delimiters & separators — shown literally.
@@ -448,10 +452,11 @@ struct Parser<'s> {
     builder: GreenNodeBuilder<'static>,
     /// Farthest-failure recorder: the labels expected at byte offset
     /// `expected_at` (the start of the farthest significant token peeked at
-    /// so far). [`Parser::expected`] appends to it; [`Parser::error`] turns
-    /// it into a [`ParseError`]. A later wave polishes these labels to
-    /// byte-parity with the old parser; the recording points are already in
-    /// place.
+    /// so far). [`Parser::expected`] appends to it (de-duplicated, in
+    /// recording order — which matches the order chumsky merged the same
+    /// labels in, i.e. grammar/choice order); [`Parser::error`] turns it
+    /// into a [`ParseError`]. The `error_parity_with_old_parser` test holds
+    /// the resulting labels to byte-parity with the old pipeline.
     expected: Vec<&'static str>,
     expected_at: usize,
 }
@@ -564,6 +569,13 @@ impl Parser<'_> {
     /// Builds the error for a hard failure at the current position from the
     /// farthest-failure recorder.
     fn error(&self) -> Box<ParseError> {
+        // The span is the offending token's own range (`len..len` at EOF),
+        // matching the old pipeline's observable spans — with one intentional
+        // sharpening: on a mid-expression lex error the old pipeline kept
+        // chumsky's raw error span, which folds the whitespace before the
+        // unlexable token into `found` (`"a & b"` → span 1..3, found `" &"`).
+        // Pointing exactly at the ERROR_TOKEN renders strictly better; see
+        // `error_lex_error_keeps_precise_span`.
         let (span, found_kind) = match self.cur_index() {
             Some(i) => {
                 let tok = self.tokens[i];
@@ -1892,6 +1904,21 @@ SOURCE_FILE@0..3
         assert_eq!(e.message(), "expected expression, found end of input");
     }
 
+    /// An EOF error carets the empty range `len..len` with no `found` token,
+    /// like the old pipeline — including on empty input, at offset zero.
+    #[test]
+    fn error_eof_span_is_len_to_len() {
+        let src = "1 +";
+        let e = parse_source(src).unwrap_err();
+        assert_eq!(e.span, src.len()..src.len());
+        assert_eq!(e.found, None);
+        assert_eq!(e.expected, ["expression"]);
+        let e = parse_source("").unwrap_err();
+        assert_eq!(e.span, 0..0);
+        assert_eq!(e.found, None);
+        assert_eq!(e.expected, ["expression"]);
+    }
+
     /// The `found` span covers exactly the offending token, not the leading
     /// whitespace before it.
     #[test]
@@ -1935,18 +1962,27 @@ SOURCE_FILE@0..3
     }
 
     /// Unlexable input — an [`ERROR_TOKEN`](SyntaxKind::ERROR_TOKEN) in the
-    /// stream — fails the parse with the offending text as `found`, mirroring
-    /// the old pipeline's lex-error behavior.
+    /// stream — fails the parse like the old pipeline's lex-error path, with
+    /// one intentional delta: the span. The old pipeline kept chumsky's raw
+    /// error span, which folds the whitespace before the unlexable token into
+    /// `found` (`"a & b"` → span 1..3, found `" &"`, rendering as
+    /// ``found ` &` ``); the new parser carets exactly the offending token
+    /// (span 2..3, found `"&"`), which reads strictly better under ariadne.
+    /// The expected labels match the old pipeline exactly.
     #[test]
-    fn error_token_surfaces_as_parse_error() {
+    fn error_lex_error_keeps_precise_span() {
         let src = "a & b";
         let e = parse_source(src).unwrap_err();
-        assert_eq!(&src[e.span.clone()], "&");
-        assert_eq!(e.found.as_deref(), Some("&"));
-        assert!(
-            crate::parser::parse_source(src).is_err(),
-            "old parser disagrees"
+        assert_eq!(e.span, 2..3); // old pipeline: 1..3
+        assert_eq!(e.found.as_deref(), Some("&")); // old pipeline: " &"
+        assert_eq!(
+            e.message(),
+            "expected one of `(`, an operator, or end of input, found `&`"
         );
+        let old = crate::parser::parse_source(src).unwrap_err();
+        assert_eq!(old.span, 1..3, "old span sharpened upstream — drop delta?");
+        assert_eq!(old.found.as_deref(), Some(" &"));
+        assert_eq!(e.expected, old.expected);
     }
 
     /// Every parse failure yields a non-empty, specific message.
@@ -2060,6 +2096,58 @@ SOURCE_FILE@0..3
         }
     }
 
+    // ----- old-pipeline error differential (deleted in wave 6) -----------
+
+    /// Asserts the old and the new pipeline reject `src` with field-identical
+    /// errors, including the rendered `message()` / `caret_label()` surfaces
+    /// the CLI, LSP, and playground print.
+    #[track_caller]
+    fn assert_error_parity(src: &str) {
+        let old = crate::parser::parse_source(src).expect_err("old parser accepted input");
+        let new = parse_source(src).expect_err("new parser accepted input");
+        assert_eq!(new.span, old.span, "span for {src:?}");
+        assert_eq!(new.expected, old.expected, "expected labels for {src:?}");
+        assert_eq!(new.found, old.found, "found for {src:?}");
+        assert_eq!(new.headline, old.headline, "headline for {src:?}");
+        assert_eq!(new.secondary, old.secondary, "secondary for {src:?}");
+        assert_eq!(new.help, old.help, "help for {src:?}");
+        assert_eq!(new.message(), old.message(), "message for {src:?}");
+        assert_eq!(
+            new.caret_label(),
+            old.caret_label(),
+            "caret label for {src:?}"
+        );
+    }
+
+    /// Until the old parser is deleted, broken input must error identically
+    /// through both pipelines: same caret span, same expected labels in the
+    /// same order, same `found` text, headline, secondary span, and help.
+    /// The one intentional exception — a sharper span on mid-expression lex
+    /// errors — is pinned by `error_lex_error_keeps_precise_span` instead.
+    #[test]
+    fn error_parity_with_old_parser() {
+        // Delimiter pre-pass errors, all three shapes.
+        assert_error_parity("[)"); // mismatched closing delimiter
+        assert_error_parity("foo(a"); // unclosed delimiter
+        assert_error_parity("1)"); // unmatched closing delimiter
+        // An operand is due but input ends.
+        assert_error_parity("");
+        assert_error_parity("1 +");
+        assert_error_parity("x = ;");
+        // A dropped comma between elements (the `help:` case).
+        assert_error_parity("[1 2]");
+        assert_error_parity("f(a b)");
+        assert_error_parity("{1 2}");
+        // Token mismatches mid-ladder.
+        assert_error_parity("1 2");
+        assert_error_parity("a.b");
+        assert_error_parity("a ~ ~ b");
+        assert_error_parity("f(;)");
+        // Unlexable input where an expression was due (no preceding
+        // whitespace folded in, so even the spans agree).
+        assert_error_parity("&");
+    }
+
     // ----- corpus gates ---------------------------------------------------
 
     /// Files the old parser cannot parse (kept in sync with the other copies
@@ -2140,7 +2228,8 @@ SOURCE_FILE@0..3
 
     /// The load-bearing gate of this migration wave: on EVERY corpus file
     /// (known-bad included) the old chumsky parser and this parser agree on
-    /// whether the source parses. Deleted in wave 6 together with
+    /// whether the source parses — and, where both reject, on the error
+    /// itself, field for field. Deleted in wave 6 together with
     /// `crate::parser`.
     #[test]
     fn corpus_parse_success_differential() {
@@ -2154,6 +2243,18 @@ SOURCE_FILE@0..3
                 old.as_ref().map(|_| ()).map_err(|e| e.message()),
                 new.as_ref().map(|_| ()).map_err(|e| e.message()),
             );
+            if let (Err(old), Err(new)) = (&old, &new) {
+                // Error parity on real-world broken files. (None of today's
+                // known-bad files trips the documented lex-error span delta;
+                // if a future corpus update does, exempt it here and lean on
+                // `error_lex_error_keeps_precise_span`.)
+                assert_eq!(new.span, old.span, "{rel}: error span");
+                assert_eq!(new.expected, old.expected, "{rel}: expected labels");
+                assert_eq!(new.found, old.found, "{rel}: found");
+                assert_eq!(new.headline, old.headline, "{rel}: headline");
+                assert_eq!(new.secondary, old.secondary, "{rel}: secondary");
+                assert_eq!(new.help, old.help, "{rel}: help");
+            }
         }
     }
 }
