@@ -1,0 +1,84 @@
+// Scarpet Un-Grammar.
+//
+// Describes the shape of the rowan syntax tree; `cargo xtask codegen`
+// generates `src/syntax_kind.rs` and `src/cst/generated.rs` from it.
+//
+// Node names are a contract — other code refers to them by name.
+//
+// Legend:
+//
+//   //          -- comment
+//   Name =      -- non-terminal definition
+//   'ident'     -- token (terminal)
+//   A B         -- sequence
+//   A | B       -- alternation
+//   A*          -- zero or more repetition
+//   A?          -- zero or one repetition
+//   (A)         -- same as A
+//   label:A     -- suggested name for field of AST node
+
+SourceFile = Expr?
+
+Expr =
+  Literal
+| NameRef
+| CallExpr
+| ListExpr
+| MapExpr
+| ParenExpr
+| PrefixExpr
+| BinExpr
+| CommaChain
+| SemiChain
+| EmptyArg
+
+Literal =
+  'number'
+| 'string'
+
+NameRef =
+  'ident'
+
+CallExpr =
+  NameRef ArgList
+
+ArgList =
+  '(' Expr* ')'
+
+ListExpr =
+  '[' Expr* ']'
+
+MapExpr =
+  '{' Expr* '}'
+
+ParenExpr =
+  '(' Expr ')'
+
+PrefixExpr =
+  op:('-' | '+' | '!' | '...') Expr
+
+BinExpr =
+  lhs:Expr
+  op:(
+    '+' | '-' | '*' | '/' | '%' | '^'
+  | '==' | '!=' | '<' | '<=' | '>' | '>='
+  | '&&' | '||'
+  | '~' | ':'
+  | '=' | '+=' | '<>'
+  | '->'
+  )
+  rhs:Expr
+
+// N-ary chain of comma-separated expressions: `a, b, c`.
+CommaChain =
+  Expr (',' Expr)*
+
+// N-ary chain of semicolon-separated expressions: `a; b; c;`.
+SemiChain =
+  Expr (';' Expr)* ';'?
+
+// Zero-width marker for an omitted argument slot, e.g. the hole in
+// `f(a,,b)`. In practice it never has children; the `Expr?` is only
+// there because ungrammar requires a non-empty rule.
+EmptyArg =
+  Expr?
