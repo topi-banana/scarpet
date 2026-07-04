@@ -287,6 +287,10 @@ jobs:
 
       - name: Deploy to Cloudflare Pages
         id: deploy
+        # Don't fail the job on deploy errors (e.g. Dependabot PRs run without
+        # secrets access and would otherwise always fail here); the outcome is
+        # still recorded and surfaced in the summary/PR comment below.
+        continue-on-error: true
         uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
