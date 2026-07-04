@@ -1,132 +1,18 @@
-use crate::lexer::{Token, TokenKind};
-use chumsky::{
-    error::RichPattern, extra, label::LabelError, prelude::*, recursive::Recursive, util::MaybeRef,
-};
-use logosky::{Lexed, utils::Span};
+//! Hand-written recursive-descent parser producing a lossless `rowan` syntax
+//! tree, plus the legacy [`Cst`] view lowered from it (see [`crate::cst`]).
+//!
+//! The grammar's node shapes are documented in `scarpet.ungram`; the typed
+//! accessors over the tree live in [`crate::nodes`].
 
-type TokenStream<'s> = logosky::TokenStream<'s, Token<'s>>;
-type RichErr<'s> = Rich<'s, Lexed<'s, Token<'s>>, Span>;
-type Extra<'s> = extra::Err<RichErr<'s>>;
-type BoxedP<'s, O> = Boxed<'s, 's, TokenStream<'s>, O, Extra<'s>>;
+use crate::lexer::{self, Token};
+use crate::syntax::{SyntaxKind, SyntaxNode};
+use rowan::{Checkpoint, GreenNode, GreenNodeBuilder};
 
-// ====================================================================
-// CST (concrete syntax tree) — preserves comments and breaks as
-// `leading` trivia attached to each node.
-// ====================================================================
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Cst<'s> {
-    pub leading: Vec<Trivia<'s>>,
-    pub kind: CstKind<'s>,
-}
-
-impl<'s> Cst<'s> {
-    pub fn bare(kind: CstKind<'s>) -> Self {
-        Self {
-            leading: Vec::new(),
-            kind,
-        }
-    }
-
-    pub fn with_leading(mut self, mut leading: Vec<Trivia<'s>>) -> Self {
-        if leading.is_empty() {
-            return self;
-        }
-        leading.extend(self.leading);
-        self.leading = leading;
-        self
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Trivia<'s> {
-    Comment(&'s str),
-    Break,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum CstKind<'s> {
-    Number(&'s str),
-    Str(&'s str),
-    Ident(&'s str),
-    Call {
-        callee: Box<Cst<'s>>,
-        args: Vec<Cst<'s>>,
-    },
-    List(Vec<Cst<'s>>),
-    Map(Vec<Cst<'s>>),
-    Paren(Box<Cst<'s>>),
-    Empty,
-    Binary {
-        op: BinOp,
-        lhs: Box<Cst<'s>>,
-        rhs: Box<Cst<'s>>,
-    },
-    Unary {
-        op: UnaryOp,
-        operand: Box<Cst<'s>>,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BinOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Rem,
-    Pow,
-    Eq,
-    NotEq,
-    Lt,
-    LtEq,
-    Gt,
-    GtEq,
-    And,
-    Or,
-    Match,
-    Get,
-    Assign,
-    AddAssign,
-    Swap,
-    Arrow,
-    Semi,
-    Comma,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnaryOp {
-    Neg,
-    Pos,
-    Not,
-    Unpack,
-}
+pub use crate::cst::{BinOp, Cst, CstKind, Trivia, UnaryOp, strip_trivia};
 
 // ====================================================================
 // Front-end
 // ====================================================================
-
-#[derive(Debug, Clone, Copy)]
-pub struct Code<'s> {
-    source: &'s str,
-}
-
-impl<'s> Code<'s> {
-    pub fn from_source(src: &'s str) -> Result<Self, LexError> {
-        Ok(Self { source: src })
-    }
-
-    pub fn source(&self) -> &'s str {
-        self.source
-    }
-
-    pub fn parse(&self) -> Result<Cst<'s>, Box<ParseError>> {
-        parse_source(self.source)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LexError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
@@ -135,8 +21,8 @@ pub struct ParseError {
     pub span: std::ops::Range<usize>,
     /// What the parser expected at `span`, as display-ready labels — concrete
     /// tokens carry back-ticks (`` `,` ``), higher-level patterns read as prose
-    /// (`expression`, `end of input`). De-duplicated, in chumsky's order; empty
-    /// for delimiter errors and when nothing specific was on offer.
+    /// (`expression`, `end of input`). De-duplicated; empty for delimiter
+    /// errors and when nothing specific was on offer.
     pub expected: Vec<String>,
     /// Source text of the offending token, or `None` at end of input.
     pub found: Option<String>,
@@ -208,123 +94,73 @@ impl ParseError {
     }
 }
 
+/// Parse `src` to the legacy [`Cst`] (the shape the formatter and the AST
+/// lowering consume). Convenience over [`parse`] + [`crate::cst::from_root`].
 pub fn parse_source(src: &str) -> Result<Cst<'_>, Box<ParseError>> {
+    let root = parse(src)?;
+    Ok(crate::cst::from_root(src, &root))
+}
+
+/// Parse `src` to the lossless `rowan` syntax tree. The tree's text is the
+/// source, byte for byte — nothing (comments, whitespace, `$` breaks) is
+/// dropped.
+pub fn parse(src: &str) -> Result<SyntaxNode, Box<ParseError>> {
+    // Lex once and share the token stream: the delimiter pre-pass scans it, then
+    // the parser consumes the same `Vec` (no second lexer pass, no throwaway
+    // allocation).
+    let tokens = lexer::lex(src);
     // A delimiter pre-pass catches unbalanced brackets with a structural message
     // (and a pointer back to the opener) that's clearer than whatever token
     // mismatch the grammar would otherwise trip over first.
-    if let Some(err) = check_delimiters(src) {
+    if let Some(err) = check_delimiters(&tokens) {
         return Err(Box::new(err));
     }
-    let stream = TokenStream::new(src);
-    let len = src.len();
-    match program_parser().parse(stream).into_result() {
-        Ok(cst) => Ok(cst),
-        Err(errs) => {
-            let err = errs.into_iter().next().unwrap();
-            // Prefer the offending token's own span: chumsky's error span can
-            // begin at the *previous* token's end, folding the inter-token
-            // whitespace into `found`. Lex errors / EOF keep the raw span.
-            let span = match err.found() {
-                Some(Lexed::Token(s)) => s.span.range(),
-                _ => err.span().start()..err.span().end(),
-            };
-            // A span that starts at end-of-input means EOF (no `found` token);
-            // otherwise lift the offending token's text out of `src`.
-            let found = (span.start < len).then(|| src[span.clone()].to_string());
-            let expected = collect_expected(&err);
-            let help = missing_comma_help(&err, &expected);
-            // Boxed: `ParseError` is large and the error path is cold, so we
-            // keep the hot `Ok` arm of the `Result` cheap (clippy result_large_err).
-            Err(Box::new(ParseError {
-                span,
-                expected,
-                found,
-                headline: None,
-                secondary: None,
-                help,
-            }))
-        }
-    }
-}
-
-/// Lower the expected-patterns of a chumsky `Rich` error into display-ready,
-/// de-duplicated labels. Concrete tokens come back back-ticked via
-/// [`kind_label`]; higher-level patterns (from `.labelled(...)`) read as prose.
-/// `Any` / `SomethingElse` carry nothing worth showing and are dropped.
-fn collect_expected(err: &RichErr<'_>) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for pat in err.expected() {
-        let label = match pat {
-            RichPattern::Token(t) => token_label(t).map(str::to_string),
-            RichPattern::Label(l) => Some(l.to_string()),
-            RichPattern::Identifier(i) => Some(format!("`{i}`")),
-            RichPattern::EndOfInput => Some("end of input".to_string()),
-            _ => None,
-        };
-        if let Some(label) = label
-            && !out.contains(&label)
-        {
-            out.push(label);
-        }
-    }
-    // A position that accepts an `expression` also accepts the prefix operators
-    // that begin one (`-`, `!`, …), so listing `an operator` next to it is just
-    // noise — drop it.
-    if out.iter().any(|s| s == "expression") {
-        out.retain(|s| s != "an operator");
-    }
-    out
-}
-
-/// The back-ticked display label for a concrete expected token, or `None` for
-/// a lex-error placeholder.
-fn token_label<'s>(t: &MaybeRef<'s, Lexed<'s, Token<'s>>>) -> Option<&'static str> {
-    match &**t {
-        Lexed::Token(s) => Some(kind_label(logosky::Token::kind(&s.data))),
-        Lexed::Error(_) => None,
-    }
+    let parser = Parser {
+        src,
+        tokens,
+        pos: 0,
+        builder: GreenNodeBuilder::new(),
+    };
+    // Boxed errors keep the hot `Ok` arm of every `Result` cheap — the error
+    // path is cold and `ParseError` is large (clippy result_large_err).
+    Ok(SyntaxNode::new_root(parser.parse_root()?))
 }
 
 // --- delimiter pre-pass ---------------------------------------------
 
 /// Scan the token stream for the first unbalanced delimiter — a stray closer, a
 /// wrong closer, or an opener that never closes — and describe it structurally.
-/// Returns `None` when every bracket balances. Runs straight on the lexer, so
-/// brackets inside strings and comments (which lex as single tokens) are ignored.
-fn check_delimiters(src: &str) -> Option<ParseError> {
-    use logos::Logos as _;
-    let mut stack: Vec<(TokenKind, std::ops::Range<usize>)> = Vec::new();
-    let mut lex = Token::lexer(src);
-    while let Some(res) = lex.next() {
-        let span = lex.span();
-        // A lex error isn't our concern here; let the grammar report it.
-        let Ok(tok) = res else { continue };
-        let k = logosky::Token::kind(&tok);
-        match k {
-            TokenKind::OpenParen | TokenKind::OpenBrack | TokenKind::OpenBrace => {
-                stack.push((k, span));
+/// Returns `None` when every bracket balances. Scans the already-lexed token
+/// stream, so brackets inside strings and comments (which lex as single tokens)
+/// are ignored.
+fn check_delimiters(tokens: &[Token]) -> Option<ParseError> {
+    let mut stack: Vec<(SyntaxKind, std::ops::Range<usize>)> = Vec::new();
+    for tok in tokens {
+        match tok.kind {
+            k if k.is_opener() => {
+                stack.push((tok.kind, tok.range()));
             }
-            TokenKind::CloseParen | TokenKind::CloseBrack | TokenKind::CloseBrace => {
+            k if k.is_closer() => {
                 match stack.pop() {
                     // A closer with no opener waiting for it.
                     None => {
                         return Some(ParseError {
-                            span: span.clone(),
+                            span: tok.range(),
                             expected: Vec::new(),
-                            found: Some(src[span].to_string()),
+                            found: Some(tok.text.to_string()),
                             headline: Some("unmatched closing delimiter".to_string()),
                             secondary: None,
                             help: None,
                         });
                     }
                     // The wrong closer for the opener on top of the stack.
-                    Some((open, open_span)) if closer_for(open) != k => {
+                    Some((open, open_span)) if closer_for(open) != tok.kind => {
                         return Some(ParseError {
-                            span: span.clone(),
-                            expected: vec![kind_label(closer_for(open)).to_string()],
-                            found: Some(src[span].to_string()),
+                            span: tok.range(),
+                            expected: vec![delim_label(closer_for(open)).to_string()],
+                            found: Some(tok.text.to_string()),
                             headline: Some("mismatched closing delimiter".to_string()),
-                            secondary: Some((open_span, format!("unclosed {}", kind_label(open)))),
+                            secondary: Some((open_span, format!("unclosed {}", delim_label(open)))),
                             help: None,
                         });
                     }
@@ -340,7 +176,7 @@ fn check_delimiters(src: &str) -> Option<ParseError> {
         let (open, open_span) = stack.remove(0);
         return Some(ParseError {
             span: open_span,
-            expected: vec![kind_label(closer_for(open)).to_string()],
+            expected: vec![delim_label(closer_for(open)).to_string()],
             found: None,
             headline: Some("unclosed delimiter".to_string()),
             secondary: None,
@@ -360,16 +196,13 @@ fn check_delimiters(src: &str) -> Option<ParseError> {
 /// The REPL uses this to decide whether to hold a multi-line submission open
 /// until its brackets balance.
 pub fn has_open_delimiter(src: &str) -> bool {
-    use logos::Logos as _;
     let mut depth: usize = 0;
-    for res in Token::lexer(src) {
-        // A lex error isn't our concern here; let the grammar report it.
-        let Ok(tok) = res else { continue };
-        match logosky::Token::kind(&tok) {
-            TokenKind::OpenParen | TokenKind::OpenBrack | TokenKind::OpenBrace => {
+    for tok in lexer::lex(src) {
+        match tok.kind {
+            k if k.is_opener() => {
                 depth += 1;
             }
-            TokenKind::CloseParen | TokenKind::CloseBrack | TokenKind::CloseBrace => {
+            k if k.is_closer() => {
                 // Saturate at zero so a surplus closer never reads as "open".
                 depth = depth.saturating_sub(1);
             }
@@ -380,11 +213,11 @@ pub fn has_open_delimiter(src: &str) -> bool {
 }
 
 /// The closing delimiter kind that matches an opener (identity for non-openers).
-fn closer_for(open: TokenKind) -> TokenKind {
+fn closer_for(open: SyntaxKind) -> SyntaxKind {
     match open {
-        TokenKind::OpenParen => TokenKind::CloseParen,
-        TokenKind::OpenBrack => TokenKind::CloseBrack,
-        TokenKind::OpenBrace => TokenKind::CloseBrace,
+        SyntaxKind::L_PAREN => SyntaxKind::R_PAREN,
+        SyntaxKind::L_BRACK => SyntaxKind::R_BRACK,
+        SyntaxKind::L_BRACE => SyntaxKind::R_BRACE,
         other => other,
     }
 }
@@ -392,73 +225,52 @@ fn closer_for(open: TokenKind) -> TokenKind {
 /// Guess a dropped comma: inside a list / call / map a forgotten `,` surfaces as
 /// an expression token sitting where a closer (and only operators besides) was
 /// expected — e.g. `[1 2]`. Returns the `help:` text, or `None`.
-fn missing_comma_help(err: &RichErr<'_>, expected: &[String]) -> Option<String> {
+fn missing_comma_help(expected: &[String], found: Option<SyntaxKind>) -> Option<String> {
     let closer_expected = expected
         .iter()
         .any(|e| e == "`]`" || e == "`)`" || e == "`}`");
     if !closer_expected {
         return None;
     }
-    let found_begins_expr = matches!(
-        err.found(),
-        Some(Lexed::Token(s)) if begins_expr(logosky::Token::kind(&s.data))
-    );
+    let found_begins_expr = found.is_some_and(begins_expr);
     found_begins_expr.then(|| "missing `,`".to_string())
 }
 
 /// Whether a token can begin an expression — the set whose appearance where a
 /// closer was due signals a dropped separator.
-fn begins_expr(k: TokenKind) -> bool {
+fn begins_expr(k: SyntaxKind) -> bool {
     matches!(
         k,
-        TokenKind::Number
-            | TokenKind::String
-            | TokenKind::Ident
-            | TokenKind::OpenParen
-            | TokenKind::OpenBrack
-            | TokenKind::OpenBrace
-            | TokenKind::Sub
-            | TokenKind::Add
-            | TokenKind::Bang
-            | TokenKind::Ellipsis
+        SyntaxKind::NUMBER
+            | SyntaxKind::STRING
+            | SyntaxKind::IDENT
+            | SyntaxKind::L_PAREN
+            | SyntaxKind::L_BRACK
+            | SyntaxKind::L_BRACE
+            | SyntaxKind::MINUS
+            | SyntaxKind::PLUS
+            | SyntaxKind::BANG
+            | SyntaxKind::DOT3
     )
 }
 
-/// Return a clone of `cst` with all leading trivia removed, recursively.
-///
-/// Useful for comparing two trees for structural equality while ignoring
-/// comments and breaks — e.g. to assert a formatter is non-destructive.
-pub fn strip_trivia<'s>(cst: &Cst<'s>) -> Cst<'s> {
-    let kind = match &cst.kind {
-        CstKind::Call { callee, args } => CstKind::Call {
-            callee: Box::new(strip_trivia(callee)),
-            args: args.iter().map(strip_trivia).collect(),
-        },
-        CstKind::List(items) => CstKind::List(items.iter().map(strip_trivia).collect()),
-        CstKind::Map(items) => CstKind::Map(items.iter().map(strip_trivia).collect()),
-        CstKind::Paren(inner) => CstKind::Paren(Box::new(strip_trivia(inner))),
-        CstKind::Binary { op, lhs, rhs } => CstKind::Binary {
-            op: *op,
-            lhs: Box::new(strip_trivia(lhs)),
-            rhs: Box::new(strip_trivia(rhs)),
-        },
-        CstKind::Unary { op, operand } => CstKind::Unary {
-            op: *op,
-            operand: Box::new(strip_trivia(operand)),
-        },
-        CstKind::Number(s) => CstKind::Number(s),
-        CstKind::Str(s) => CstKind::Str(s),
-        CstKind::Ident(s) => CstKind::Ident(s),
-        CstKind::Empty => CstKind::Empty,
-    };
-    Cst {
-        leading: Vec::new(),
-        kind,
+/// The literal label for a bracket kind in `expected …` / `unclosed …`
+/// messages (`` `(` ``, `` `]` ``). Only ever called with a delimiter — an
+/// opener or its matching closer — from [`check_delimiters`].
+fn delim_label(k: SyntaxKind) -> &'static str {
+    match k {
+        SyntaxKind::L_PAREN => "`(`",
+        SyntaxKind::R_PAREN => "`)`",
+        SyntaxKind::L_BRACK => "`[`",
+        SyntaxKind::R_BRACK => "`]`",
+        SyntaxKind::L_BRACE => "`{`",
+        SyntaxKind::R_BRACE => "`}`",
+        k => unreachable!("delimiter label: {k:?}"),
     }
 }
 
 // ====================================================================
-// chumsky-based parser
+// Recursive-descent parser
 // ====================================================================
 //
 // Precedence ladder (low → high):
@@ -480,619 +292,356 @@ pub fn strip_trivia<'s>(cst: &Cst<'s>) -> Cst<'s> {
 //   get         = primary ((`~` | `:`) primary)*
 //   primary     = atom | `(` top `)` | `[` arg_list `]` | `{` arg_list `}` | ident `(` arg_list `)`
 //
-// Trivia (Break / Comment) is collected at every token consumer via
-// `leading_trivia()`. Leaf and compound nodes alike carry their leading
-// trivia in `Cst::leading`. Trivia that sits immediately before an
-// operator token is treated as belonging to the operator's RHS — it is
-// prepended to the RHS node's leading.
+// Every level lands in a `BIN_EXPR` node (or `PREFIX_EXPR` for the unary
+// prefixes); left-associative levels wrap repeatedly at the same checkpoint,
+// right-associative ones recurse before wrapping. Trivia tokens are emitted
+// into the green tree at the position they occupy in the source — checkpoints
+// are always taken *after* flushing pending trivia, so a band before an
+// expression stays outside the expression's node, and a band before an
+// operator lands inside the operator's `BIN_EXPR`. The `Cst` lowering relies
+// on those positions to reproduce the old trivia attachment.
 
-fn program_parser<'s>() -> impl Parser<'s, TokenStream<'s>, Cst<'s>, Extra<'s>> {
-    top_parser()
-        .then(leading_trivia())
-        .map(|(mut cst, trailing)| {
-            // Anchor any pure-trailing trivia (e.g. a comment after the final
-            // expression) onto the root so it isn't silently dropped.
-            cst.leading.extend(trailing);
-            cst
-        })
-        .then_ignore(end())
+type PResult = Result<(), Box<ParseError>>;
+
+struct Parser<'s> {
+    src: &'s str,
+    tokens: Vec<Token<'s>>,
+    /// Index of the next token (trivia included) not yet emitted into the
+    /// builder.
+    pos: usize,
+    builder: GreenNodeBuilder<'static>,
 }
 
-fn top_parser<'s>() -> BoxedP<'s, Cst<'s>> {
-    let mut seq_chain =
-        Recursive::<chumsky::recursive::Indirect<TokenStream<'s>, Cst<'s>, Extra<'s>>>::declare();
-    let mut top =
-        Recursive::<chumsky::recursive::Indirect<TokenStream<'s>, Cst<'s>, Extra<'s>>>::declare();
+impl<'s> Parser<'s> {
+    // --- token access -------------------------------------------------
 
-    let arg_list = arg_list_parser(seq_chain.clone().boxed()).boxed();
-
-    let primary = {
-        let number = tok_matching(|t| match t {
-            Token::Number(s) => Some(CstKind::Number(s)),
-            _ => None,
-        })
-        .map(|(leading, kind)| Cst { leading, kind });
-
-        let string = tok_matching(|t| match t {
-            Token::String(s) => Some(CstKind::Str(s)),
-            _ => None,
-        })
-        .map(|(leading, kind)| Cst { leading, kind });
-
-        let ident_only = tok_matching(|t| match t {
-            Token::Ident(s) => Some(s),
-            _ => None,
-        });
-
-        let ident_or_call = ident_only
-            .then(
-                arg_list
-                    .clone()
-                    .delimited_by(kind(TokenKind::OpenParen), kind(TokenKind::CloseParen))
-                    .or_not(),
-            )
-            .map(|((leading, name), args)| match args {
-                Some(args) => Cst {
-                    leading,
-                    kind: CstKind::Call {
-                        callee: Box::new(Cst::bare(CstKind::Ident(name))),
-                        args,
-                    },
-                },
-                None => Cst {
-                    leading,
-                    kind: CstKind::Ident(name),
-                },
-            });
-
-        let paren = kind(TokenKind::OpenParen)
-            .then(top.clone())
-            .then_ignore(kind(TokenKind::CloseParen))
-            .map(|(leading, inner)| Cst {
-                leading,
-                kind: CstKind::Paren(Box::new(inner)),
-            });
-
-        let list = kind(TokenKind::OpenBrack)
-            .then(arg_list.clone())
-            .then_ignore(kind(TokenKind::CloseBrack))
-            .map(|(leading, args)| Cst {
-                leading,
-                kind: CstKind::List(args),
-            });
-
-        let map = kind(TokenKind::OpenBrace)
-            .then(arg_list.clone())
-            .then_ignore(kind(TokenKind::CloseBrace))
-            .map(|(leading, args)| Cst {
-                leading,
-                kind: CstKind::Map(args),
-            });
-
-        choice((number, string, ident_or_call, paren, list, map))
-            .labelled("expression")
-            .boxed()
-    };
-
-    let get = primary
-        .clone()
-        .foldl(
-            choice((
-                kind(TokenKind::Tilde).map(|l| (l, BinOp::Match)),
-                kind(TokenKind::Colon).map(|l| (l, BinOp::Get)),
-            ))
-            .then(primary.clone())
-            .repeated(),
-            |lhs, ((op_leading, op), rhs)| bin(op, lhs, rhs.with_leading(op_leading)),
-        )
-        .boxed();
-
-    let unary_prefix = choice((
-        kind(TokenKind::Sub).map(|l| (l, UnaryOp::Neg)),
-        kind(TokenKind::Add).map(|l| (l, UnaryOp::Pos)),
-        kind(TokenKind::Bang).map(|l| (l, UnaryOp::Not)),
-        kind(TokenKind::Ellipsis).map(|l| (l, UnaryOp::Unpack)),
-    ));
-    let unary = unary_prefix
-        .repeated()
-        .collect::<Vec<_>>()
-        .then(get)
-        .map(|(prefixes, operand)| {
-            // Innermost prefix wraps the operand; each outer prefix wraps
-            // the result. Each prefix takes its own leading trivia.
-            prefixes
-                .into_iter()
-                .rev()
-                .fold(operand, |acc, (l, op)| Cst {
-                    leading: l,
-                    kind: CstKind::Unary {
-                        op,
-                        operand: Box::new(acc),
-                    },
-                })
-        })
-        .boxed();
-
-    // power is right-associative.
-    let power = unary
-        .clone()
-        .then(
-            kind(TokenKind::Pow)
-                .then(unary)
-                .repeated()
-                .collect::<Vec<_>>(),
-        )
-        .map(|(first, rest)| {
-            if rest.is_empty() {
-                return first;
-            }
-            let mut operands = Vec::with_capacity(rest.len() + 1);
-            let mut op_leadings = Vec::with_capacity(rest.len());
-            operands.push(first);
-            for (op_leading, rhs) in rest {
-                op_leadings.push(op_leading);
-                operands.push(rhs);
-            }
-            let mut acc = operands.pop().unwrap();
-            while let Some(lhs) = operands.pop() {
-                let op_leading = op_leadings.pop().unwrap();
-                acc = bin(BinOp::Pow, lhs, acc.with_leading(op_leading));
-            }
-            acc
-        })
-        .boxed();
-
-    let multiplicative = power
-        .clone()
-        .foldl(
-            choice((
-                kind(TokenKind::Mul).map(|l| (l, BinOp::Mul)),
-                kind(TokenKind::Div).map(|l| (l, BinOp::Div)),
-                kind(TokenKind::Rem).map(|l| (l, BinOp::Rem)),
-            ))
-            .then(power)
-            .repeated(),
-            |lhs, ((op_leading, op), rhs)| bin(op, lhs, rhs.with_leading(op_leading)),
-        )
-        .boxed();
-
-    let additive = multiplicative
-        .clone()
-        .foldl(
-            choice((
-                kind(TokenKind::Add).map(|l| (l, BinOp::Add)),
-                kind(TokenKind::Sub).map(|l| (l, BinOp::Sub)),
-            ))
-            .then(multiplicative)
-            .repeated(),
-            |lhs, ((op_leading, op), rhs)| bin(op, lhs, rhs.with_leading(op_leading)),
-        )
-        .boxed();
-
-    let compare = additive
-        .clone()
-        .foldl(
-            choice((
-                kind(TokenKind::LtEq).map(|l| (l, BinOp::LtEq)),
-                kind(TokenKind::GtEq).map(|l| (l, BinOp::GtEq)),
-                kind(TokenKind::Lt).map(|l| (l, BinOp::Lt)),
-                kind(TokenKind::Gt).map(|l| (l, BinOp::Gt)),
-            ))
-            .then(additive)
-            .repeated(),
-            |lhs, ((op_leading, op), rhs)| bin(op, lhs, rhs.with_leading(op_leading)),
-        )
-        .boxed();
-
-    let equality = compare
-        .clone()
-        .foldl(
-            choice((
-                kind(TokenKind::EqEq).map(|l| (l, BinOp::Eq)),
-                kind(TokenKind::BangEq).map(|l| (l, BinOp::NotEq)),
-            ))
-            .then(compare)
-            .repeated(),
-            |lhs, ((op_leading, op), rhs)| bin(op, lhs, rhs.with_leading(op_leading)),
-        )
-        .boxed();
-
-    let land = equality
-        .clone()
-        .foldl(
-            kind(TokenKind::And).then(equality).repeated(),
-            |lhs, (op_leading, rhs)| bin(BinOp::And, lhs, rhs.with_leading(op_leading)),
-        )
-        .boxed();
-
-    let lor = land
-        .clone()
-        .foldl(
-            kind(TokenKind::Or).then(land).repeated(),
-            |lhs, (op_leading, rhs)| bin(BinOp::Or, lhs, rhs.with_leading(op_leading)),
-        )
-        .boxed();
-
-    // assign is right-associative; per-link op may differ.
-    let assign_op = choice((
-        kind(TokenKind::Assign).map(|l| (l, BinOp::Assign)),
-        kind(TokenKind::AddAssign).map(|l| (l, BinOp::AddAssign)),
-        kind(TokenKind::Swap).map(|l| (l, BinOp::Swap)),
-    ));
-    let assign = lor
-        .clone()
-        .then(assign_op.then(lor).repeated().collect::<Vec<_>>())
-        .map(|(first, rest)| {
-            if rest.is_empty() {
-                return first;
-            }
-            let mut operands: Vec<Cst<'s>> = Vec::with_capacity(rest.len() + 1);
-            let mut links: Vec<(Vec<Trivia<'s>>, BinOp)> = Vec::with_capacity(rest.len());
-            operands.push(first);
-            for ((op_leading, op), rhs) in rest {
-                links.push((op_leading, op));
-                operands.push(rhs);
-            }
-            let mut acc = operands.pop().unwrap();
-            while let Some(lhs) = operands.pop() {
-                let (op_leading, op) = links.pop().unwrap();
-                acc = bin(op, lhs, acc.with_leading(op_leading));
-            }
-            acc
-        })
-        .boxed();
-
-    let arrow_chain = assign
-        .clone()
-        .then(
-            kind(TokenKind::Arrow)
-                .then(assign)
-                .repeated()
-                .collect::<Vec<_>>(),
-        )
-        .map(|(first, rest)| {
-            if rest.is_empty() {
-                return first;
-            }
-            let mut operands = Vec::with_capacity(rest.len() + 1);
-            let mut op_leadings = Vec::with_capacity(rest.len());
-            operands.push(first);
-            for (op_leading, rhs) in rest {
-                op_leadings.push(op_leading);
-                operands.push(rhs);
-            }
-            let mut acc = operands.pop().unwrap();
-            while let Some(lhs) = operands.pop() {
-                let op_leading = op_leadings.pop().unwrap();
-                acc = bin(BinOp::Arrow, lhs, acc.with_leading(op_leading));
-            }
-            acc
-        })
-        .boxed();
-
-    seq_chain.define(seq_chain_inner(arrow_chain));
-    top.define(comma_chain_inner(seq_chain.clone().boxed()));
-
-    top.boxed()
-}
-
-fn seq_chain_inner<'s>(
-    arrow_chain: BoxedP<'s, Cst<'s>>,
-) -> impl Parser<'s, TokenStream<'s>, Cst<'s>, Extra<'s>> + Clone {
-    let leading = leading_trivia();
-    custom(move |inp| {
-        let mut acc = inp.parse(arrow_chain.clone())?;
-        loop {
-            // The leading trivia for the next operator. If we end up at a
-            // closer/EOF/comma, this trivia belongs to no specific child —
-            // it gets handed back to the enclosing parser as the next
-            // peeked-token's leading. Because chumsky doesn't let us
-            // "un-collect" trivia, we have to be careful to NOT consume
-            // it unless we know we're about to commit. Strategy: save a
-            // checkpoint, collect trivia, peek; if the next token is `;`
-            // commit, otherwise rewind and stop.
-            let saved = inp.save();
-            let trivia = inp.parse(leading.clone())?;
-            if !peek_is(inp, TokenKind::SemiColon) {
-                inp.rewind(saved);
-                break;
-            }
-            // Eat one `;`, then any additional `;`s (Scarpet's preprocessor
-            // strips runs of them). Keep the trivia gathered after the
-            // FINAL `;` so it can attach to the next statement.
-            let _ = inp.next();
-            let mut post_semi_trivia = inp.parse(leading.clone())?;
-            while peek_is(inp, TokenKind::SemiColon) {
-                let _ = inp.next();
-                post_semi_trivia = inp.parse(leading.clone())?;
-            }
-            if peek_is_closer_or_eof(inp) || peek_is(inp, TokenKind::Comma) {
-                // Trailing `;`. Both the trivia before the first `;` and
-                // any trivia after the final `;` would otherwise be lost —
-                // anchor them onto the accumulator's leading.
-                acc.leading.extend(trivia);
-                acc.leading.extend(post_semi_trivia);
-                break;
-            }
-            let rhs = inp.parse(arrow_chain.clone())?;
-            // Trivia before the `;` (visually ends the LHS statement) and
-            // trivia after the final `;` both flow into the next stmt's
-            // leading, in source order.
-            let mut combined = trivia;
-            combined.extend(post_semi_trivia);
-            acc = bin(BinOp::Semi, acc, rhs.with_leading(combined));
-        }
-        Ok(acc)
-    })
-}
-
-fn comma_chain_inner<'s>(
-    seq_chain: BoxedP<'s, Cst<'s>>,
-) -> impl Parser<'s, TokenStream<'s>, Cst<'s>, Extra<'s>> + Clone {
-    let leading = leading_trivia();
-    custom(move |inp| {
-        let mut acc = inp.parse(seq_chain.clone())?;
-        loop {
-            let saved = inp.save();
-            let trivia = inp.parse(leading.clone())?;
-            if !peek_is(inp, TokenKind::Comma) {
-                inp.rewind(saved);
-                break;
-            }
-            let _ = inp.next();
-            let trivia2 = inp.parse(leading.clone())?;
-            if peek_is_closer_or_eof(inp) {
-                // Trailing `,`. Trivia between the previous expr and `,` is
-                // attached to acc; trivia after `,` goes to acc too.
-                let mut combined = trivia;
-                combined.extend(trivia2);
-                acc.leading.extend(combined);
-                break;
-            }
-            let rhs = inp.parse(seq_chain.clone())?;
-            // trivia (before `,`) attaches to rhs; trivia2 (after `,`) also
-            // attaches to rhs's leading (already does via the seq parse).
-            // Order: trivia, then trivia2, then rhs's own leading.
-            let mut combined = trivia;
-            combined.extend(trivia2);
-            acc = bin(BinOp::Comma, acc, rhs.with_leading(combined));
-        }
-        Ok(acc)
-    })
-}
-
-// arg_list (between `(`, `[`, `{`) — comma-separated `seq_chain`s, tolerating:
-//   - empty list right before closer
-//   - omitted entries: `f(a, , b)` → second arg is `CstKind::Empty`
-//   - trailing comma: `(a, b,)` does NOT insert a phantom trailing Empty
-//
-// Trivia is preserved by attaching to each item's leading. Trivia before a
-// phantom Empty is recorded on the Empty node.
-fn arg_list_parser<'s>(
-    seq: BoxedP<'s, Cst<'s>>,
-) -> impl Parser<'s, TokenStream<'s>, Vec<Cst<'s>>, Extra<'s>> + Clone {
-    let leading = leading_trivia();
-    custom(move |inp| {
-        let initial = inp.parse(leading.clone())?;
-        let mut items: Vec<Cst<'s>> = Vec::new();
-        if peek_is_closer_or_eof(inp) {
-            // Trivia inside an empty `(... )`. Promote it onto a phantom-less
-            // tail; we have nowhere natural to attach it, so re-attach to
-            // the caller via the input rewind isn't possible. Stash on a
-            // hidden Empty node so it's not lost.
-            if !initial.is_empty() {
-                items.push(Cst {
-                    leading: initial,
-                    kind: CstKind::Empty,
-                });
-            }
-            return Ok(items);
-        }
-        let mut pending: Vec<Trivia<'s>> = initial;
-        loop {
-            if peek_is(inp, TokenKind::Comma) {
-                // Omitted entry: synthesise an Empty carrying the pending
-                // trivia (which would otherwise be lost).
-                items.push(Cst {
-                    leading: std::mem::take(&mut pending),
-                    kind: CstKind::Empty,
-                });
-            } else if peek_is_closer_or_eof(inp) {
-                if !pending.is_empty() {
-                    items.push(Cst {
-                        leading: std::mem::take(&mut pending),
-                        kind: CstKind::Empty,
-                    });
-                }
-                break;
-            } else {
-                let v = inp.parse(seq.clone())?;
-                let leading_before = std::mem::take(&mut pending);
-                items.push(v.with_leading(leading_before));
-            }
-            let trivia_after = inp.parse(leading.clone())?;
-            if peek_is(inp, TokenKind::Comma) {
-                let _ = inp.next();
-                let trivia_post_comma = inp.parse(leading.clone())?;
-                // trivia_after sits between the previous item and `,`;
-                // trivia_post_comma sits between `,` and the next item.
-                // Both flow into the next item's leading.
-                pending = trivia_after;
-                pending.extend(trivia_post_comma);
-                if peek_is_closer_or_eof(inp) {
-                    // Trailing comma — flush pending onto last item.
-                    if !pending.is_empty() {
-                        items.last_mut().unwrap().leading.extend(pending);
-                    }
-                    break;
-                }
-            } else {
-                // No comma, so we're done. Trivia between last item and
-                // closer attaches back onto the last item.
-                if !trivia_after.is_empty() {
-                    items.last_mut().unwrap().leading.extend(trivia_after);
-                }
-                break;
-            }
-        }
-        Ok(items)
-    })
-}
-
-fn peek_is<'s>(
-    inp: &mut chumsky::input::InputRef<'s, '_, TokenStream<'s>, Extra<'s>>,
-    k: TokenKind,
-) -> bool {
-    match inp.peek() {
-        Some(Lexed::Token(s)) => logosky::Token::kind(&s.data) == k,
-        _ => false,
+    /// The next semantic (non-trivia) token, without consuming anything.
+    fn peek(&self) -> Option<&Token<'s>> {
+        self.tokens[self.pos..].iter().find(|t| !t.kind.is_trivia())
     }
-}
 
-fn peek_is_closer_or_eof<'s>(
-    inp: &mut chumsky::input::InputRef<'s, '_, TokenStream<'s>, Extra<'s>>,
-) -> bool {
-    match inp.peek() {
-        None => true,
-        Some(Lexed::Token(s)) => matches!(
-            logosky::Token::kind(&s.data),
-            TokenKind::CloseParen | TokenKind::CloseBrack | TokenKind::CloseBrace
-        ),
-        _ => false,
+    fn peek_kind(&self) -> Option<SyntaxKind> {
+        self.peek().map(|t| t.kind)
     }
-}
 
-// --- token matching helpers ----------------------------------------
+    fn at(&self, kind: SyntaxKind) -> bool {
+        self.peek_kind() == Some(kind)
+    }
 
-/// A parser that collects consecutive trivia tokens (Break / Comment)
-/// from the head of the input without consuming any semantic token.
-fn leading_trivia<'s>() -> BoxedP<'s, Vec<Trivia<'s>>> {
-    custom(|inp| {
-        let mut v = Vec::new();
-        loop {
-            let saved = inp.save();
-            match inp.next() {
-                Some(Lexed::Token(s)) => match s.data {
-                    Token::Comment(c) => v.push(Trivia::Comment(c)),
-                    Token::Break => v.push(Trivia::Break),
-                    _ => {
-                        inp.rewind(saved);
-                        break;
-                    }
-                },
-                _ => {
-                    inp.rewind(saved);
-                    break;
-                }
-            }
+    fn at_closer_or_eof(&self) -> bool {
+        self.peek_kind().is_none_or(SyntaxKind::is_closer)
+    }
+
+    /// Emit pending trivia tokens into the builder, up to the next semantic
+    /// token (or end of input).
+    fn flush_trivia(&mut self) {
+        while self
+            .tokens
+            .get(self.pos)
+            .is_some_and(|t| t.kind.is_trivia())
+        {
+            let t = &self.tokens[self.pos];
+            self.builder.token(t.kind.into(), t.text);
+            self.pos += 1;
         }
-        Ok(v)
-    })
-    .boxed()
-}
-
-/// Match a token kind, returning its leading trivia. On mismatch the failure is
-/// labelled with the kind's spelling, so that `choice`/`foldl` can union the
-/// alternatives into an `expected one of …` set (see [`kind_label`]).
-fn kind<'s>(k: TokenKind) -> BoxedP<'s, Vec<Trivia<'s>>> {
-    leading_trivia()
-        .then(
-            any()
-                .try_map(move |tok: Lexed<'s, Token<'s>>, span: Span| match tok {
-                    Lexed::Token(t) if logosky::Token::kind(&t.data) == k => Ok(()),
-                    other => Err(unexpected(other, span)),
-                })
-                .labelled(kind_label(k)),
-        )
-        .map(|(leading, _)| leading)
-        .boxed()
-}
-
-/// Match a token and project a value from it, returning the leading trivia
-/// alongside. Callers that want a friendly expectation wrap this in
-/// `.labelled(...)` — e.g. the `primary` choice is labelled `expression`.
-fn tok_matching<'s, T: 's, F>(f: F) -> BoxedP<'s, (Vec<Trivia<'s>>, T)>
-where
-    F: Fn(Token<'s>) -> Option<T> + Clone + 's,
-{
-    leading_trivia()
-        .then(
-            any().try_map(move |tok: Lexed<'s, Token<'s>>, span: Span| match tok {
-                Lexed::Token(t) => f(t.data).ok_or_else(|| unexpected(Lexed::Token(t), span)),
-                other => Err(unexpected(other, span)),
-            }),
-        )
-        .boxed()
-}
-
-/// A `Rich` error reporting `found` where it was not expected, leaving the
-/// expected-set empty for a wrapping `.labelled(...)` to fill in. Built by hand
-/// because the trivia-peeling matchers above can't use chumsky's own
-/// `just`/`select` (which would synthesise this automatically).
-fn unexpected<'s>(found: Lexed<'s, Token<'s>>, span: Span) -> RichErr<'s> {
-    <RichErr<'s> as LabelError<'s, TokenStream<'s>, RichPattern<'s, Lexed<'s, Token<'s>>>>>::expected_found(
-        core::iter::empty(),
-        Some(MaybeRef::Val(found)),
-        span,
-    )
-}
-
-/// The display label for a token kind in `expected …` messages. Delimiters and
-/// separators are shown literally (`` `,` ``, `` `]` ``); the whole operator
-/// ladder collapses to a single `an operator`, so a position that accepts any
-/// of ~20 operators doesn't spell them all out; literals read as prose.
-fn kind_label(k: TokenKind) -> &'static str {
-    match k {
-        // Delimiters & separators — shown literally.
-        TokenKind::OpenParen => "`(`",
-        TokenKind::CloseParen => "`)`",
-        TokenKind::OpenBrack => "`[`",
-        TokenKind::CloseBrack => "`]`",
-        TokenKind::OpenBrace => "`{`",
-        TokenKind::CloseBrace => "`}`",
-        TokenKind::Comma => "`,`",
-        TokenKind::SemiColon => "`;`",
-        TokenKind::Dot => "`.`",
-        // Literals / words.
-        TokenKind::Number => "number",
-        TokenKind::String => "string",
-        TokenKind::Ident => "identifier",
-        TokenKind::Break => "line break",
-        TokenKind::Comment => "comment",
-        // The entire precedence ladder collapses to one label.
-        TokenKind::Arrow
-        | TokenKind::Assign
-        | TokenKind::AddAssign
-        | TokenKind::Swap
-        | TokenKind::Add
-        | TokenKind::Sub
-        | TokenKind::Mul
-        | TokenKind::Div
-        | TokenKind::Rem
-        | TokenKind::Pow
-        | TokenKind::EqEq
-        | TokenKind::BangEq
-        | TokenKind::Lt
-        | TokenKind::LtEq
-        | TokenKind::Gt
-        | TokenKind::GtEq
-        | TokenKind::And
-        | TokenKind::Or
-        | TokenKind::Bang
-        | TokenKind::Tilde
-        | TokenKind::Colon
-        | TokenKind::Ellipsis => "an operator",
     }
-}
 
-// --- helpers --------------------------------------------------------
+    /// Consume the next semantic token (flushing trivia before it).
+    fn bump(&mut self) {
+        self.flush_trivia();
+        let t = &self.tokens[self.pos];
+        debug_assert!(!t.kind.is_trivia());
+        self.builder.token(t.kind.into(), t.text);
+        self.pos += 1;
+    }
 
-fn bin<'s>(op: BinOp, lhs: Cst<'s>, rhs: Cst<'s>) -> Cst<'s> {
-    Cst::bare(CstKind::Binary {
-        op,
-        lhs: Box::new(lhs),
-        rhs: Box::new(rhs),
-    })
+    /// A checkpoint for retroactive wrapping. Trivia is flushed first, so the
+    /// band before the upcoming expression stays *outside* the wrapped node.
+    fn checkpoint(&mut self) -> Checkpoint {
+        self.flush_trivia();
+        self.builder.checkpoint()
+    }
+
+    fn start_node(&mut self, kind: SyntaxKind) {
+        self.flush_trivia();
+        self.builder.start_node(kind.into());
+    }
+
+    fn finish_node(&mut self) {
+        self.builder.finish_node();
+    }
+
+    /// Wrap everything parsed since `cp` into a `kind` node.
+    fn wrap(&mut self, cp: Checkpoint, kind: SyntaxKind) {
+        self.builder.start_node_at(cp, kind.into());
+        self.builder.finish_node();
+    }
+
+    // --- errors ---------------------------------------------------------
+
+    /// A [`ParseError`] at the next semantic token (or end of input), with the
+    /// given expectation labels and, where it applies, the missing-comma help.
+    fn err_here(&self, expected: Vec<String>) -> Box<ParseError> {
+        let (span, found, found_kind) = match self.peek() {
+            Some(t) => (t.range(), Some(t.text.to_string()), Some(t.kind)),
+            None => (self.src.len()..self.src.len(), None, None),
+        };
+        let help = missing_comma_help(&expected, found_kind);
+        Box::new(ParseError {
+            span,
+            expected,
+            found,
+            headline: None,
+            secondary: None,
+            help,
+        })
+    }
+
+    fn expected_operator_or(&self, closer_label: &str) -> Box<ParseError> {
+        self.err_here(vec!["an operator".to_string(), closer_label.to_string()])
+    }
+
+    // --- grammar ----------------------------------------------------------
+
+    fn parse_root(mut self) -> Result<GreenNode, Box<ParseError>> {
+        self.builder.start_node(SyntaxKind::ROOT.into());
+        self.parse_top()?;
+        // Anchor trailing trivia (e.g. a comment after the final expression)
+        // inside the root so it isn't lost.
+        self.flush_trivia();
+        if self.peek().is_some() {
+            // Anything the ladder could not consume. A stray closer cannot
+            // appear here — the delimiter pre-pass rejected it already.
+            return Err(self.err_here(vec!["an operator".to_string(), "end of input".to_string()]));
+        }
+        self.finish_node();
+        Ok(self.builder.finish())
+    }
+
+    /// `comma_chain`, the grammar's `top`: the root, and paren bodies.
+    fn parse_top(&mut self) -> PResult {
+        let cp = self.checkpoint();
+        self.parse_item()?;
+        while self.at(SyntaxKind::COMMA) {
+            self.bump();
+            if self.at_closer_or_eof() {
+                // Trailing `,` — tolerated; the CST lowering anchors the
+                // surrounding trivia onto the chain.
+                break;
+            }
+            self.parse_item()?;
+            self.wrap(cp, SyntaxKind::BIN_EXPR);
+        }
+        Ok(())
+    }
+
+    /// `seq_chain`: `;`-separated statements — also each argument-list item.
+    fn parse_item(&mut self) -> PResult {
+        let cp = self.checkpoint();
+        self.parse_arrow()?;
+        while self.at(SyntaxKind::SEMICOLON) {
+            self.bump();
+            // Scarpet's preprocessor strips runs of `;`; treat the run as one
+            // separator.
+            while self.at(SyntaxKind::SEMICOLON) {
+                self.bump();
+            }
+            if self.at_closer_or_eof() || self.at(SyntaxKind::COMMA) {
+                // Trailing `;` — tolerated.
+                break;
+            }
+            self.parse_arrow()?;
+            self.wrap(cp, SyntaxKind::BIN_EXPR);
+        }
+        Ok(())
+    }
+
+    /// `arrow_chain` (`->`; right-associative).
+    fn parse_arrow(&mut self) -> PResult {
+        self.parse_right_assoc(&[SyntaxKind::ARROW], Self::parse_assign)
+    }
+
+    /// `assign` (`=`, `+=`, `<>`; right-associative).
+    fn parse_assign(&mut self) -> PResult {
+        self.parse_right_assoc(
+            &[SyntaxKind::EQ, SyntaxKind::PLUS_EQ, SyntaxKind::LT_GT],
+            Self::parse_lor,
+        )
+    }
+
+    /// One left-associative binary level: `next (op next)*`.
+    fn parse_left_assoc(&mut self, ops: &[SyntaxKind], next: fn(&mut Self) -> PResult) -> PResult {
+        let cp = self.checkpoint();
+        next(self)?;
+        while self.peek_kind().is_some_and(|k| ops.contains(&k)) {
+            self.bump();
+            next(self)?;
+            self.wrap(cp, SyntaxKind::BIN_EXPR);
+        }
+        Ok(())
+    }
+
+    /// One right-associative binary level: `next (op right)?`, where `right`
+    /// recurses at this same level (so `a = b = c` nests to the right). The
+    /// twin of [`Self::parse_left_assoc`].
+    fn parse_right_assoc(&mut self, ops: &[SyntaxKind], next: fn(&mut Self) -> PResult) -> PResult {
+        let cp = self.checkpoint();
+        next(self)?;
+        if self.peek_kind().is_some_and(|k| ops.contains(&k)) {
+            self.bump();
+            self.parse_right_assoc(ops, next)?;
+            self.wrap(cp, SyntaxKind::BIN_EXPR);
+        }
+        Ok(())
+    }
+
+    fn parse_lor(&mut self) -> PResult {
+        self.parse_left_assoc(&[SyntaxKind::PIPE2], Self::parse_land)
+    }
+
+    fn parse_land(&mut self) -> PResult {
+        self.parse_left_assoc(&[SyntaxKind::AMP2], Self::parse_equality)
+    }
+
+    fn parse_equality(&mut self) -> PResult {
+        self.parse_left_assoc(&[SyntaxKind::EQ2, SyntaxKind::BANG_EQ], Self::parse_compare)
+    }
+
+    fn parse_compare(&mut self) -> PResult {
+        self.parse_left_assoc(
+            &[
+                SyntaxKind::LT_EQ,
+                SyntaxKind::GT_EQ,
+                SyntaxKind::LT,
+                SyntaxKind::GT,
+            ],
+            Self::parse_additive,
+        )
+    }
+
+    fn parse_additive(&mut self) -> PResult {
+        self.parse_left_assoc(&[SyntaxKind::PLUS, SyntaxKind::MINUS], Self::parse_mult)
+    }
+
+    fn parse_mult(&mut self) -> PResult {
+        self.parse_left_assoc(
+            &[SyntaxKind::STAR, SyntaxKind::SLASH, SyntaxKind::PERCENT],
+            Self::parse_power,
+        )
+    }
+
+    /// `power` (`^`; right-associative).
+    fn parse_power(&mut self) -> PResult {
+        self.parse_right_assoc(&[SyntaxKind::CARET], Self::parse_unary)
+    }
+
+    /// `unary`: stackable prefixes (`-`, `+`, `!`, `...`).
+    fn parse_unary(&mut self) -> PResult {
+        if matches!(
+            self.peek_kind(),
+            Some(SyntaxKind::MINUS | SyntaxKind::PLUS | SyntaxKind::BANG | SyntaxKind::DOT3)
+        ) {
+            self.start_node(SyntaxKind::PREFIX_EXPR);
+            self.bump();
+            self.parse_unary()?;
+            self.finish_node();
+            Ok(())
+        } else {
+            self.parse_get()
+        }
+    }
+
+    /// `get` (`~`, `:`; left-associative; the RHS is always a primary).
+    fn parse_get(&mut self) -> PResult {
+        self.parse_left_assoc(&[SyntaxKind::TILDE, SyntaxKind::COLON], Self::parse_primary)
+    }
+
+    fn parse_primary(&mut self) -> PResult {
+        match self.peek_kind() {
+            Some(SyntaxKind::NUMBER | SyntaxKind::STRING) => {
+                self.start_node(SyntaxKind::LITERAL);
+                self.bump();
+                self.finish_node();
+                Ok(())
+            }
+            Some(SyntaxKind::IDENT) => {
+                let cp = self.checkpoint();
+                self.start_node(SyntaxKind::NAME_REF);
+                self.bump();
+                self.finish_node();
+                if self.at(SyntaxKind::L_PAREN) {
+                    self.builder.start_node_at(cp, SyntaxKind::CALL_EXPR.into());
+                    self.parse_delimited(SyntaxKind::ARG_LIST, SyntaxKind::R_PAREN, "`)`")?;
+                    self.finish_node();
+                }
+                Ok(())
+            }
+            Some(SyntaxKind::L_PAREN) => {
+                self.start_node(SyntaxKind::PAREN_EXPR);
+                self.bump();
+                self.parse_top()?;
+                if !self.at(SyntaxKind::R_PAREN) {
+                    return Err(self.expected_operator_or("`)`"));
+                }
+                self.bump();
+                self.finish_node();
+                Ok(())
+            }
+            Some(SyntaxKind::L_BRACK) => {
+                self.parse_delimited(SyntaxKind::LIST_EXPR, SyntaxKind::R_BRACK, "`]`")
+            }
+            Some(SyntaxKind::L_BRACE) => {
+                self.parse_delimited(SyntaxKind::MAP_EXPR, SyntaxKind::R_BRACE, "`}`")
+            }
+            _ => Err(self.err_here(vec!["expression".to_string()])),
+        }
+    }
+
+    /// A bracketed argument list: a call's `( … )`, a list's `[ … ]`, a map's
+    /// `{ … }`. The opener is the next token.
+    fn parse_delimited(
+        &mut self,
+        node: SyntaxKind,
+        closer: SyntaxKind,
+        closer_label: &str,
+    ) -> PResult {
+        self.start_node(node);
+        self.bump();
+        self.parse_args(closer_label)?;
+        if !self.at(closer) {
+            // Unreachable in practice: the pre-pass balanced every delimiter
+            // and `parse_args` stops only at a closer. Kept for robustness.
+            return Err(self.err_here(vec![closer_label.to_string()]));
+        }
+        self.bump();
+        self.finish_node();
+        Ok(())
+    }
+
+    /// The comma-separated items between delimiters, tolerating an empty list,
+    /// omitted entries (`f(a, , b)` — the CST lowering synthesizes the phantom
+    /// `Empty`), and a trailing comma.
+    fn parse_args(&mut self, closer_label: &str) -> PResult {
+        loop {
+            if self.at_closer_or_eof() {
+                return Ok(());
+            }
+            if !self.at(SyntaxKind::COMMA) {
+                // A real item; a `,` here is an omitted entry, represented by
+                // nothing at all between the separators.
+                self.parse_item()?;
+            }
+            if self.at(SyntaxKind::COMMA) {
+                self.bump();
+                continue;
+            }
+            if self.at_closer_or_eof() {
+                return Ok(());
+            }
+            // Two items with nothing between them — e.g. `[1 2]`.
+            return Err(self.expected_operator_or(closer_label));
+        }
+    }
 }
 
 // ====================================================================
@@ -1136,6 +685,13 @@ mod tests {
         Cst::bare(CstKind::Unary {
             op,
             operand: Box::new(operand),
+        })
+    }
+    fn bin<'s>(op: BinOp, lhs: Cst<'s>, rhs: Cst<'s>) -> Cst<'s> {
+        Cst::bare(CstKind::Binary {
+            op,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
         })
     }
 
@@ -1320,6 +876,22 @@ mod tests {
         assert_eq!(strip_trivia(&parse(src)), expected);
     }
 
+    // ----- the rowan tree ------------------------------------------------
+
+    /// The syntax tree is lossless: its text is the source, byte for byte.
+    #[test]
+    fn syntax_tree_is_lossless() {
+        for src in [
+            "foo(a, b) -> ( // c\n  a + b;\n)\r\n",
+            "// lead\n[1, , 2,]; {'k' -> v}; -x ^ 2 $ + y",
+            "f(// note\n)",
+            "a; // x\n; b",
+        ] {
+            let tree = super::parse(src).expect("parse error");
+            assert_eq!(tree.text().to_string(), src, "lossless for {src:?}");
+        }
+    }
+
     // ----- trivia-preservation tests ------------------------------------
 
     #[test]
@@ -1407,7 +979,7 @@ mod tests {
     #[test]
     fn trailing_comment_anchored_on_root() {
         // No operator/comma follows `a`, so trivia after the final token
-        // would otherwise be dropped — `program_parser` anchors it on the
+        // would otherwise be dropped — `parse_root` anchors it on the
         // root node's leading instead.
         let cst = parse("a\n// trailing");
         assert_eq!(cst.kind, CstKind::Ident("a"));
@@ -1420,7 +992,7 @@ mod tests {
     #[test]
     fn comment_inside_empty_parens_becomes_phantom_empty() {
         // The arg list is otherwise empty, but the comment needs an anchor.
-        // `arg_list_parser` synthesises a single `Empty` to hold the trivia.
+        // The CST lowering synthesises a single `Empty` to hold the trivia.
         let cst = parse("f(// note\n)");
         match &cst.kind {
             CstKind::Call { args, .. } => {
@@ -1495,8 +1067,8 @@ mod tests {
 
     #[test]
     fn comment_inside_paren_attaches_to_inner_first_token() {
-        // `paren` delegates the body to `top`, so trivia immediately after
-        // `(` becomes the leading of the first inner atom.
+        // The paren body's leading trivia becomes the leading of the first
+        // inner atom.
         let cst = parse("(// note\n a + b)");
         match &cst.kind {
             CstKind::Paren(inner) => {
@@ -1541,6 +1113,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn trailing_semicolon_trivia_anchors_on_the_statement() {
+        // Trivia around a trailing `;` inside a paren appends onto the last
+        // statement's leading rather than being dropped.
+        let cst = parse("(a;\n// todo\n)");
+        match &cst.kind {
+            CstKind::Paren(inner) => {
+                assert_eq!(inner.kind, CstKind::Ident("a"));
+                assert_eq!(
+                    inner.leading,
+                    vec![Trivia::Break, Trivia::Comment("// todo"), Trivia::Break]
+                );
+            }
+            other => panic!("expected Paren, got {other:?}"),
+        }
+    }
+
     // ----- token-mismatch errors (delimiters balanced) ------------------
 
     /// Where an operand is due but input ends, the message names the missing
@@ -1554,7 +1143,7 @@ mod tests {
     }
 
     /// The `found` span covers exactly the offending token, not the leading
-    /// whitespace that chumsky's raw error span would fold in.
+    /// whitespace before it.
     #[test]
     fn error_found_span_is_the_token() {
         let src = "[0, 1 2]";

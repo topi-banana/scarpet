@@ -6,12 +6,12 @@ Guidance for Claude Code when working in this repository.
 
 Rust tooling for **Scarpet**, the scripting language of Minecraft's Carpet mod (`.sc` files). A Cargo workspace (edition 2024) of four crates:
 
-- `scarpet-syntax` — lexer (`logos`) + parser (`chumsky` via the `logosky` bridge) → a CST that preserves comments and line breaks as **leading trivia** on each node. Builds for `wasm32`.
+- `scarpet-syntax` — hand-written lexer + recursive-descent parser → a lossless `rowan` syntax tree (every byte of the source, including whitespace), lowered on demand to a compact CST that preserves comments and line breaks as **leading trivia** on each node (`cst.rs`). The tree's node shapes are specified in `scarpet.ungram`; the typed accessor layer (`nodes.rs`) is generated from it by the sourcegen test. Builds for `wasm32`.
 - `scarpet-fmt` — formatter: lowers the CST to a Wadler/Lindig pretty-printing `Doc` IR, then renders it at a style set by a `Config` (indent width, max width).
 - `scarpet-vm` — tree-walking evaluator (early prototype): lowers the CST to an AST (`scarpet-syntax`'s `ast.rs`) and evaluates it — values, operators, assignment/destructuring, user-defined functions, and a few builtins. Driven by `scarpet repl`.
 - `scarpet-cli` — `clap` CLI (`scarpet format`, `scarpet repl`). Built binary is `scarpet-cli`.
 
-Data flow (formatting): `source → lexer → parser → CST (trivia) → lower → Doc → string` — one-directional and non-destructive. A second, experimental path evaluates rather than formats: `scarpet-vm` lowers the same CST to an AST and walks it (`scarpet repl`). The evaluator is an early prototype; the formatter remains the mature path.
+Data flow (formatting): `source → lexer → parser → rowan tree → CST (trivia) → lower → Doc → string` — one-directional and non-destructive. A second, experimental path evaluates rather than formats: `scarpet-vm` lowers the same CST to an AST and walks it (`scarpet repl`). The evaluator is an early prototype; the formatter remains the mature path.
 
 ## Commands
 
@@ -39,8 +39,9 @@ CI also builds `wasm32-unknown-unknown` (only `scarpet-syntax --lib`); keep that
 ## Invariants — do not break these
 
 - **The formatter must stay non-destructive and idempotent.** Re-parsing formatted output must yield a structurally equal CST (`strip_trivia(a) == strip_trivia(b)`), and formatting twice must equal formatting once. The `corpus` test in `scarpet-fmt/src/lib.rs` enforces both across all ~220 corpus files. When changing `scarpet-fmt`, run `cargo test -p scarpet-fmt` — a corpus failure means a real regression, not a flaky test.
-- **Trivia must never be silently dropped.** Comments and breaks are attached as `leading` trivia. The parser goes to some length to anchor otherwise-orphaned trivia (trailing comments, comments in empty arg lists, around trailing commas) onto a node — often a phantom `CstKind::Empty`. Preserve this when touching `parser.rs`; the trivia-preservation tests there are the spec.
-- **The precedence ladder lives in `scarpet-syntax/src/parser.rs`** (documented as a comment above `top_parser`). It mirrors Scarpet's operator precedence. Changing it changes parse results — update the ladder comment and the precedence tests together.
+- **Trivia must never be silently dropped.** The rowan tree is lossless by construction (a test asserts `tree.text() == source`). The CST view attaches comments and breaks as `leading` trivia, and `cst.rs` goes to some length to anchor otherwise-orphaned trivia (trailing comments, comments in empty arg lists, around trailing commas) onto a node — often a phantom `CstKind::Empty`. Preserve this when touching `cst.rs` or `parser.rs`; the trivia-preservation tests in `parser.rs` are the spec, and the module comment in `cst.rs` documents the attachment rules (including a few deliberately preserved drop-quirks of the original parser that byte-identical formatting depends on).
+- **The precedence ladder lives in `scarpet-syntax/src/parser.rs`** (documented as a comment above the `Parser` impl). It mirrors Scarpet's operator precedence. Changing it changes parse results — update the ladder comment and the precedence tests together.
+- **`scarpet.ungram` and `src/nodes/generated.rs` move together.** The sourcegen test (`scarpet-syntax/tests/sourcegen.rs`) regenerates the typed node layer from the grammar and fails while it is stale — edit the grammar (and `SyntaxKind` in `syntax.rs` if node kinds change), run `cargo test -p scarpet-syntax`, commit the regenerated file.
 
 ## Conventions
 

@@ -12,10 +12,8 @@ members = [
 [workspace.dependencies]
 ariadne = { version = "0.6", features = ["auto-color"] }
 clap = { version = "4.6.1", features = ["derive"] }
-chumsky = { version = "0.11" }
-logos = { version = "0.15.1" }
-logosky = { version = "0.2" }
 regex = { version = "1" }
+rowan = { version = "0.16" }
 rustyline = { version = "18" }
 similar = { version = "3" }
 scarpet-fmt = { path = "./scarpet-fmt" }
@@ -23,3 +21,4 @@ scarpet-syntax = { path = "./scarpet-syntax" }
 scarpet-vm = { path = "./scarpet-vm" }
 serde = { version = "1", features = ["derive"] }
 toml = { version = "1" }
+ungrammar = { version = "1.16" }
