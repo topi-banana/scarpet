@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-chumsky.workspace = true
-logos.workspace = true
-logosky.workspace = true
+rowan.workspace = true
+
+[dev-dependencies]
+ungrammar.workspace = true

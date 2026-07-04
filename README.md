@@ -14,7 +14,7 @@ This is a Cargo workspace of four crates plus a test corpus:
 
 | Crate | What it is |
 | --- | --- |
-| [`scarpet-syntax`](scarpet-syntax) | Lexer ([`logos`](https://crates.io/crates/logos)) and parser ([`chumsky`](https://crates.io/crates/chumsky) via [`logosky`](https://crates.io/crates/logosky)) producing a CST that preserves comments and line breaks. Also builds for `wasm32`. |
+| [`scarpet-syntax`](scarpet-syntax) | Hand-written lexer and recursive-descent parser producing a lossless [`rowan`](https://crates.io/crates/rowan) syntax tree (its structure specified in [`scarpet.ungram`](scarpet-syntax/scarpet.ungram) via [`ungrammar`](https://crates.io/crates/ungrammar)), plus a compact CST view that preserves comments and line breaks. Also builds for `wasm32`. |
 | [`scarpet-fmt`](scarpet-fmt) | Code formatter. Lowers the CST to a Wadler/Lindig pretty-printing IR and renders it at a configurable style. |
 | [`scarpet-vm`](scarpet-vm) | Tree-walking evaluator — an early prototype. Lowers the CST to an AST and evaluates it: values, operators, assignment and destructuring, user-defined functions, and a few builtins (`type`, `str`, `print`, `call`, `if`, `range`). |
 | [`scarpet-cli`](scarpet-cli) | Command-line front end (`scarpet`), built on `clap`. Exposes `format` and an interactive `repl`. |
@@ -23,15 +23,15 @@ This is a Cargo workspace of four crates plus a test corpus:
 Two pipelines share the syntax front end. Formatting is one-directional and non-destructive:
 
 ```
-source (.sc) → lexer → parser → CST (with trivia) → fmt lower → Doc IR → formatted text
-                                  └─ scarpet-syntax ─┘   └──────── scarpet-fmt ────────┘
+source (.sc) → lexer → parser → rowan tree → CST (with trivia) → fmt lower → Doc IR → formatted text
+                                  └──── scarpet-syntax ─────┘       └──────── scarpet-fmt ────────┘
 ```
 
 Evaluation (experimental) lowers the same CST to an AST and walks it:
 
 ```
-source (.sc) → lexer → parser → CST → AST lower → evaluate → value
-                                  └─ scarpet-syntax ─┘ └─ scarpet-vm ─┘
+source (.sc) → lexer → parser → rowan tree → CST → AST lower → evaluate → value
+                                  └──── scarpet-syntax ────┘ └── scarpet-vm ──┘
 ```
 
 ## Getting started

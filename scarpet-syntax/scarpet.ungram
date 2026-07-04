@@ -1,0 +1,61 @@
+// Scarpet Un-Grammar.
+//
+// This grammar specifies the structure of Scarpet's concrete syntax tree.
+// It does not specify parsing rules (ambiguities, precedence, associativity,
+// trivia placement — see the ladder comment in `src/parser.rs` for those).
+// The tests in `tests/sourcegen.rs` generate `src/nodes/generated.rs` from
+// this file; edit this file, then run `cargo test -p scarpet-syntax` to
+// regenerate.
+//
+// Legend (ungrammar syntax):
+//
+//   //          -- comment
+//   Name =      -- non-terminal definition
+//   'ident'     -- token (terminal)
+//   A B         -- sequence
+//   A | B       -- alternation
+//   A*          -- zero or more repetition
+//   A?          -- zero or one repetition
+//   (A)         -- same as A
+//   label:A     -- suggested name for field of AST node
+
+Root = Expr
+
+Expr =
+  Literal
+| NameRef
+| CallExpr
+| ListExpr
+| MapExpr
+| ParenExpr
+| PrefixExpr
+| BinExpr
+
+Literal = value:('number' | 'string')
+
+NameRef = 'ident'
+
+CallExpr = callee:NameRef ArgList
+
+ArgList = '(' args:(Expr (',' Expr)*)? ')'
+
+ListExpr = '[' args:(Expr (',' Expr)*)? ']'
+
+MapExpr = '{' args:(Expr (',' Expr)*)? '}'
+
+ParenExpr = '(' Expr ')'
+
+PrefixExpr = op:('-' | '+' | '!' | '...') Expr
+
+BinExpr =
+  lhs:Expr
+  op:(
+    ';' | ',' | '->'
+  | '=' | '+=' | '<>'
+  | '||' | '&&'
+  | '==' | '!='
+  | '<' | '<=' | '>' | '>='
+  | '+' | '-' | '*' | '/' | '%' | '^'
+  | '~' | ':'
+  )
+  rhs:Expr
