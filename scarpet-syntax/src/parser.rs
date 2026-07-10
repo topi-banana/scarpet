@@ -256,7 +256,7 @@ fn begins_expr(k: SyntaxKind) -> bool {
 
 /// The literal label for a bracket kind in `expected …` / `unclosed …`
 /// messages (`` `(` ``, `` `]` ``). Only ever called with a delimiter — an
-/// opener or its matching closer — from [`check_delimiters`].
+/// opener or its matching closer.
 fn delim_label(k: SyntaxKind) -> &'static str {
     match k {
         SyntaxKind::L_PAREN => "`(`",
@@ -290,7 +290,9 @@ fn delim_label(k: SyntaxKind) -> &'static str {
 //   power       = unary (`^` power)?
 //   unary       = (`+` | `-` | `!` | `...`)* get
 //   get         = primary ((`~` | `:`) primary)*
-//   primary     = atom | `(` top `)` | `[` arg_list `]` | `{` arg_list `}` | ident `(` arg_list `)`
+//   primary     = atom | `(` top `)` | list_literal | map_literal | ident `(` arg_list `)`
+//   list_literal = `[` arg_list `]` | `l(` arg_list `)`
+//   map_literal  = `{` arg_list `}` | `m(` arg_list `)`
 //
 // Every level lands in a `BIN_EXPR` node (or `PREFIX_EXPR` for the unary
 // prefixes); left-associative levels wrap repeatedly at the same checkpoint,
@@ -302,6 +304,39 @@ fn delim_label(k: SyntaxKind) -> &'static str {
 // on those positions to reproduce the old trivia attachment.
 
 type PResult = Result<(), Box<ParseError>>;
+
+/// An identifier which becomes a literal introducer when immediately followed
+/// by `(`. The lexer deliberately leaves these as `IDENT`, preserving their
+/// use as ordinary names in every other context.
+#[derive(Clone, Copy)]
+enum LiteralConstructor {
+    List,
+    Map,
+}
+
+impl LiteralConstructor {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "l" => Some(Self::List),
+            "m" => Some(Self::Map),
+            _ => None,
+        }
+    }
+
+    fn token_kind(self) -> SyntaxKind {
+        match self {
+            Self::List => SyntaxKind::L_KW,
+            Self::Map => SyntaxKind::M_KW,
+        }
+    }
+
+    fn node_kind(self) -> SyntaxKind {
+        match self {
+            Self::List => SyntaxKind::LIST_EXPR,
+            Self::Map => SyntaxKind::MAP_EXPR,
+        }
+    }
+}
 
 struct Parser<'s> {
     src: &'s str,
@@ -317,15 +352,34 @@ impl<'s> Parser<'s> {
 
     /// The next semantic (non-trivia) token, without consuming anything.
     fn peek(&self) -> Option<&Token<'s>> {
-        self.tokens[self.pos..].iter().find(|t| !t.kind.is_trivia())
+        self.peek_nth(0)
     }
 
     fn peek_kind(&self) -> Option<SyntaxKind> {
         self.peek().map(|t| t.kind)
     }
 
+    /// The `n`th semantic (non-trivia) token ahead (`0` is [`peek`](Self::peek)),
+    /// without consuming anything.
+    fn peek_nth(&self, n: usize) -> Option<&Token<'s>> {
+        self.tokens[self.pos..]
+            .iter()
+            .filter(|t| !t.kind.is_trivia())
+            .nth(n)
+    }
+
     fn at(&self, kind: SyntaxKind) -> bool {
         self.peek_kind() == Some(kind)
+    }
+
+    /// Recognize a contextual literal constructor without reserving its name
+    /// in the lexer. Whitespace and comments between the name and `(` are
+    /// intentionally allowed, as they are for ordinary calls.
+    fn peek_literal_constructor(&self) -> Option<LiteralConstructor> {
+        let constructor = LiteralConstructor::from_name(self.peek()?.text)?;
+        self.peek_nth(1)
+            .is_some_and(|t| t.kind == SyntaxKind::L_PAREN)
+            .then_some(constructor)
     }
 
     fn at_closer_or_eof(&self) -> bool {
@@ -352,6 +406,16 @@ impl<'s> Parser<'s> {
         let t = &self.tokens[self.pos];
         debug_assert!(!t.kind.is_trivia());
         self.builder.token(t.kind.into(), t.text);
+        self.pos += 1;
+    }
+
+    /// Consume the next semantic token while reclassifying it in the syntax
+    /// tree. Used for contextual keywords whose lexical kind remains `IDENT`.
+    fn bump_as(&mut self, kind: SyntaxKind) {
+        self.flush_trivia();
+        let t = &self.tokens[self.pos];
+        debug_assert_eq!(t.kind, SyntaxKind::IDENT);
+        self.builder.token(kind.into(), t.text);
         self.pos += 1;
     }
 
@@ -565,13 +629,20 @@ impl<'s> Parser<'s> {
                 Ok(())
             }
             Some(SyntaxKind::IDENT) => {
+                if let Some(constructor) = self.peek_literal_constructor() {
+                    self.start_node(constructor.node_kind());
+                    self.bump_as(constructor.token_kind());
+                    self.parse_delimited_tail(SyntaxKind::R_PAREN)?;
+                    self.finish_node();
+                    return Ok(());
+                }
                 let cp = self.checkpoint();
                 self.start_node(SyntaxKind::NAME_REF);
                 self.bump();
                 self.finish_node();
                 if self.at(SyntaxKind::L_PAREN) {
                     self.builder.start_node_at(cp, SyntaxKind::CALL_EXPR.into());
-                    self.parse_delimited(SyntaxKind::ARG_LIST, SyntaxKind::R_PAREN, "`)`")?;
+                    self.parse_delimited(SyntaxKind::ARG_LIST, SyntaxKind::R_PAREN)?;
                     self.finish_node();
                 }
                 Ok(())
@@ -588,10 +659,10 @@ impl<'s> Parser<'s> {
                 Ok(())
             }
             Some(SyntaxKind::L_BRACK) => {
-                self.parse_delimited(SyntaxKind::LIST_EXPR, SyntaxKind::R_BRACK, "`]`")
+                self.parse_delimited(SyntaxKind::LIST_EXPR, SyntaxKind::R_BRACK)
             }
             Some(SyntaxKind::L_BRACE) => {
-                self.parse_delimited(SyntaxKind::MAP_EXPR, SyntaxKind::R_BRACE, "`}`")
+                self.parse_delimited(SyntaxKind::MAP_EXPR, SyntaxKind::R_BRACE)
             }
             _ => Err(self.err_here(vec!["expression".to_string()])),
         }
@@ -599,29 +670,32 @@ impl<'s> Parser<'s> {
 
     /// A bracketed argument list: a call's `( … )`, a list's `[ … ]`, a map's
     /// `{ … }`. The opener is the next token.
-    fn parse_delimited(
-        &mut self,
-        node: SyntaxKind,
-        closer: SyntaxKind,
-        closer_label: &str,
-    ) -> PResult {
+    fn parse_delimited(&mut self, node: SyntaxKind, closer: SyntaxKind) -> PResult {
         self.start_node(node);
+        self.parse_delimited_tail(closer)?;
+        self.finish_node();
+        Ok(())
+    }
+
+    /// The `( … )` / `[ … ]` / `{ … }` core of [`parse_delimited`]: consumes
+    /// from the opener (the next token) through the matching closer into the
+    /// current node.
+    fn parse_delimited_tail(&mut self, closer: SyntaxKind) -> PResult {
         self.bump();
-        self.parse_args(closer_label)?;
+        self.parse_args(closer)?;
         if !self.at(closer) {
             // Unreachable in practice: the pre-pass balanced every delimiter
             // and `parse_args` stops only at a closer. Kept for robustness.
-            return Err(self.err_here(vec![closer_label.to_string()]));
+            return Err(self.err_here(vec![delim_label(closer).to_string()]));
         }
         self.bump();
-        self.finish_node();
         Ok(())
     }
 
     /// The comma-separated items between delimiters, tolerating an empty list,
     /// omitted entries (`f(a, , b)` — the CST lowering synthesizes the phantom
     /// `Empty`), and a trailing comma.
-    fn parse_args(&mut self, closer_label: &str) -> PResult {
+    fn parse_args(&mut self, closer: SyntaxKind) -> PResult {
         loop {
             if self.at_closer_or_eof() {
                 return Ok(());
@@ -639,7 +713,7 @@ impl<'s> Parser<'s> {
                 return Ok(());
             }
             // Two items with nothing between them — e.g. `[1 2]`.
-            return Err(self.expected_operator_or(closer_label));
+            return Err(self.expected_operator_or(delim_label(closer)));
         }
     }
 }
@@ -759,6 +833,17 @@ mod tests {
     #[test]
     fn list_and_map_literals() {
         assert_eq!(parse("[1, 2, 3]"), list(vec![num("1"), num("2"), num("3")]));
+        assert_eq!(
+            parse("l(1, 2, 3)"),
+            list(vec![num("1"), num("2"), num("3")])
+        );
+        assert_eq!(
+            parse("m('a' -> 1, 'b' -> 2)"),
+            map(vec![
+                bin(BinOp::Arrow, str_("'a'"), num("1")),
+                bin(BinOp::Arrow, str_("'b'"), num("2")),
+            ])
+        );
         assert_eq!(
             parse("{'a' -> 1, 'b' -> 2}"),
             map(vec![

@@ -36,6 +36,10 @@ define_syntax_kinds! {
     NUMBER,
     STRING,
     IDENT,
+    /// Contextual `l` introducing the parenthesized spelling of a list literal.
+    L_KW,
+    /// Contextual `m` introducing the parenthesized spelling of a map literal.
+    M_KW,
 
     // ===== Tokens: delimiters =====
     L_PAREN,

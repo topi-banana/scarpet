@@ -116,6 +116,10 @@ mod tests {
             eval("[1, 2, 3]"),
             Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
         );
+        assert_eq!(
+            eval("l(1, 2, 3)"),
+            Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+        );
     }
 
     #[test]

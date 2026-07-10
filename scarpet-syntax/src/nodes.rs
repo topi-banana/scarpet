@@ -87,6 +87,33 @@ mod tests {
     }
 
     #[test]
+    fn contextual_literal_constructors_have_distinct_token_kinds() {
+        let tree = parse("l(1)").expect("parse list literal");
+        let root = Root::cast(tree).expect("root casts");
+        let Some(Expr::ListExpr(list)) = root.expr() else {
+            panic!("expected a list literal");
+        };
+        assert_eq!(list.l_token().expect("l keyword").kind(), SyntaxKind::L_KW);
+
+        let tree = parse("m(1 -> 2)").expect("parse map literal");
+        let root = Root::cast(tree).expect("root casts");
+        let Some(Expr::MapExpr(map)) = root.expr() else {
+            panic!("expected a map literal");
+        };
+        assert_eq!(map.m_token().expect("m keyword").kind(), SyntaxKind::M_KW);
+
+        let tree = parse("l").expect("parse ordinary identifier");
+        let root = Root::cast(tree).expect("root casts");
+        let Some(Expr::NameRef(name)) = root.expr() else {
+            panic!("expected a name reference");
+        };
+        assert_eq!(
+            name.ident_token().expect("identifier").kind(),
+            SyntaxKind::IDENT
+        );
+    }
+
+    #[test]
     fn typed_view_walks_a_binary() {
         let tree = parse("a + b * 2").expect("parse error");
         let root = Root::cast(tree).expect("root casts");

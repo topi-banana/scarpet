@@ -194,6 +194,18 @@ impl ListExpr {
     pub fn r_brack_token(&self) -> Option<SyntaxToken> {
         support::token(&self.syntax, &[SyntaxKind::R_BRACK])
     }
+
+    pub fn l_token(&self) -> Option<SyntaxToken> {
+        support::token(&self.syntax, &[SyntaxKind::L_KW])
+    }
+
+    pub fn l_paren_token(&self) -> Option<SyntaxToken> {
+        support::token(&self.syntax, &[SyntaxKind::L_PAREN])
+    }
+
+    pub fn r_paren_token(&self) -> Option<SyntaxToken> {
+        support::token(&self.syntax, &[SyntaxKind::R_PAREN])
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -226,6 +238,18 @@ impl MapExpr {
 
     pub fn r_brace_token(&self) -> Option<SyntaxToken> {
         support::token(&self.syntax, &[SyntaxKind::R_BRACE])
+    }
+
+    pub fn m_token(&self) -> Option<SyntaxToken> {
+        support::token(&self.syntax, &[SyntaxKind::M_KW])
+    }
+
+    pub fn l_paren_token(&self) -> Option<SyntaxToken> {
+        support::token(&self.syntax, &[SyntaxKind::L_PAREN])
+    }
+
+    pub fn r_paren_token(&self) -> Option<SyntaxToken> {
+        support::token(&self.syntax, &[SyntaxKind::R_PAREN])
     }
 }
 

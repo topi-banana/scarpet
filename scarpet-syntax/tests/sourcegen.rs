@@ -82,21 +82,21 @@ fn generate(grammar: &Grammar) -> String {
 
     for node in grammar.iter() {
         let data = &grammar[node];
-        if let Rule::Alt(variants) = &data.rule {
+        if let Rule::Alt(variants) = &data.rule
+            && variants.iter().all(|rule| matches!(rule, Rule::Node(_)))
+        {
             let variants: Vec<&str> = variants
                 .iter()
                 .map(|rule| match rule {
                     Rule::Node(n) => grammar[*n].name.as_str(),
-                    other => panic!(
-                        "{}: enum variants must be plain nodes, got {other:?}",
-                        data.name
-                    ),
+                    _ => unreachable!("guard restricts variants to Rule::Node"),
                 })
                 .collect();
             generate_enum(&mut out, &data.name, &variants);
         } else {
             let mut fields = Vec::new();
             lower_rule(grammar, &data.rule, None, &mut fields);
+            dedup_identical_fields(&mut fields);
             dedup_node_fields(&mut fields);
             generate_struct(&mut out, &data.name, &fields);
         }
@@ -233,16 +233,24 @@ fn lower_rule(grammar: &Grammar, rule: &Rule, label: Option<&str>, acc: &mut Vec
             });
         }
         Rule::Alt(alts) => {
-            // A non-top-level alternation must be all tokens (`value:`, `op:`).
-            let kinds = alts
-                .iter()
-                .map(|r| match r {
-                    Rule::Token(t) => token_info(&grammar[*t].name).1.to_string(),
-                    other => panic!("token alternation expected, got {other:?}"),
-                })
-                .collect();
-            let name = format!("{}_token", label.expect("a token alternation is labeled"));
-            acc.push(Field::Token { name, kinds });
+            if alts.iter().all(|r| matches!(r, Rule::Token(_))) {
+                // A token alternation (`value:`, `op:`) becomes one token accessor.
+                let kinds = alts
+                    .iter()
+                    .map(|r| match r {
+                        Rule::Token(t) => token_info(&grammar[*t].name).1.to_string(),
+                        _ => unreachable!("checked above"),
+                    })
+                    .collect();
+                let name = format!("{}_token", label.expect("a token alternation is labeled"));
+                acc.push(Field::Token { name, kinds });
+            } else {
+                // Structural alternatives, such as the two spellings of `ListExpr`,
+                // surface the union of accessors from all branches.
+                for r in alts {
+                    lower_rule(grammar, r, label, acc);
+                }
+            }
         }
         Rule::Seq(rules) => {
             if let Some(label) = label {
@@ -300,6 +308,27 @@ fn collect_node_types(grammar: &Grammar, rule: &Rule, acc: &mut Vec<String>) {
             }
         }
     }
+}
+
+/// Collapse fields that several `Alt` branches contribute identically (the
+/// two `ListExpr` spellings both label their elements `args`). A field name
+/// reused with a different shape is a grammar bug.
+fn dedup_identical_fields(fields: &mut Vec<Field>) {
+    let mut seen: BTreeMap<String, String> = BTreeMap::new();
+    fields.retain(|field| {
+        let (name, shape) = match field {
+            Field::Node { name, ty, many, .. } => (name.clone(), format!("node {ty} many={many}")),
+            Field::Token { name, kinds } => (name.clone(), format!("token {}", kinds.join(" "))),
+        };
+        match seen.get(&name) {
+            Some(prev) if *prev == shape => false,
+            Some(prev) => panic!("field `{name}` has conflicting shapes: {prev} vs {shape}"),
+            None => {
+                seen.insert(name, shape);
+                true
+            }
+        }
+    });
 }
 
 /// When one node type fills several single-child fields (`lhs`/`rhs`), switch
@@ -366,6 +395,10 @@ fn token_info(token: &str) -> (&'static str, &'static str) {
         "number" => ("number", "NUMBER"),
         "string" => ("string", "STRING"),
         "ident" => ("ident", "IDENT"),
+        // Contextual keywords: lexed as `IDENT`, then reclassified by the
+        // parser only when they introduce their corresponding literal form.
+        "l" => ("l", "L_KW"),
+        "m" => ("m", "M_KW"),
         other => panic!("unknown token in scarpet.ungram: {other:?}"),
     }
 }

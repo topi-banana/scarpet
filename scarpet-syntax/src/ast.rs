@@ -34,7 +34,7 @@
 //!   `{ k -> v }` in `MAPDEF` context.
 //! - An assignment target (the left of `=`/`+=`/`<>`) lowers to [`LValue`] — a
 //!   single [`Place`] (`x`, `var(e)`, `a:b:c`), a [`Destructure`](LValue::Destructure)
-//!   list (`[a, b]` / `l(a, b)`) that may nest and carry at most one `...rest` per
+//!   list that may nest and carry at most one `...rest` per
 //!   level, or a [`Computed`](LValue::Computed) call (`if(c, a, b) = …`) resolved
 //!   at runtime. A shape that can never be a place (`1 = 2`, `a + b = c`,
 //!   `a ~ b = c`) is a [`LowerError::NotAssignable`]. So the structured cases are
@@ -172,7 +172,7 @@ pub enum ParamWord {
 pub enum LValue<'s> {
     /// A single writable place: `x`, `var(e)`, or `a:b:c`.
     Place(Place<'s>),
-    /// A destructuring list: `[a, b]` / `l(a, b)`, binding several places at once
+    /// A destructuring list, binding several places at once
     /// (see [`LPatterns`]).
     Destructure(LPatterns<'s>),
     /// A place produced by evaluating a call — `if(c, a, b) = …`, where the call
@@ -587,8 +587,8 @@ impl<'a, 's> TryFrom<&'a Cst<'s>> for Assign<'s> {
 
 // --- lowering: assignment targets and function parameters -----------
 
-/// Lower a CST node to an [`LValue`] assignment target. `[...]` / `l(...)` is a
-/// destructuring list; a call other than those (and `var(…)`) is a dynamic
+/// Lower a CST node to an [`LValue`] assignment target. A list literal is a
+/// destructuring list; a call other than `var(…)` is a dynamic
 /// [`Computed`](LValue::Computed) place (`if(c, a, b) = …`); anything else must be
 /// a single [`Place`] ([`lower_place`]), so a shape that can never be a place
 /// (`1 = 2`, `a + b = c`, `a ~ b`) is a [`LowerError::NotAssignable`]. Also drives
@@ -596,10 +596,7 @@ impl<'a, 's> TryFrom<&'a Cst<'s>> for Assign<'s> {
 fn lower_lvalue<'s>(cst: &Cst<'s>) -> Result<LValue<'s>, LowerError> {
     match &cst.kind {
         CstKind::List(items) => Ok(LValue::Destructure(lower_lpatterns(items)?)),
-        CstKind::Call { callee, args } if matches!(&callee.kind, CstKind::Ident("l")) => {
-            Ok(LValue::Destructure(lower_lpatterns(args)?))
-        }
-        // A call other than `l(…)` / `var(…)` may still be a place at runtime —
+        // A call other than `var(…)` may still be a place at runtime —
         // `if(c, a, b) = …` returns one of its bound arguments.
         CstKind::Call { callee, .. } if !matches!(&callee.kind, CstKind::Ident("var")) => {
             Ok(LValue::Computed(Box::new(Primary::try_from(cst)?)))
@@ -634,8 +631,8 @@ fn lower_place<'s>(cst: &Cst<'s>) -> Result<Place<'s>, LowerError> {
     }
 }
 
-/// Lower the `,`-separated elements of a destructuring list (`[...]` / `l(...)`)
-/// into an [`LPatterns`], dropping phantom `Empty` slots. A `...x` element becomes
+/// Lower the `,`-separated elements of a destructuring list into an [`LPatterns`],
+/// dropping phantom `Empty` slots. A `...x` element becomes
 /// the single rest binder (a second is a [`LowerError::MultipleRest`]); elements
 /// after it go into [`LRest::after`]. Each element is itself an [`LValue`], so a
 /// nested destructure recurses.
@@ -1547,6 +1544,13 @@ mod tests {
         assert_eq!(args.0.len(), 1);
 
         let a = ast("[1, 2, 3]");
+        let Primary::List(Args(codes)) = prim_of_expr(only_expr(&a)) else {
+            panic!("expected a list");
+        };
+        assert_eq!(codes.len(), 3);
+
+        let a = ast("l(1, 2, 3)");
+        println!("{:?}", prim_of_expr(only_expr(&a)));
         let Primary::List(Args(codes)) = prim_of_expr(only_expr(&a)) else {
             panic!("expected a list");
         };

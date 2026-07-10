@@ -39,9 +39,13 @@ CallExpr = callee:NameRef ArgList
 
 ArgList = '(' args:(Expr (',' Expr)*)? ')'
 
-ListExpr = '[' args:(Expr (',' Expr)*)? ']'
+ListExpr =
+  '[' args:(Expr (',' Expr)*)? ']'
+| 'l' '(' args:(Expr (',' Expr)*)? ')'
 
-MapExpr = '{' args:(Expr (',' Expr)*)? '}'
+MapExpr =
+  '{' args:(Expr (',' Expr)*)? '}'
+| 'm' '(' args:(Expr (',' Expr)*)? ')'
 
 ParenExpr = '(' Expr ')'
 
