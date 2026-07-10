@@ -19,10 +19,12 @@
 //! - Trivia around a trailing `;`/`,` (before a closer or end of input) is
 //!   appended onto the preceding node's leading.
 //!
-//! The `->` operator (parsed into its own `ARROW_EXPR`) is split here rather
-//! than carried as a generic binary op: a call LHS with a valid parameter list
-//! becomes a [`CstKind::FunctionDef`], any other LHS a [`CstKind::Arrow`]. Its
-//! trivia routes exactly as the old `->` binary did.
+//! The `->` operator never reaches this module as a binary op: the parser
+//! already decided, from context alone, whether it is a function definition
+//! (`DEFINE_FUNCTION`, anywhere) or a map entry's key/value arrow (folded
+//! into the item's `MAP_ENTRY` node). Both lower tag-for-tag — to
+//! [`CstKind::DefineFunction`] and [`CstKind::MapEntry`] — and their trivia
+//! routes exactly as the old `->` binary did.
 //!
 //! Deliberately preserved quirks of the old parser (the corpus round-trip
 //! depends on byte-identical formatting): trivia between a callee and its
@@ -79,19 +81,19 @@ pub enum CstKind<'s> {
     Map(Vec<Cst<'s>>),
     Paren(Box<Cst<'s>>),
     Empty,
-    /// `name(params) -> body` — a function definition. `signature` is always a
-    /// [`CstKind::Call`] whose callee is an identifier and whose arguments form
-    /// a valid parameter list; the lowering decides this once (see
-    /// [`Conv::arrow`]) so the AST lowering carries no def-vs-arrow judgment.
-    FunctionDef {
+    /// `signature -> body` — a function definition: any `->` outside the top
+    /// level of a map item, as decided by the parser. The signature is
+    /// *semantically* a call `name(params)`; the AST lowering rejects any
+    /// other shape, so no def-vs-entry judgment happens after the parse.
+    DefineFunction {
         signature: Box<Cst<'s>>,
         body: Box<Cst<'s>>,
     },
-    /// `lhs -> rhs` where `lhs` is not a function signature — a map entry
-    /// (`'k' -> v`) or any other arrow.
-    Arrow {
-        lhs: Box<Cst<'s>>,
-        rhs: Box<Cst<'s>>,
+    /// One item of a map literal (`{…}` / `m(…)`): a bare `key`, or the
+    /// item-level pair `key -> value`.
+    MapEntry {
+        key: Box<Cst<'s>>,
+        value: Option<Box<Cst<'s>>>,
     },
     Binary {
         op: BinOp,
@@ -150,13 +152,13 @@ pub fn strip_trivia<'s>(cst: &Cst<'s>) -> Cst<'s> {
         CstKind::List(items) => CstKind::List(items.iter().map(strip_trivia).collect()),
         CstKind::Map(items) => CstKind::Map(items.iter().map(strip_trivia).collect()),
         CstKind::Paren(inner) => CstKind::Paren(Box::new(strip_trivia(inner))),
-        CstKind::FunctionDef { signature, body } => CstKind::FunctionDef {
+        CstKind::DefineFunction { signature, body } => CstKind::DefineFunction {
             signature: Box::new(strip_trivia(signature)),
             body: Box::new(strip_trivia(body)),
         },
-        CstKind::Arrow { lhs, rhs } => CstKind::Arrow {
-            lhs: Box::new(strip_trivia(lhs)),
-            rhs: Box::new(strip_trivia(rhs)),
+        CstKind::MapEntry { key, value } => CstKind::MapEntry {
+            key: Box::new(strip_trivia(key)),
+            value: value.as_ref().map(|v| Box::new(strip_trivia(v))),
         },
         CstKind::Binary { op, lhs, rhs } => CstKind::Binary {
             op: *op,
@@ -263,7 +265,8 @@ impl<'s> Conv<'s> {
             SyntaxKind::MAP_EXPR => Cst::bare(CstKind::Map(self.args(node))),
             SyntaxKind::PAREN_EXPR => self.paren(node),
             SyntaxKind::PREFIX_EXPR => self.prefix(node),
-            SyntaxKind::ARROW_EXPR => self.arrow(node),
+            SyntaxKind::DEFINE_FUNCTION => self.define_function(node),
+            SyntaxKind::MAP_ENTRY => self.map_entry(node),
             SyntaxKind::BIN_EXPR => self.bin(node),
             k => unreachable!("expression node: {k:?}"),
         }
@@ -332,98 +335,98 @@ impl<'s> Conv<'s> {
         })
     }
 
-    /// A binary application. Trivia before the operator prepends onto the RHS
-    /// node itself; trivia after it sinks to the RHS's leftmost node — except
-    /// for `;`/`,` links, where both bands prepend onto the RHS node (the old
-    /// chain parsers collected them at the chain level). A `;` link may carry
-    /// several `;` tokens (Scarpet treats runs of `;` as one separator);
-    /// trivia between them is dropped, as the old parser did.
+    /// A binary application. Trivia routes via [`Self::infix_operands`].
     fn bin(&self, node: &SyntaxNode) -> Cst<'s> {
+        let (lhs, op, rhs) = self
+            .infix_operands(node)
+            .expect("a binary has its operator");
+        Cst::bare(CstKind::Binary {
+            op: binop_of(op),
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        })
+    }
+
+    /// A function definition (a dedicated `DEFINE_FUNCTION`, always a single
+    /// operator — right-associativity puts any further `->` inside the body
+    /// node). Trivia routes via [`Self::infix_operands`], exactly as the old
+    /// `->` binary did.
+    fn define_function(&self, node: &SyntaxNode) -> Cst<'s> {
+        let (signature, _, body) = self
+            .infix_operands(node)
+            .expect("a definition has its `->`");
+        Cst::bare(CstKind::DefineFunction {
+            signature: Box::new(signature),
+            body: Box::new(body),
+        })
+    }
+
+    /// One item of a map literal (a `MAP_ENTRY`). A bare entry wraps exactly
+    /// its key node — no interior bands. A pair routes its `->` trivia via
+    /// [`Self::infix_operands`].
+    fn map_entry(&self, node: &SyntaxNode) -> Cst<'s> {
+        match self.infix_operands(node) {
+            Some((key, _, value)) => Cst::bare(CstKind::MapEntry {
+                key: Box::new(key),
+                value: Some(Box::new(value)),
+            }),
+            None => {
+                let key = node.children().next().expect("a map entry has a key");
+                Cst::bare(CstKind::MapEntry {
+                    key: Box::new(self.expr(&key)),
+                    value: None,
+                })
+            }
+        }
+    }
+
+    /// The `lhs op rhs` decomposition of an infix node (a `BIN_EXPR`, a
+    /// `DEFINE_FUNCTION`, or a pair `MAP_ENTRY`), or `None` for a node with a
+    /// single operand (a bare `MAP_ENTRY`). Trivia before the operator
+    /// prepends onto the RHS node itself; trivia after it sinks to the RHS's
+    /// leftmost node — except for `;`/`,` links, where both bands prepend
+    /// onto the RHS node (the old chain parsers collected them at the chain
+    /// level). A `;` link may carry several `;` tokens (Scarpet treats runs
+    /// of `;` as one separator); trivia between them is dropped, as the old
+    /// parser did.
+    fn infix_operands(&self, node: &SyntaxNode) -> Option<(Cst<'s>, SyntaxKind, Cst<'s>)> {
         let elems: Vec<SyntaxElement> = node.children_with_tokens().collect();
         let lhs_at = elems
             .iter()
             .position(|e| e.as_node().is_some())
-            .expect("a binary has an LHS");
+            .expect("an infix node has an operand");
         let rhs_at = elems
             .iter()
             .rposition(|e| e.as_node().is_some())
-            .expect("a binary has an RHS");
+            .expect("an infix node has an operand");
+        if lhs_at == rhs_at {
+            return None;
+        }
         let op_at = elems[lhs_at + 1..rhs_at]
             .iter()
             .position(|e| e.as_token().is_some_and(|t| !t.kind().is_trivia()))
             .map(|i| i + lhs_at + 1)
-            .expect("a binary has its operator");
+            .expect("an infix node has its operator");
         let last_op_at = elems[..rhs_at]
             .iter()
             .rposition(|e| e.as_token().is_some_and(|t| !t.kind().is_trivia()))
-            .expect("a binary has its operator");
-        let op = binop_of(elems[op_at].as_token().unwrap().kind());
+            .expect("an infix node has its operator");
+        let op = elems[op_at].as_token().unwrap().kind();
 
         let band_before = self.band(&elems[lhs_at + 1..op_at]);
         let band_after = self.band(&elems[last_op_at + 1..rhs_at]);
 
         let lhs = self.expr(elems[lhs_at].as_node().unwrap());
         let mut rhs = self.expr(elems[rhs_at].as_node().unwrap());
-        match op {
-            BinOp::Semi | BinOp::Comma => {
-                let mut band = band_before;
-                band.extend(band_after);
-                rhs = rhs.with_leading(band);
-            }
-            _ => {
-                prepend_deep(&mut rhs, band_after);
-                rhs = rhs.with_leading(band_before);
-            }
-        }
-        Cst::bare(CstKind::Binary {
-            op,
-            lhs: Box::new(lhs),
-            rhs: Box::new(rhs),
-        })
-    }
-
-    /// An `->` application (a dedicated `ARROW_EXPR`, always a single operator —
-    /// right-associativity puts any further `->` inside the RHS node). Trivia
-    /// routes exactly as the old `->` binary did: the band before `->` prepends
-    /// onto the RHS node itself, the band after it sinks to the RHS's leftmost
-    /// node. The def-vs-arrow split happens here — a call LHS with a valid
-    /// signature becomes a [`CstKind::FunctionDef`], any other LHS a generic
-    /// [`CstKind::Arrow`] — so the AST lowering needs no such decision.
-    fn arrow(&self, node: &SyntaxNode) -> Cst<'s> {
-        let elems: Vec<SyntaxElement> = node.children_with_tokens().collect();
-        let lhs_at = elems
-            .iter()
-            .position(|e| e.as_node().is_some())
-            .expect("an arrow has an LHS");
-        let rhs_at = elems
-            .iter()
-            .rposition(|e| e.as_node().is_some())
-            .expect("an arrow has an RHS");
-        let op_at = elems[lhs_at + 1..rhs_at]
-            .iter()
-            .position(|e| e.as_token().is_some_and(|t| t.kind() == SyntaxKind::ARROW))
-            .map(|i| i + lhs_at + 1)
-            .expect("an arrow has its `->`");
-
-        let band_before = self.band(&elems[lhs_at + 1..op_at]);
-        let band_after = self.band(&elems[op_at + 1..rhs_at]);
-
-        let lhs = self.expr(elems[lhs_at].as_node().unwrap());
-        let mut rhs = self.expr(elems[rhs_at].as_node().unwrap());
-        prepend_deep(&mut rhs, band_after);
-        rhs = rhs.with_leading(band_before);
-
-        if is_function_def(&lhs) {
-            Cst::bare(CstKind::FunctionDef {
-                signature: Box::new(lhs),
-                body: Box::new(rhs),
-            })
+        if matches!(op, SyntaxKind::SEMICOLON | SyntaxKind::COMMA) {
+            let mut band = band_before;
+            band.extend(band_after);
+            rhs = rhs.with_leading(band);
         } else {
-            Cst::bare(CstKind::Arrow {
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-            })
+            prepend_deep(&mut rhs, band_after);
+            rhs = rhs.with_leading(band_before);
         }
+        Some((lhs, op, rhs))
     }
 
     /// The comma-separated items between a node's delimiters (a call's
@@ -559,14 +562,6 @@ fn prepend_deep<'s>(cst: &mut Cst<'s>, band: Vec<Trivia<'s>>) {
     let mut leading = band;
     leading.append(&mut cst.leading);
     cst.leading = leading;
-}
-
-/// Whether a `->` left-hand side is a function *signature*. This is the single
-/// place the def-vs-arrow decision is made; it defers to the AST's
-/// [`crate::ast::signature_params`] oracle, which the AST lowering then calls
-/// again to extract the params infallibly, so the two never drift.
-fn is_function_def(lhs: &Cst<'_>) -> bool {
-    crate::ast::signature_params(lhs).is_some()
 }
 
 /// Append the pending band onto the last item's leading.

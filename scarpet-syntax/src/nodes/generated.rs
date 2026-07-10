@@ -37,7 +37,7 @@ pub enum Expr {
     MapExpr(MapExpr),
     ParenExpr(ParenExpr),
     PrefixExpr(PrefixExpr),
-    ArrowExpr(ArrowExpr),
+    DefineFunction(DefineFunction),
     BinExpr(BinExpr),
 }
 
@@ -52,7 +52,7 @@ impl AstNode for Expr {
                 | SyntaxKind::MAP_EXPR
                 | SyntaxKind::PAREN_EXPR
                 | SyntaxKind::PREFIX_EXPR
-                | SyntaxKind::ARROW_EXPR
+                | SyntaxKind::DEFINE_FUNCTION
                 | SyntaxKind::BIN_EXPR
         )
     }
@@ -66,7 +66,7 @@ impl AstNode for Expr {
             SyntaxKind::MAP_EXPR => Expr::MapExpr(MapExpr { syntax }),
             SyntaxKind::PAREN_EXPR => Expr::ParenExpr(ParenExpr { syntax }),
             SyntaxKind::PREFIX_EXPR => Expr::PrefixExpr(PrefixExpr { syntax }),
-            SyntaxKind::ARROW_EXPR => Expr::ArrowExpr(ArrowExpr { syntax }),
+            SyntaxKind::DEFINE_FUNCTION => Expr::DefineFunction(DefineFunction { syntax }),
             SyntaxKind::BIN_EXPR => Expr::BinExpr(BinExpr { syntax }),
             _ => return None,
         };
@@ -82,7 +82,7 @@ impl AstNode for Expr {
             Expr::MapExpr(it) => &it.syntax,
             Expr::ParenExpr(it) => &it.syntax,
             Expr::PrefixExpr(it) => &it.syntax,
-            Expr::ArrowExpr(it) => &it.syntax,
+            Expr::DefineFunction(it) => &it.syntax,
             Expr::BinExpr(it) => &it.syntax,
         }
     }
@@ -236,7 +236,7 @@ impl MapExpr {
         support::token(&self.syntax, &[SyntaxKind::L_BRACE])
     }
 
-    pub fn args(&self) -> AstChildren<Expr> {
+    pub fn entries(&self) -> AstChildren<MapEntry> {
         support::children(&self.syntax)
     }
 
@@ -328,13 +328,13 @@ impl PrefixExpr {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ArrowExpr {
+pub struct DefineFunction {
     syntax: SyntaxNode,
 }
 
-impl AstNode for ArrowExpr {
+impl AstNode for DefineFunction {
     fn can_cast(kind: SyntaxKind) -> bool {
-        kind == SyntaxKind::ARROW_EXPR
+        kind == SyntaxKind::DEFINE_FUNCTION
     }
 
     fn cast(syntax: SyntaxNode) -> Option<Self> {
@@ -346,8 +346,8 @@ impl AstNode for ArrowExpr {
     }
 }
 
-impl ArrowExpr {
-    pub fn lhs(&self) -> Option<Expr> {
+impl DefineFunction {
+    pub fn signature(&self) -> Option<Expr> {
         support::nth_child(&self.syntax, 0)
     }
 
@@ -355,7 +355,7 @@ impl ArrowExpr {
         support::token(&self.syntax, &[SyntaxKind::ARROW])
     }
 
-    pub fn rhs(&self) -> Option<Expr> {
+    pub fn body(&self) -> Option<Expr> {
         support::nth_child(&self.syntax, 1)
     }
 }
@@ -448,5 +448,38 @@ impl ArgList {
 
     pub fn r_paren_token(&self) -> Option<SyntaxToken> {
         support::token(&self.syntax, &[SyntaxKind::R_PAREN])
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MapEntry {
+    syntax: SyntaxNode,
+}
+
+impl AstNode for MapEntry {
+    fn can_cast(kind: SyntaxKind) -> bool {
+        kind == SyntaxKind::MAP_ENTRY
+    }
+
+    fn cast(syntax: SyntaxNode) -> Option<Self> {
+        Self::can_cast(syntax.kind()).then_some(Self { syntax })
+    }
+
+    fn syntax(&self) -> &SyntaxNode {
+        &self.syntax
+    }
+}
+
+impl MapEntry {
+    pub fn key(&self) -> Option<Expr> {
+        support::nth_child(&self.syntax, 0)
+    }
+
+    pub fn arrow_token(&self) -> Option<SyntaxToken> {
+        support::token(&self.syntax, &[SyntaxKind::ARROW])
+    }
+
+    pub fn value(&self) -> Option<Expr> {
+        support::nth_child(&self.syntax, 1)
     }
 }

@@ -292,10 +292,14 @@ fn delim_label(k: SyntaxKind) -> &'static str {
 //   get         = primary ((`~` | `:`) primary)*
 //   primary     = atom | `(` top `)` | list_literal | map_literal | ident `(` arg_list `)`
 //   list_literal = `[` arg_list `]` | `l(` arg_list `)`
-//   map_literal  = `{` arg_list `}` | `m(` arg_list `)`
+//   map_literal  = `{` map_items `}` | `m(` map_items `)`
+//   map_items   = comma-separated map_item
+//   map_item    = seq_chain, wrapped in a MAP_ENTRY node; when the whole item
+//                 is exactly `assign -> arrow_chain` (trailing `;` runs
+//                 aside), the `->` is the entry's own key/value arrow
 //
 // Every level lands in a `BIN_EXPR` node (or `PREFIX_EXPR` for the unary
-// prefixes, or a dedicated `ARROW_EXPR` for `->`); left-associative levels
+// prefixes, or a dedicated `DEFINE_FUNCTION` for `->`); left-associative levels
 // wrap repeatedly at the same checkpoint,
 // right-associative ones recurse before wrapping. Trivia tokens are emitted
 // into the green tree at the position they occupy in the source — checkpoints
@@ -310,33 +314,39 @@ type PResult = Result<(), Box<ParseError>>;
 /// by `(`. The lexer deliberately leaves these as `IDENT`, preserving their
 /// use as ordinary names in every other context.
 #[derive(Clone, Copy)]
-enum LiteralConstructor {
-    List,
-    Map,
+struct LiteralConstructor {
+    /// What the `IDENT` token reclassifies to in the tree.
+    token_kind: SyntaxKind,
+    /// The literal node wrapping the whole construct.
+    node_kind: SyntaxKind,
+    /// What the parenthesized items parse as.
+    item_mode: ItemMode,
 }
 
 impl LiteralConstructor {
     fn from_name(name: &str) -> Option<Self> {
         match name {
-            "l" => Some(Self::List),
-            "m" => Some(Self::Map),
+            "l" => Some(Self {
+                token_kind: SyntaxKind::L_KW,
+                node_kind: SyntaxKind::LIST_EXPR,
+                item_mode: ItemMode::Expr,
+            }),
+            "m" => Some(Self {
+                token_kind: SyntaxKind::M_KW,
+                node_kind: SyntaxKind::MAP_EXPR,
+                item_mode: ItemMode::MapEntry,
+            }),
             _ => None,
         }
     }
+}
 
-    fn token_kind(self) -> SyntaxKind {
-        match self {
-            Self::List => SyntaxKind::L_KW,
-            Self::Map => SyntaxKind::M_KW,
-        }
-    }
-
-    fn node_kind(self) -> SyntaxKind {
-        match self {
-            Self::List => SyntaxKind::LIST_EXPR,
-            Self::Map => SyntaxKind::MAP_EXPR,
-        }
-    }
+/// What the items of a bracketed list parse as: plain expressions (call
+/// arguments, list elements) or `MAP_ENTRY`-wrapped map items.
+#[derive(Clone, Copy)]
+enum ItemMode {
+    Expr,
+    MapEntry,
 }
 
 struct Parser<'s> {
@@ -504,16 +514,53 @@ impl<'s> Parser<'s> {
     fn parse_item(&mut self) -> PResult {
         let cp = self.checkpoint();
         self.parse_arrow()?;
+        self.parse_semi_links(cp)?;
+        // A trailing `;` run — tolerated.
         while self.at(SyntaxKind::SEMICOLON) {
             self.bump();
-            // Scarpet's preprocessor strips runs of `;`; treat the run as one
-            // separator.
+        }
+        Ok(())
+    }
+
+    /// One item of a map literal: a `seq_chain` like [`Self::parse_item`],
+    /// wrapped in a [`SyntaxKind::MAP_ENTRY`] node. A `->` at the item's top
+    /// level whose right-hand side ends the item stays unwrapped as the
+    /// entry's own `key -> value`; any other `->` wraps a `DEFINE_FUNCTION`
+    /// as usual. Trailing `;` runs are consumed *after* the `MAP_ENTRY` wrap
+    /// so they stay `MAP_EXPR`-level siblings, where the CST lowering's
+    /// trivia rules expect them.
+    fn parse_map_item(&mut self) -> PResult {
+        let cp = self.checkpoint();
+        self.parse_assign()?;
+        if self.at(SyntaxKind::ARROW) {
+            self.bump();
+            // The value is a full arrow chain; nested `->`s are definitions.
+            self.parse_arrow()?;
+            if self.at_continuing_semi() {
+                // `k -> v; w` — the arrow heads a statement of the entry's
+                // `;`-chain, so it is a definition, not the entry's `->`.
+                self.wrap(cp, SyntaxKind::DEFINE_FUNCTION);
+            }
+        }
+        self.parse_semi_links(cp)?;
+        self.wrap(cp, SyntaxKind::MAP_ENTRY);
+        // A trailing `;` run — tolerated, and kept outside the entry.
+        while self.at(SyntaxKind::SEMICOLON) {
+            self.bump();
+        }
+        Ok(())
+    }
+
+    /// The `;`-chain links after a statement parsed at `cp`: each continuing
+    /// `;` run (see [`Self::at_continuing_semi`]) is consumed as one separator
+    /// — Scarpet's preprocessor strips runs of `;` — followed by the next
+    /// statement, wrapping the chain so far in a `BIN_EXPR`. Trailing runs
+    /// are left for the caller, which decides what node they stay outside of.
+    fn parse_semi_links(&mut self, cp: Checkpoint) -> PResult {
+        while self.at_continuing_semi() {
+            self.bump();
             while self.at(SyntaxKind::SEMICOLON) {
                 self.bump();
-            }
-            if self.at_closer_or_eof() || self.at(SyntaxKind::COMMA) {
-                // Trailing `;` — tolerated.
-                break;
             }
             self.parse_arrow()?;
             self.wrap(cp, SyntaxKind::BIN_EXPR);
@@ -521,16 +568,34 @@ impl<'s> Parser<'s> {
         Ok(())
     }
 
+    /// Whether the parser sits at a `;` run that *continues* the statement
+    /// chain — i.e. the run is followed by another statement rather than a
+    /// `,`, a closer, or the end of input (a trailing run).
+    fn at_continuing_semi(&self) -> bool {
+        let mut n = 0;
+        while self
+            .peek_nth(n)
+            .is_some_and(|t| t.kind == SyntaxKind::SEMICOLON)
+        {
+            n += 1;
+        }
+        n > 0
+            && self
+                .peek_nth(n)
+                .is_some_and(|t| t.kind != SyntaxKind::COMMA && !t.kind.is_closer())
+    }
+
     /// `arrow_chain` (`->`; right-associative). Unlike the other binary levels
-    /// this wraps a dedicated [`SyntaxKind::ARROW_EXPR`] node rather than a
-    /// generic `BIN_EXPR`: `->` is the function-definition / arrow operator, and
-    /// the CST lowering (see [`crate::cst`]) splits an `ARROW_EXPR` into a
-    /// function definition or a generic arrow, so it never flows through the
-    /// binary-operator machinery.
+    /// this wraps a dedicated [`SyntaxKind::DEFINE_FUNCTION`] node rather than
+    /// a generic `BIN_EXPR`: `->` is the function-definition operator, so it
+    /// never flows through the binary-operator machinery. The one context
+    /// where `->` is *not* a definition — the top level of a map item — is
+    /// handled by [`Self::parse_map_item`], which folds it into the item's
+    /// `MAP_ENTRY` node instead.
     fn parse_arrow(&mut self) -> PResult {
         self.parse_right_assoc(
             &[SyntaxKind::ARROW],
-            SyntaxKind::ARROW_EXPR,
+            SyntaxKind::DEFINE_FUNCTION,
             Self::parse_assign,
         )
     }
@@ -559,7 +624,7 @@ impl<'s> Parser<'s> {
     /// One right-associative binary level: `next (op right)?`, where `right`
     /// recurses at this same level (so `a = b = c` nests to the right). The
     /// twin of [`Self::parse_left_assoc`]. `node` is the wrapper kind — usually
-    /// `BIN_EXPR`, but `->` wraps a dedicated `ARROW_EXPR`.
+    /// `BIN_EXPR`, but `->` wraps a dedicated `DEFINE_FUNCTION`.
     fn parse_right_assoc(
         &mut self,
         ops: &[SyntaxKind],
@@ -651,9 +716,9 @@ impl<'s> Parser<'s> {
             }
             Some(SyntaxKind::IDENT) => {
                 if let Some(constructor) = self.peek_literal_constructor() {
-                    self.start_node(constructor.node_kind());
-                    self.bump_as(constructor.token_kind());
-                    self.parse_delimited_tail(SyntaxKind::R_PAREN)?;
+                    self.start_node(constructor.node_kind);
+                    self.bump_as(constructor.token_kind);
+                    self.parse_delimited_tail(SyntaxKind::R_PAREN, constructor.item_mode)?;
                     self.finish_node();
                     return Ok(());
                 }
@@ -663,7 +728,11 @@ impl<'s> Parser<'s> {
                 self.finish_node();
                 if self.at(SyntaxKind::L_PAREN) {
                     self.builder.start_node_at(cp, SyntaxKind::CALL_EXPR.into());
-                    self.parse_delimited(SyntaxKind::ARG_LIST, SyntaxKind::R_PAREN)?;
+                    self.parse_delimited(
+                        SyntaxKind::ARG_LIST,
+                        SyntaxKind::R_PAREN,
+                        ItemMode::Expr,
+                    )?;
                     self.finish_node();
                 }
                 Ok(())
@@ -680,20 +749,22 @@ impl<'s> Parser<'s> {
                 Ok(())
             }
             Some(SyntaxKind::L_BRACK) => {
-                self.parse_delimited(SyntaxKind::LIST_EXPR, SyntaxKind::R_BRACK)
+                self.parse_delimited(SyntaxKind::LIST_EXPR, SyntaxKind::R_BRACK, ItemMode::Expr)
             }
-            Some(SyntaxKind::L_BRACE) => {
-                self.parse_delimited(SyntaxKind::MAP_EXPR, SyntaxKind::R_BRACE)
-            }
+            Some(SyntaxKind::L_BRACE) => self.parse_delimited(
+                SyntaxKind::MAP_EXPR,
+                SyntaxKind::R_BRACE,
+                ItemMode::MapEntry,
+            ),
             _ => Err(self.err_here(vec!["expression".to_string()])),
         }
     }
 
     /// A bracketed argument list: a call's `( … )`, a list's `[ … ]`, a map's
     /// `{ … }`. The opener is the next token.
-    fn parse_delimited(&mut self, node: SyntaxKind, closer: SyntaxKind) -> PResult {
+    fn parse_delimited(&mut self, node: SyntaxKind, closer: SyntaxKind, mode: ItemMode) -> PResult {
         self.start_node(node);
-        self.parse_delimited_tail(closer)?;
+        self.parse_delimited_tail(closer, mode)?;
         self.finish_node();
         Ok(())
     }
@@ -701,9 +772,9 @@ impl<'s> Parser<'s> {
     /// The `( … )` / `[ … ]` / `{ … }` core of [`parse_delimited`]: consumes
     /// from the opener (the next token) through the matching closer into the
     /// current node.
-    fn parse_delimited_tail(&mut self, closer: SyntaxKind) -> PResult {
+    fn parse_delimited_tail(&mut self, closer: SyntaxKind, mode: ItemMode) -> PResult {
         self.bump();
-        self.parse_args(closer)?;
+        self.parse_args(closer, mode)?;
         if !self.at(closer) {
             // Unreachable in practice: the pre-pass balanced every delimiter
             // and `parse_args` stops only at a closer. Kept for robustness.
@@ -716,7 +787,7 @@ impl<'s> Parser<'s> {
     /// The comma-separated items between delimiters, tolerating an empty list,
     /// omitted entries (`f(a, , b)` — the CST lowering synthesizes the phantom
     /// `Empty`), and a trailing comma.
-    fn parse_args(&mut self, closer: SyntaxKind) -> PResult {
+    fn parse_args(&mut self, closer: SyntaxKind, mode: ItemMode) -> PResult {
         loop {
             if self.at_closer_or_eof() {
                 return Ok(());
@@ -724,7 +795,10 @@ impl<'s> Parser<'s> {
             if !self.at(SyntaxKind::COMMA) {
                 // A real item; a `,` here is an omitted entry, represented by
                 // nothing at all between the separators.
-                self.parse_item()?;
+                match mode {
+                    ItemMode::Expr => self.parse_item()?,
+                    ItemMode::MapEntry => self.parse_map_item()?,
+                }
             }
             if self.at(SyntaxKind::COMMA) {
                 self.bump();
@@ -789,16 +863,22 @@ mod tests {
             rhs: Box::new(rhs),
         })
     }
-    fn arrow<'s>(lhs: Cst<'s>, rhs: Cst<'s>) -> Cst<'s> {
-        Cst::bare(CstKind::Arrow {
-            lhs: Box::new(lhs),
-            rhs: Box::new(rhs),
-        })
-    }
     fn fndef<'s>(signature: Cst<'s>, body: Cst<'s>) -> Cst<'s> {
-        Cst::bare(CstKind::FunctionDef {
+        Cst::bare(CstKind::DefineFunction {
             signature: Box::new(signature),
             body: Box::new(body),
+        })
+    }
+    fn pair<'s>(key: Cst<'s>, value: Cst<'s>) -> Cst<'s> {
+        Cst::bare(CstKind::MapEntry {
+            key: Box::new(key),
+            value: Some(Box::new(value)),
+        })
+    }
+    fn key_only(key: Cst<'_>) -> Cst<'_> {
+        Cst::bare(CstKind::MapEntry {
+            key: Box::new(key),
+            value: None,
         })
     }
 
@@ -853,7 +933,7 @@ mod tests {
 
     #[test]
     fn function_definition() {
-        // A call LHS with a valid signature lowers straight to `FunctionDef`.
+        // Any `->` outside a map item's top level is a `DefineFunction`.
         assert_eq!(
             parse("foo(a, b) -> a + b"),
             fndef(
@@ -861,6 +941,9 @@ mod tests {
                 bin(BinOp::Add, id("a"), id("b")),
             )
         );
+        // Even with a non-signature LHS — validity is the AST lowering's
+        // concern, not the parser's.
+        assert_eq!(parse("'k' -> v"), fndef(str_("'k'"), id("v")));
     }
 
     #[test]
@@ -873,17 +956,67 @@ mod tests {
         assert_eq!(
             parse("m('a' -> 1, 'b' -> 2)"),
             map(vec![
-                arrow(str_("'a'"), num("1")),
-                arrow(str_("'b'"), num("2")),
+                pair(str_("'a'"), num("1")),
+                pair(str_("'b'"), num("2")),
             ])
         );
         assert_eq!(
             parse("{'a' -> 1, 'b' -> 2}"),
             map(vec![
-                arrow(str_("'a'"), num("1")),
-                arrow(str_("'b'"), num("2")),
+                pair(str_("'a'"), num("1")),
+                pair(str_("'b'"), num("2")),
             ])
         );
+    }
+
+    #[test]
+    fn map_entry_forms() {
+        // Every item of a map wraps in a `MapEntry`: a `k -> v` pair, or a
+        // bare key — a list (`[k, v]`, `l(k, v)`) or any other expression —
+        // whose *value* the VM classifies at runtime. A trailing comma is
+        // tolerated as in every argument list.
+        assert_eq!(
+            parse("{k->v, [k,v], l(k,v), k, k2,}"),
+            map(vec![
+                pair(id("k"), id("v")),
+                key_only(list(vec![id("k"), id("v")])),
+                key_only(list(vec![id("k"), id("v")])),
+                key_only(id("k")),
+                key_only(id("k2")),
+            ])
+        );
+    }
+
+    #[test]
+    fn map_entry_arrow_only_at_the_item_top_level() {
+        // Only the top level of a map item is entry context: an arrow nested
+        // in a call's arguments — even inside a map — is a definition…
+        assert_eq!(
+            parse("{f(k->v)}"),
+            map(vec![key_only(call("f", vec![fndef(id("k"), id("v"))]))])
+        );
+        // …while an entry's value containing a map re-enters entry context.
+        assert_eq!(
+            parse("{k -> {a -> b}}"),
+            map(vec![pair(id("k"), map(vec![pair(id("a"), id("b"))]))])
+        );
+    }
+
+    #[test]
+    fn map_entry_with_statement_chain_is_a_bare_key() {
+        // Once a `;` continues the item, no arrow is the *whole* item, so the
+        // entry is a bare key (a `;`-chain) and the arrow inside it is an
+        // ordinary definition.
+        assert_eq!(
+            parse("{k -> v; w}"),
+            map(vec![key_only(bin(
+                BinOp::Semi,
+                fndef(id("k"), id("v")),
+                id("w"),
+            ))])
+        );
+        // A *trailing* `;` run does not continue the item: the pair stays.
+        assert_eq!(parse("{k -> v;}"), map(vec![pair(id("k"), id("v"))]));
     }
 
     #[test]
@@ -893,25 +1026,34 @@ mod tests {
         // Scarpet, where `->` (precedence 2) binds tighter than `;` (1).
         assert_eq!(
             parse("{1+2;'a'->3*4}"),
-            map(vec![bin(
+            map(vec![key_only(bin(
                 BinOp::Semi,
                 bin(BinOp::Add, num("1"), num("2")),
-                arrow(str_("'a'"), bin(BinOp::Mul, num("3"), num("4"))),
-            )])
+                fndef(str_("'a'"), bin(BinOp::Mul, num("3"), num("4"))),
+            ))])
         );
     }
 
     #[test]
     fn arrow_right_assoc() {
         // `->` is right-associative, so `{f()->g()->h()}` groups as
-        // `{f() -> (g() -> h())}`. An empty-argument call is a valid signature,
-        // so both `f()` and `g()` head a `FunctionDef`.
+        // `{f() -> (g() -> h())}`. The item-level arrow is the entry's own
+        // pair; the nested one is a definition of `g` (the *key* `f()` is an
+        // ordinary call — context, not signature-validity, decides).
         assert_eq!(
             parse("{f()->g()->h()}"),
-            map(vec![fndef(
+            map(vec![pair(
                 call("f", vec![]),
                 fndef(call("g", vec![]), call("h", vec![])),
             )])
+        );
+        // Outside a map the same chain is nested definitions.
+        assert_eq!(
+            parse("f()->g()->h()"),
+            fndef(
+                call("f", vec![]),
+                fndef(call("g", vec![]), call("h", vec![])),
+            )
         );
     }
 
@@ -1062,6 +1204,47 @@ mod tests {
                 assert_eq!(rhs.kind, CstKind::Ident("b"));
             }
             other => panic!("expected Add(a, b), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn comment_between_map_arrow_and_value_attaches_to_value() {
+        // The band after a map entry's `->` sinks to the value's leftmost
+        // node, exactly as it did when `->` was a generic binary operator.
+        let cst = parse("{'k' -> // c\n v}");
+        match &cst.kind {
+            CstKind::Map(items) => {
+                assert_eq!(items.len(), 1);
+                let CstKind::MapEntry {
+                    key,
+                    value: Some(value),
+                } = &items[0].kind
+                else {
+                    panic!("expected a pair entry, got {:?}", items[0].kind);
+                };
+                assert_eq!(key.kind, CstKind::Str("'k'"));
+                assert_eq!(value.leading, vec![Trivia::Comment("// c"), Trivia::Break]);
+                assert_eq!(value.kind, CstKind::Ident("v"));
+            }
+            other => panic!("expected Map, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn comment_before_map_entry_attaches_to_the_entry() {
+        // The band between `{` and the first item rides on the item — the
+        // `MAP_ENTRY` wrap must not swallow it.
+        let cst = parse("{ // c\n k -> v }");
+        match &cst.kind {
+            CstKind::Map(items) => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(
+                    items[0].leading,
+                    vec![Trivia::Comment("// c"), Trivia::Break]
+                );
+                assert!(matches!(items[0].kind, CstKind::MapEntry { .. }));
+            }
+            other => panic!("expected Map, got {other:?}"),
         }
     }
 

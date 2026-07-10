@@ -55,7 +55,11 @@ impl Lowerer<'_> {
         match &cst.kind {
             CstKind::Number(s) | CstKind::Str(s) | CstKind::Ident(s) => text(s.to_string()),
             CstKind::Unary { op, operand } => self.unary(*op, operand),
-            CstKind::FunctionDef { .. } | CstKind::Arrow { .. } => self.arrow_chain(cst),
+            CstKind::DefineFunction { .. } | CstKind::MapEntry { value: Some(_), .. } => {
+                self.arrow_chain(cst)
+            }
+            // A bare map entry is transparent: it wraps exactly its key.
+            CstKind::MapEntry { key, value: None } => self.expr(key),
             CstKind::Binary { op, lhs, rhs } => match *op {
                 BinOp::Comma => self.comma_chain(cst),
                 BinOp::Semi => self.semi_chain(cst),
@@ -186,8 +190,8 @@ impl Lowerer<'_> {
     /// A right-associative `->` chain (`a -> b -> c`). The arrow stays on the
     /// signature line; the RHS handles its own breaking. The final operand is the
     /// body, lowered via [`Lowerer::arrow_body`] so its opening delimiter can hug
-    /// the arrow. Both [`CstKind::FunctionDef`] and [`CstKind::Arrow`] links are
-    /// flattened together — they render identically.
+    /// the arrow. Both [`CstKind::DefineFunction`] and pair-[`CstKind::MapEntry`]
+    /// links are flattened together — they render identically.
     fn arrow_chain(&self, cst: &Cst) -> Doc {
         let parts = flatten_arrow(cst);
         let last = parts.len() - 1;
@@ -466,19 +470,23 @@ fn flatten_left<'a, 's>(op: BinOp, cst: &'a Cst<'s>) -> Vec<&'a Cst<'s>> {
 }
 
 /// Collect the operands of a right-nested `->` chain (`a -> b -> c` →
-/// `[a, b, c]`), treating both [`CstKind::FunctionDef`] (a definition whose LHS
-/// is a call signature) and [`CstKind::Arrow`] (a map entry / generic arrow) as
-/// links — the two format identically, so a mixed chain flattens uniformly.
+/// `[a, b, c]`), treating both [`CstKind::DefineFunction`] (a definition) and a
+/// pair-[`CstKind::MapEntry`] (a map item's `key -> value`) as links — the two
+/// format identically, so a mixed chain (`{'k' -> f() -> x}`) flattens
+/// uniformly.
 fn flatten_arrow<'a, 's>(cst: &'a Cst<'s>) -> Vec<&'a Cst<'s>> {
     let mut out = Vec::new();
     let mut cur = cst;
     loop {
-        // A `FunctionDef` splits into signature/body, a generic `Arrow` into
-        // lhs/rhs; both render as `head -> tail`, so a mixed chain flattens the
-        // same way.
+        // A `DefineFunction` splits into signature/body, a pair entry into
+        // key/value; both render as `head -> tail`, so a mixed chain flattens
+        // the same way.
         let (head, tail) = match &cur.kind {
-            CstKind::FunctionDef { signature, body } => (signature, body),
-            CstKind::Arrow { lhs, rhs } => (lhs, rhs),
+            CstKind::DefineFunction { signature, body } => (signature, body),
+            CstKind::MapEntry {
+                key,
+                value: Some(value),
+            } => (key, value),
             _ => {
                 out.push(cur);
                 break;
@@ -702,6 +710,27 @@ mod tests {
     fn list_and_map_flat() {
         assert_eq!(fmt("[1,2,3]"), "[1, 2, 3]\n");
         assert_eq!(fmt("{'a'->1,'b'->2}"), "{'a' -> 1, 'b' -> 2}\n");
+    }
+
+    #[test]
+    fn map_entry_forms() {
+        // Pair entries, list keys (either spelling — `l(…)` normalizes to
+        // `[…]`), and bare keys; the flat layout drops the trailing comma.
+        assert_eq!(
+            fmt("{k->v,[k,v],l(k,v),k,}"),
+            "{k -> v, [k, v], [k, v], k}\n"
+        );
+        // A pair whose value is a definition chain flattens like any arrow.
+        assert_eq!(fmt("{'k' -> f() -> x}"), "{'k' -> f() -> x}\n");
+    }
+
+    #[test]
+    fn map_entry_with_statement_chain_is_stable() {
+        // A `;`-chain item is a bare key; its statement layout reaches a
+        // fixpoint in one pass.
+        let once = fmt("{k -> v; w}");
+        assert_eq!(once, "{\n    k -> v;\n    w;,\n}\n");
+        assert_eq!(fmt(&once), once);
     }
 
     #[test]

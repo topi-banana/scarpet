@@ -1,4 +1,4 @@
-use scarpet_syntax::ast::{Args, Code, Expr, Primary};
+use scarpet_syntax::ast::{Args, MapEntry, Primary};
 
 use super::Evaluate;
 use crate::{
@@ -30,13 +30,13 @@ impl<'src, 'state> Evaluate<Primary<'src>> for ScarpetVm<'state, 'src> {
                 }
                 Ok(ValueContainer::new(Value::list(items)))
             }
-            // `{k -> v, …}`: each entry is evaluated in map context, where a
-            // top-level `->` is a key/value pair (the original desugars `{…}` to
-            // `m(…)`). Duplicate keys are last-wins.
-            Primary::Map(Args(codes)) => {
+            // `{k -> v, …}`: the parser already tagged each item (see
+            // [`MapEntry`]); evaluate each into a key/value pair. Duplicate
+            // keys are last-wins.
+            Primary::Map(items) => {
                 let mut entries: Vec<(Value, Value)> = Vec::new();
-                for code in codes {
-                    let (key, value) = self.eval_map_entry(code)?;
+                for item in items {
+                    let (key, value) = self.eval_map_entry(item)?;
                     match entries.iter_mut().find(|(k, _)| k.scarpet_eq(&key)) {
                         Some(slot) => slot.1 = value,
                         None => entries.push((key, value)),
@@ -58,27 +58,27 @@ impl<'src, 'state> Evaluate<Primary<'src>> for ScarpetVm<'state, 'src> {
 
 impl<'state, 'src> ScarpetVm<'state, 'src> {
     /// Evaluate one entry of a map literal (`{…}` / `m(…)`) into a key/value
-    /// pair. In map context a top-level `->` is not a lambda but a pair (the
-    /// original evaluates these args in `MAPDEF` context). Otherwise the entry
-    /// is a value handled like `MapValue.put`: a 2-element list is a pair, any
+    /// pair. A `key -> value` pair evaluates both sides. A bare entry is a
+    /// value handled like `MapValue.put`: a 2-element list is a pair, any
     /// other list is an error, and a non-list becomes a key with a null value.
-    fn eval_map_entry(&mut self, Code(mut exprs): Code<'src>) -> Result<(Value, Value), VmError> {
-        if exprs.len() == 1 && matches!(exprs.first(), Some(Expr::Arrow { .. })) {
-            let Some(Expr::Arrow { lhs, body }) = exprs.pop() else {
-                unreachable!()
-            };
-            let key = self.push(lhs)?.lock()?.clone();
-            let value = self.push(*body)?.lock()?.clone();
-            return Ok((key, value));
-        }
-        let value = self.push(Code(exprs))?.lock()?.clone();
-        match value {
-            Value::List(items) if items.len() == 2 => {
-                let mut it = items.into_iter();
-                Ok((it.next().unwrap(), it.next().unwrap()))
+    fn eval_map_entry(&mut self, entry: MapEntry<'src>) -> Result<(Value, Value), VmError> {
+        match entry {
+            MapEntry::Pair { key, value } => {
+                let key = self.push(*key)?.lock()?.clone();
+                let value = self.push(*value)?.lock()?.clone();
+                Ok((key, value))
             }
-            Value::List(_) => Err(VmError::MapEntryNotPair),
-            other => Ok((other, Value::Null)),
+            MapEntry::Single(code) => {
+                let value = self.push(code)?.lock()?.clone();
+                match value {
+                    Value::List(items) if items.len() == 2 => {
+                        let mut it = items.into_iter();
+                        Ok((it.next().unwrap(), it.next().unwrap()))
+                    }
+                    Value::List(_) => Err(VmError::MapEntryNotPair),
+                    other => Ok((other, Value::Null)),
+                }
+            }
         }
     }
 }

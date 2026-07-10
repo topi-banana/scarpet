@@ -29,7 +29,7 @@ Expr =
 | MapExpr
 | ParenExpr
 | PrefixExpr
-| ArrowExpr
+| DefineFunction
 | BinExpr
 
 Literal = value:('number' | 'string')
@@ -45,18 +45,28 @@ ListExpr =
 | 'l' '(' args:(Expr (',' Expr)*)? ')'
 
 MapExpr =
-  '{' args:(Expr (',' Expr)*)? '}'
-| 'm' '(' args:(Expr (',' Expr)*)? ')'
+  '{' entries:(MapEntry (',' MapEntry)* ','?)? '}'
+| 'm' '(' entries:(MapEntry (',' MapEntry)* ','?)? ')'
+
+// One item of a map literal — `{k -> v, [k, v], l(k, v), k, k,}` shows every
+// form. Only when the whole item is exactly `key -> value` does the entry
+// carry its own `->`; a bare item (`k`, `[k, v]`, `l(k, v)`, a `;`-chain) is
+// just the key, and the VM classifies its *value* at runtime (a two-element
+// list is a pair, any other value a key). The parser decides this from
+// context alone (`parse_map_item` in `src/parser.rs`), so no later lowering
+// distinguishes definitions from entries.
+MapEntry = key:Expr ('->' value:Expr)?
 
 ParenExpr = '(' Expr ')'
 
 PrefixExpr = op:('-' | '+' | '!' | '...') Expr
 
-// The `->` operator lives in its own node rather than `BinExpr`'s operator
-// list: it is Scarpet's function-definition / arrow operator, and the CST
-// lowering (`src/cst.rs`) splits an `ArrowExpr` into a function definition or a
-// generic arrow, so `->` never flows through the binary-operator machinery.
-ArrowExpr = lhs:Expr '->' rhs:Expr
+// Any `->` outside the top level of a map item — always a function
+// definition. The `->` operator lives in its own node rather than `BinExpr`'s
+// operator list, so it never flows through the binary-operator machinery.
+// The signature is semantically a call `name(params)`; the AST lowering
+// (`src/ast.rs`) rejects any other shape.
+DefineFunction = signature:Expr '->' body:Expr
 
 BinExpr =
   lhs:Expr

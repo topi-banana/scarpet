@@ -37,8 +37,6 @@ impl<'src, 'state> Evaluate<Expr<'src>> for ScarpetVm<'state, 'src> {
                 Ok(ValueContainer::string(name.to_owned()))
             }
             Expr::Assign(ost) => self.push(ost),
-            // A bare `->` outside a map (a lambda) is not modelled yet.
-            Expr::Arrow { .. } => todo!(),
         }
     }
 }
