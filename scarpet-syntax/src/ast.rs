@@ -11,8 +11,9 @@
 //!
 //! - `,` → [`Args`]`(Vec<Code>)` — argument / element lists, paren bodies, root
 //! - `;` → [`Code`]`(Vec<Expr>)` — a statement sequence
-//! - `->` → [`Expr`] — a function definition [`Expr::Def`] when the left of the
-//!   arrow is a call, otherwise a generic [`Expr::Arrow`]
+//! - `->` → [`Expr`] — the CST already tagged it a function definition
+//!   ([`CstKind::FunctionDef`] → [`Expr::Def`]) or a generic arrow
+//!   ([`CstKind::Arrow`] → [`Expr::Arrow`]), so this level only maps the tag
 //! - `=` `+=` `<>` → [`Assign`] — an [`LValue`] target with an [`AssignOp`]
 //! - `||` `&&` `==`/`!=` `<`/`<=`/`>`/`>=` `+`/`-` `*`/`/`/`%` `^` → one enum
 //!   per level ([`Lor`], [`Land`], [`Equality`], [`Compare`], [`Additive`],
@@ -29,9 +30,10 @@
 //! - A function's parameters lower to [`Params`] — a flat list of plain binders,
 //!   `outer(x)`-style [`Capture`]s (each a [`ParamWord`] reserved word), and at
 //!   most one `...rest`. A call-arrow whose "parameters" are not all valid (a
-//!   literal, an index, a nested pattern) is *not* a definition: it lowers to a
-//!   generic [`Expr::Arrow`] — a map key→value pair — exactly as Scarpet treats
-//!   `{ k -> v }` in `MAPDEF` context.
+//!   literal, an index, a nested pattern) is *not* a definition: the CST tags it
+//!   a generic [`CstKind::Arrow`] — a map key→value pair — exactly as Scarpet
+//!   treats `{ k -> v }` in `MAPDEF` context. The def-vs-arrow decision is made
+//!   once, in the CST lowering; this module only reads the tag.
 //! - An assignment target (the left of `=`/`+=`/`<>`) lowers to [`LValue`] — a
 //!   single [`Place`] (`x`, `var(e)`, `a:b:c`), a [`Destructure`](LValue::Destructure)
 //!   list that may nest and carry at most one `...rest` per
@@ -522,36 +524,30 @@ fn collect_semi<'s>(cst: &Cst<'s>, out: &mut Vec<Expr<'s>>) -> Result<(), LowerE
     Ok(())
 }
 
-/// `arrow_chain`: a `->` whose left side is a call is a function definition; any
-/// other `->` is a generic arrow; no `->` falls through to the assignment level.
+/// `arrow_chain`: the CST already split `->` into a [`CstKind::FunctionDef`]
+/// (function definition) or a [`CstKind::Arrow`] (generic arrow / map entry), so
+/// there is no def-vs-arrow decision left here — each maps straight to its
+/// [`Expr`]. Anything else falls through to the assignment level.
 impl<'a, 's> TryFrom<&'a Cst<'s>> for Expr<'s> {
     type Error = LowerError;
     fn try_from(cst: &'a Cst<'s>) -> Result<Self, LowerError> {
-        if let CstKind::Binary {
-            op: BinOp::Arrow,
-            lhs,
-            rhs,
-        } = &cst.kind
-        {
-            let body = Box::new(Expr::try_from(rhs.as_ref())?);
-            // A call LHS with a *valid signature* is a function definition. Any
-            // other arrow — a non-call LHS, or a call whose "parameters" are not a
-            // valid signature (a literal / index, e.g. the map key `str('x', _)`) —
-            // is a generic arrow: a key→value pair in `{ … }` map context, exactly
-            // as Scarpet treats it.
-            if let CstKind::Call { callee, args } = &lhs.kind
-                && let CstKind::Ident(name) = &callee.kind
-                && let Some(params) = lower_params(args)
-            {
-                Ok(Expr::Def { name, params, body })
-            } else {
-                Ok(Expr::Arrow {
-                    lhs: Assign::try_from(lhs.as_ref())?,
-                    body,
+        match &cst.kind {
+            // `cst.rs` builds `FunctionDef` only for a signature `signature_params`
+            // accepts, so re-reading it here is infallible.
+            CstKind::FunctionDef { signature, body } => {
+                let (name, params) =
+                    signature_params(signature).expect("a FunctionDef's signature is always valid");
+                Ok(Expr::Def {
+                    name,
+                    params,
+                    body: Box::new(Expr::try_from(body.as_ref())?),
                 })
             }
-        } else {
-            Ok(Expr::Assign(Assign::try_from(cst)?))
+            CstKind::Arrow { lhs, rhs } => Ok(Expr::Arrow {
+                lhs: Assign::try_from(lhs.as_ref())?,
+                body: Box::new(Expr::try_from(rhs.as_ref())?),
+            }),
+            _ => Ok(Expr::Assign(Assign::try_from(cst)?)),
         }
     }
 }
@@ -666,13 +662,33 @@ fn lower_lpatterns<'s>(items: &[Cst<'s>]) -> Result<LPatterns<'s>, LowerError> {
     Ok(LPatterns { before, rest })
 }
 
+/// Read a `->` left-hand side as a function *signature* — a call `name(params)`
+/// whose callee is an identifier and whose arguments form a valid [`Params`] —
+/// returning its `(name, params)`, or `None` for any other shape.
+///
+/// This is the single def-vs-arrow oracle. The CST lowering
+/// ([`crate::cst`]'s `is_function_def`) calls it to tag an `ARROW_EXPR` as a
+/// [`CstKind::FunctionDef`] or a [`CstKind::Arrow`]; the `Expr` lowering above
+/// then calls it again to read the params of a signature already known valid.
+/// A non-signature call-arrow (`str('x', _) -> …`, `f(a:0) -> …`) is a generic
+/// arrow, matching Scarpet, which treats only a valid signature as a definition.
+pub(crate) fn signature_params<'s>(sig: &Cst<'s>) -> Option<(&'s str, Params<'s>)> {
+    let CstKind::Call { callee, args } = &sig.kind else {
+        return None;
+    };
+    let CstKind::Ident(name) = &callee.kind else {
+        return None;
+    };
+    Some((name, lower_params(args)?))
+}
+
 /// Try to lower the `,`-separated arguments of a call-arrow LHS as a function
 /// signature ([`Params`]), dropping phantom `Empty` slots. Each parameter must be
 /// a plain binder, an `outer(x)`-style [`Capture`] (a [`ParamWord`]), or the
 /// single `...rest`. Returns `None` if any of them is not — a literal, an index, a
 /// nested pattern, an unknown reserved word, or a second `...` — in which case the
-/// arrow is not a definition but a generic [`Expr::Arrow`] (a map key→value pair),
-/// matching Scarpet, which only treats a valid signature LHS as a definition.
+/// arrow is not a definition but a generic arrow (see [`signature_params`], the
+/// def-vs-arrow oracle that wraps this).
 fn lower_params<'s>(items: &[Cst<'s>]) -> Option<Params<'s>> {
     let mut fixed = Vec::new();
     let mut captures = Vec::new();
@@ -976,6 +992,8 @@ fn describe(kind: &CstKind<'_>) -> &'static str {
         CstKind::Map(_) => "a map",
         CstKind::Paren(_) => "a parenthesized expression",
         CstKind::Empty => "an empty slot",
+        CstKind::FunctionDef { .. } => "a function definition",
+        CstKind::Arrow { .. } => "an arrow expression",
         CstKind::Unary { .. } => "a unary expression",
         CstKind::Binary { .. } => "an operator expression",
     }

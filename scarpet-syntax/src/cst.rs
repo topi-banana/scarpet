@@ -19,6 +19,11 @@
 //! - Trivia around a trailing `;`/`,` (before a closer or end of input) is
 //!   appended onto the preceding node's leading.
 //!
+//! The `->` operator (parsed into its own `ARROW_EXPR`) is split here rather
+//! than carried as a generic binary op: a call LHS with a valid parameter list
+//! becomes a [`CstKind::FunctionDef`], any other LHS a [`CstKind::Arrow`]. Its
+//! trivia routes exactly as the old `->` binary did.
+//!
 //! Deliberately preserved quirks of the old parser (the corpus round-trip
 //! depends on byte-identical formatting): trivia between a callee and its
 //! `(`, trivia between an expression and a `)` with no separator in between,
@@ -74,6 +79,20 @@ pub enum CstKind<'s> {
     Map(Vec<Cst<'s>>),
     Paren(Box<Cst<'s>>),
     Empty,
+    /// `name(params) -> body` — a function definition. `signature` is always a
+    /// [`CstKind::Call`] whose callee is an identifier and whose arguments form
+    /// a valid parameter list; the lowering decides this once (see
+    /// [`Conv::arrow`]) so the AST lowering carries no def-vs-arrow judgment.
+    FunctionDef {
+        signature: Box<Cst<'s>>,
+        body: Box<Cst<'s>>,
+    },
+    /// `lhs -> rhs` where `lhs` is not a function signature — a map entry
+    /// (`'k' -> v`) or any other arrow.
+    Arrow {
+        lhs: Box<Cst<'s>>,
+        rhs: Box<Cst<'s>>,
+    },
     Binary {
         op: BinOp,
         lhs: Box<Cst<'s>>,
@@ -106,7 +125,6 @@ pub enum BinOp {
     Assign,
     AddAssign,
     Swap,
-    Arrow,
     Semi,
     Comma,
 }
@@ -132,6 +150,14 @@ pub fn strip_trivia<'s>(cst: &Cst<'s>) -> Cst<'s> {
         CstKind::List(items) => CstKind::List(items.iter().map(strip_trivia).collect()),
         CstKind::Map(items) => CstKind::Map(items.iter().map(strip_trivia).collect()),
         CstKind::Paren(inner) => CstKind::Paren(Box::new(strip_trivia(inner))),
+        CstKind::FunctionDef { signature, body } => CstKind::FunctionDef {
+            signature: Box::new(strip_trivia(signature)),
+            body: Box::new(strip_trivia(body)),
+        },
+        CstKind::Arrow { lhs, rhs } => CstKind::Arrow {
+            lhs: Box::new(strip_trivia(lhs)),
+            rhs: Box::new(strip_trivia(rhs)),
+        },
         CstKind::Binary { op, lhs, rhs } => CstKind::Binary {
             op: *op,
             lhs: Box::new(strip_trivia(lhs)),
@@ -237,6 +263,7 @@ impl<'s> Conv<'s> {
             SyntaxKind::MAP_EXPR => Cst::bare(CstKind::Map(self.args(node))),
             SyntaxKind::PAREN_EXPR => self.paren(node),
             SyntaxKind::PREFIX_EXPR => self.prefix(node),
+            SyntaxKind::ARROW_EXPR => self.arrow(node),
             SyntaxKind::BIN_EXPR => self.bin(node),
             k => unreachable!("expression node: {k:?}"),
         }
@@ -353,6 +380,50 @@ impl<'s> Conv<'s> {
             lhs: Box::new(lhs),
             rhs: Box::new(rhs),
         })
+    }
+
+    /// An `->` application (a dedicated `ARROW_EXPR`, always a single operator —
+    /// right-associativity puts any further `->` inside the RHS node). Trivia
+    /// routes exactly as the old `->` binary did: the band before `->` prepends
+    /// onto the RHS node itself, the band after it sinks to the RHS's leftmost
+    /// node. The def-vs-arrow split happens here — a call LHS with a valid
+    /// signature becomes a [`CstKind::FunctionDef`], any other LHS a generic
+    /// [`CstKind::Arrow`] — so the AST lowering needs no such decision.
+    fn arrow(&self, node: &SyntaxNode) -> Cst<'s> {
+        let elems: Vec<SyntaxElement> = node.children_with_tokens().collect();
+        let lhs_at = elems
+            .iter()
+            .position(|e| e.as_node().is_some())
+            .expect("an arrow has an LHS");
+        let rhs_at = elems
+            .iter()
+            .rposition(|e| e.as_node().is_some())
+            .expect("an arrow has an RHS");
+        let op_at = elems[lhs_at + 1..rhs_at]
+            .iter()
+            .position(|e| e.as_token().is_some_and(|t| t.kind() == SyntaxKind::ARROW))
+            .map(|i| i + lhs_at + 1)
+            .expect("an arrow has its `->`");
+
+        let band_before = self.band(&elems[lhs_at + 1..op_at]);
+        let band_after = self.band(&elems[op_at + 1..rhs_at]);
+
+        let lhs = self.expr(elems[lhs_at].as_node().unwrap());
+        let mut rhs = self.expr(elems[rhs_at].as_node().unwrap());
+        prepend_deep(&mut rhs, band_after);
+        rhs = rhs.with_leading(band_before);
+
+        if is_function_def(&lhs) {
+            Cst::bare(CstKind::FunctionDef {
+                signature: Box::new(lhs),
+                body: Box::new(rhs),
+            })
+        } else {
+            Cst::bare(CstKind::Arrow {
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            })
+        }
     }
 
     /// The comma-separated items between a node's delimiters (a call's
@@ -490,6 +561,14 @@ fn prepend_deep<'s>(cst: &mut Cst<'s>, band: Vec<Trivia<'s>>) {
     cst.leading = leading;
 }
 
+/// Whether a `->` left-hand side is a function *signature*. This is the single
+/// place the def-vs-arrow decision is made; it defers to the AST's
+/// [`crate::ast::signature_params`] oracle, which the AST lowering then calls
+/// again to extract the params infallibly, so the two never drift.
+fn is_function_def(lhs: &Cst<'_>) -> bool {
+    crate::ast::signature_params(lhs).is_some()
+}
+
 /// Append the pending band onto the last item's leading.
 fn flush_onto_last<'s>(items: &mut [Cst<'s>], pending: &mut Vec<Trivia<'s>>) {
     if let Some(last) = items.last_mut() {
@@ -520,7 +599,6 @@ fn binop_of(kind: SyntaxKind) -> BinOp {
         SyntaxKind::EQ => BinOp::Assign,
         SyntaxKind::PLUS_EQ => BinOp::AddAssign,
         SyntaxKind::LT_GT => BinOp::Swap,
-        SyntaxKind::ARROW => BinOp::Arrow,
         SyntaxKind::SEMICOLON => BinOp::Semi,
         SyntaxKind::COMMA => BinOp::Comma,
         k => unreachable!("binary operator: {k:?}"),

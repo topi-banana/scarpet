@@ -295,7 +295,8 @@ fn delim_label(k: SyntaxKind) -> &'static str {
 //   map_literal  = `{` arg_list `}` | `m(` arg_list `)`
 //
 // Every level lands in a `BIN_EXPR` node (or `PREFIX_EXPR` for the unary
-// prefixes); left-associative levels wrap repeatedly at the same checkpoint,
+// prefixes, or a dedicated `ARROW_EXPR` for `->`); left-associative levels
+// wrap repeatedly at the same checkpoint,
 // right-associative ones recurse before wrapping. Trivia tokens are emitted
 // into the green tree at the position they occupy in the source — checkpoints
 // are always taken *after* flushing pending trivia, so a band before an
@@ -520,15 +521,25 @@ impl<'s> Parser<'s> {
         Ok(())
     }
 
-    /// `arrow_chain` (`->`; right-associative).
+    /// `arrow_chain` (`->`; right-associative). Unlike the other binary levels
+    /// this wraps a dedicated [`SyntaxKind::ARROW_EXPR`] node rather than a
+    /// generic `BIN_EXPR`: `->` is the function-definition / arrow operator, and
+    /// the CST lowering (see [`crate::cst`]) splits an `ARROW_EXPR` into a
+    /// function definition or a generic arrow, so it never flows through the
+    /// binary-operator machinery.
     fn parse_arrow(&mut self) -> PResult {
-        self.parse_right_assoc(&[SyntaxKind::ARROW], Self::parse_assign)
+        self.parse_right_assoc(
+            &[SyntaxKind::ARROW],
+            SyntaxKind::ARROW_EXPR,
+            Self::parse_assign,
+        )
     }
 
     /// `assign` (`=`, `+=`, `<>`; right-associative).
     fn parse_assign(&mut self) -> PResult {
         self.parse_right_assoc(
             &[SyntaxKind::EQ, SyntaxKind::PLUS_EQ, SyntaxKind::LT_GT],
+            SyntaxKind::BIN_EXPR,
             Self::parse_lor,
         )
     }
@@ -547,14 +558,20 @@ impl<'s> Parser<'s> {
 
     /// One right-associative binary level: `next (op right)?`, where `right`
     /// recurses at this same level (so `a = b = c` nests to the right). The
-    /// twin of [`Self::parse_left_assoc`].
-    fn parse_right_assoc(&mut self, ops: &[SyntaxKind], next: fn(&mut Self) -> PResult) -> PResult {
+    /// twin of [`Self::parse_left_assoc`]. `node` is the wrapper kind — usually
+    /// `BIN_EXPR`, but `->` wraps a dedicated `ARROW_EXPR`.
+    fn parse_right_assoc(
+        &mut self,
+        ops: &[SyntaxKind],
+        node: SyntaxKind,
+        next: fn(&mut Self) -> PResult,
+    ) -> PResult {
         let cp = self.checkpoint();
         next(self)?;
         if self.peek_kind().is_some_and(|k| ops.contains(&k)) {
             self.bump();
-            self.parse_right_assoc(ops, next)?;
-            self.wrap(cp, SyntaxKind::BIN_EXPR);
+            self.parse_right_assoc(ops, node, next)?;
+            self.wrap(cp, node);
         }
         Ok(())
     }
@@ -596,7 +613,11 @@ impl<'s> Parser<'s> {
 
     /// `power` (`^`; right-associative).
     fn parse_power(&mut self) -> PResult {
-        self.parse_right_assoc(&[SyntaxKind::CARET], Self::parse_unary)
+        self.parse_right_assoc(
+            &[SyntaxKind::CARET],
+            SyntaxKind::BIN_EXPR,
+            Self::parse_unary,
+        )
     }
 
     /// `unary`: stackable prefixes (`-`, `+`, `!`, `...`).
@@ -768,6 +789,18 @@ mod tests {
             rhs: Box::new(rhs),
         })
     }
+    fn arrow<'s>(lhs: Cst<'s>, rhs: Cst<'s>) -> Cst<'s> {
+        Cst::bare(CstKind::Arrow {
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        })
+    }
+    fn fndef<'s>(signature: Cst<'s>, body: Cst<'s>) -> Cst<'s> {
+        Cst::bare(CstKind::FunctionDef {
+            signature: Box::new(signature),
+            body: Box::new(body),
+        })
+    }
 
     #[test]
     fn hello_world() {
@@ -820,10 +853,10 @@ mod tests {
 
     #[test]
     fn function_definition() {
+        // A call LHS with a valid signature lowers straight to `FunctionDef`.
         assert_eq!(
             parse("foo(a, b) -> a + b"),
-            bin(
-                BinOp::Arrow,
+            fndef(
                 call("foo", vec![id("a"), id("b")]),
                 bin(BinOp::Add, id("a"), id("b")),
             )
@@ -840,15 +873,15 @@ mod tests {
         assert_eq!(
             parse("m('a' -> 1, 'b' -> 2)"),
             map(vec![
-                bin(BinOp::Arrow, str_("'a'"), num("1")),
-                bin(BinOp::Arrow, str_("'b'"), num("2")),
+                arrow(str_("'a'"), num("1")),
+                arrow(str_("'b'"), num("2")),
             ])
         );
         assert_eq!(
             parse("{'a' -> 1, 'b' -> 2}"),
             map(vec![
-                bin(BinOp::Arrow, str_("'a'"), num("1")),
-                bin(BinOp::Arrow, str_("'b'"), num("2")),
+                arrow(str_("'a'"), num("1")),
+                arrow(str_("'b'"), num("2")),
             ])
         );
     }
@@ -863,11 +896,7 @@ mod tests {
             map(vec![bin(
                 BinOp::Semi,
                 bin(BinOp::Add, num("1"), num("2")),
-                bin(
-                    BinOp::Arrow,
-                    str_("'a'"),
-                    bin(BinOp::Mul, num("3"), num("4"))
-                ),
+                arrow(str_("'a'"), bin(BinOp::Mul, num("3"), num("4"))),
             )])
         );
     }
@@ -875,13 +904,13 @@ mod tests {
     #[test]
     fn arrow_right_assoc() {
         // `->` is right-associative, so `{f()->g()->h()}` groups as
-        // `{f() -> (g() -> h())}`.
+        // `{f() -> (g() -> h())}`. An empty-argument call is a valid signature,
+        // so both `f()` and `g()` head a `FunctionDef`.
         assert_eq!(
             parse("{f()->g()->h()}"),
-            map(vec![bin(
-                BinOp::Arrow,
+            map(vec![fndef(
                 call("f", vec![]),
-                bin(BinOp::Arrow, call("g", vec![]), call("h", vec![])),
+                fndef(call("g", vec![]), call("h", vec![])),
             )])
         );
     }
@@ -938,11 +967,7 @@ mod tests {
                 "map",
                 vec![
                     list(vec![num("1"), num("2"), num("3")]),
-                    bin(
-                        BinOp::Arrow,
-                        call("_", vec![id("x")]),
-                        bin(BinOp::Mul, id("x"), id("x")),
-                    ),
+                    fndef(call("_", vec![id("x")]), bin(BinOp::Mul, id("x"), id("x")),),
                 ],
             )
         );
@@ -951,8 +976,7 @@ mod tests {
     #[test]
     fn full_source_from_compdisplay() {
         let src = "toggle() -> (\n    print(player(), 'hi');\n);";
-        let expected = bin(
-            BinOp::Arrow,
+        let expected = fndef(
             call("toggle", vec![]),
             paren(call("print", vec![call("player", vec![]), str_("'hi'")])),
         );

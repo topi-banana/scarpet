@@ -29,6 +29,7 @@ Expr =
 | MapExpr
 | ParenExpr
 | PrefixExpr
+| ArrowExpr
 | BinExpr
 
 Literal = value:('number' | 'string')
@@ -51,10 +52,16 @@ ParenExpr = '(' Expr ')'
 
 PrefixExpr = op:('-' | '+' | '!' | '...') Expr
 
+// The `->` operator lives in its own node rather than `BinExpr`'s operator
+// list: it is Scarpet's function-definition / arrow operator, and the CST
+// lowering (`src/cst.rs`) splits an `ArrowExpr` into a function definition or a
+// generic arrow, so `->` never flows through the binary-operator machinery.
+ArrowExpr = lhs:Expr '->' rhs:Expr
+
 BinExpr =
   lhs:Expr
   op:(
-    ';' | ',' | '->'
+    ';' | ','
   | '=' | '+=' | '<>'
   | '||' | '&&'
   | '==' | '!='

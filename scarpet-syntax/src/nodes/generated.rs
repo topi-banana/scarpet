@@ -37,6 +37,7 @@ pub enum Expr {
     MapExpr(MapExpr),
     ParenExpr(ParenExpr),
     PrefixExpr(PrefixExpr),
+    ArrowExpr(ArrowExpr),
     BinExpr(BinExpr),
 }
 
@@ -51,6 +52,7 @@ impl AstNode for Expr {
                 | SyntaxKind::MAP_EXPR
                 | SyntaxKind::PAREN_EXPR
                 | SyntaxKind::PREFIX_EXPR
+                | SyntaxKind::ARROW_EXPR
                 | SyntaxKind::BIN_EXPR
         )
     }
@@ -64,6 +66,7 @@ impl AstNode for Expr {
             SyntaxKind::MAP_EXPR => Expr::MapExpr(MapExpr { syntax }),
             SyntaxKind::PAREN_EXPR => Expr::ParenExpr(ParenExpr { syntax }),
             SyntaxKind::PREFIX_EXPR => Expr::PrefixExpr(PrefixExpr { syntax }),
+            SyntaxKind::ARROW_EXPR => Expr::ArrowExpr(ArrowExpr { syntax }),
             SyntaxKind::BIN_EXPR => Expr::BinExpr(BinExpr { syntax }),
             _ => return None,
         };
@@ -79,6 +82,7 @@ impl AstNode for Expr {
             Expr::MapExpr(it) => &it.syntax,
             Expr::ParenExpr(it) => &it.syntax,
             Expr::PrefixExpr(it) => &it.syntax,
+            Expr::ArrowExpr(it) => &it.syntax,
             Expr::BinExpr(it) => &it.syntax,
         }
     }
@@ -324,6 +328,39 @@ impl PrefixExpr {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ArrowExpr {
+    syntax: SyntaxNode,
+}
+
+impl AstNode for ArrowExpr {
+    fn can_cast(kind: SyntaxKind) -> bool {
+        kind == SyntaxKind::ARROW_EXPR
+    }
+
+    fn cast(syntax: SyntaxNode) -> Option<Self> {
+        Self::can_cast(syntax.kind()).then_some(Self { syntax })
+    }
+
+    fn syntax(&self) -> &SyntaxNode {
+        &self.syntax
+    }
+}
+
+impl ArrowExpr {
+    pub fn lhs(&self) -> Option<Expr> {
+        support::nth_child(&self.syntax, 0)
+    }
+
+    pub fn arrow_token(&self) -> Option<SyntaxToken> {
+        support::token(&self.syntax, &[SyntaxKind::ARROW])
+    }
+
+    pub fn rhs(&self) -> Option<Expr> {
+        support::nth_child(&self.syntax, 1)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BinExpr {
     syntax: SyntaxNode,
 }
@@ -353,7 +390,6 @@ impl BinExpr {
             &[
                 SyntaxKind::SEMICOLON,
                 SyntaxKind::COMMA,
-                SyntaxKind::ARROW,
                 SyntaxKind::EQ,
                 SyntaxKind::PLUS_EQ,
                 SyntaxKind::LT_GT,

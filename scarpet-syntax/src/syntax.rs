@@ -121,6 +121,10 @@ define_syntax_kinds! {
     PAREN_EXPR,
     /// A prefix operator application (`-x`, `+x`, `!x`, `...x`).
     PREFIX_EXPR,
+    /// An `->` application (`sig -> body`, `key -> value`). Kept distinct from
+    /// `BIN_EXPR` so the CST lowering can split it into a function definition or
+    /// a generic arrow.
+    ARROW_EXPR,
     /// A binary operator application; `;` and `,` chains are binary too.
     BIN_EXPR,
     /// The top-level node covering the whole source.

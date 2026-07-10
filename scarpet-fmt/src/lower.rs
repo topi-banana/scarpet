@@ -55,10 +55,10 @@ impl Lowerer<'_> {
         match &cst.kind {
             CstKind::Number(s) | CstKind::Str(s) | CstKind::Ident(s) => text(s.to_string()),
             CstKind::Unary { op, operand } => self.unary(*op, operand),
+            CstKind::FunctionDef { .. } | CstKind::Arrow { .. } => self.arrow_chain(cst),
             CstKind::Binary { op, lhs, rhs } => match *op {
                 BinOp::Comma => self.comma_chain(cst),
                 BinOp::Semi => self.semi_chain(cst),
-                BinOp::Arrow => self.arrow_chain(cst),
                 BinOp::Get => self.tight(*op, lhs, rhs),
                 _ => self.spaced(*op, lhs, rhs),
             },
@@ -186,9 +186,10 @@ impl Lowerer<'_> {
     /// A right-associative `->` chain (`a -> b -> c`). The arrow stays on the
     /// signature line; the RHS handles its own breaking. The final operand is the
     /// body, lowered via [`Lowerer::arrow_body`] so its opening delimiter can hug
-    /// the arrow.
+    /// the arrow. Both [`CstKind::FunctionDef`] and [`CstKind::Arrow`] links are
+    /// flattened together — they render identically.
     fn arrow_chain(&self, cst: &Cst) -> Doc {
-        let parts = flatten_right(BinOp::Arrow, cst);
+        let parts = flatten_arrow(cst);
         let last = parts.len() - 1;
         let docs = parts.into_iter().enumerate().map(|(i, p)| {
             if i == last {
@@ -464,21 +465,27 @@ fn flatten_left<'a, 's>(op: BinOp, cst: &'a Cst<'s>) -> Vec<&'a Cst<'s>> {
     out
 }
 
-/// Collect the operands of a right-nested chain of `op` (`a op (b op c)` →
-/// `[a, b, c]`).
-fn flatten_right<'a, 's>(op: BinOp, cst: &'a Cst<'s>) -> Vec<&'a Cst<'s>> {
+/// Collect the operands of a right-nested `->` chain (`a -> b -> c` →
+/// `[a, b, c]`), treating both [`CstKind::FunctionDef`] (a definition whose LHS
+/// is a call signature) and [`CstKind::Arrow`] (a map entry / generic arrow) as
+/// links — the two format identically, so a mixed chain flattens uniformly.
+fn flatten_arrow<'a, 's>(cst: &'a Cst<'s>) -> Vec<&'a Cst<'s>> {
     let mut out = Vec::new();
     let mut cur = cst;
     loop {
-        if let CstKind::Binary { op: o, lhs, rhs } = &cur.kind
-            && *o == op
-        {
-            out.push(lhs.as_ref());
-            cur = rhs.as_ref();
-            continue;
-        }
-        out.push(cur);
-        break;
+        // A `FunctionDef` splits into signature/body, a generic `Arrow` into
+        // lhs/rhs; both render as `head -> tail`, so a mixed chain flattens the
+        // same way.
+        let (head, tail) = match &cur.kind {
+            CstKind::FunctionDef { signature, body } => (signature, body),
+            CstKind::Arrow { lhs, rhs } => (lhs, rhs),
+            _ => {
+                out.push(cur);
+                break;
+            }
+        };
+        out.push(head.as_ref());
+        cur = tail.as_ref();
     }
     out
 }
@@ -506,7 +513,6 @@ fn bin_op_str(op: BinOp) -> &'static str {
         BinOp::Assign => "=",
         BinOp::AddAssign => "+=",
         BinOp::Swap => "<>",
-        BinOp::Arrow => "->",
         BinOp::Semi => ";",
         BinOp::Comma => ",",
     }
