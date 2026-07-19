@@ -347,8 +347,12 @@ impl AstNode for DefineFunction {
 }
 
 impl DefineFunction {
-    pub fn signature(&self) -> Option<Expr> {
-        support::nth_child(&self.syntax, 0)
+    pub fn name(&self) -> Option<NameRef> {
+        support::child(&self.syntax)
+    }
+
+    pub fn args(&self) -> Option<ArgList> {
+        support::child(&self.syntax)
     }
 
     pub fn arrow_token(&self) -> Option<SyntaxToken> {

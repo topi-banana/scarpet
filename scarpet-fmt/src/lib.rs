@@ -156,12 +156,16 @@ mod corpus {
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
 
-    /// Files whose Scarpet source doesn't parse (upstream typos). Mirrors the
+    /// Files whose Scarpet source is not accepted by the parser. Mirrors the
     /// list in `scarpet-syntax`'s corpus runner; these are skipped.
     const KNOWN_BAD: &[&str] = &[
         "gnembon/scarpet/programs/survival/portalorient.sc",
         "gnembon/scarpet/programs/survival/rifts/rifts.sc",
         "Ghoulboy78/Scarpet-edit/se.sc",
+        "51mayday/ScarpetScripts/geo_v0.2.1_dev.sc",
+        "CommandLeo/scarpet/programs/getallitems.sc",
+        "CommandLeo/scarpet/programs/randomizer.sc",
+        "CommandLeo/scarpet/programs/stx.sc",
     ];
 
     fn corpus_root() -> PathBuf {

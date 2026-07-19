@@ -20,9 +20,9 @@
 //!   appended onto the preceding node's leading.
 //!
 //! The `->` operator never reaches this module as a binary op: the parser
-//! already decided, from context alone, whether it is a function definition
-//! (`DEFINE_FUNCTION`, anywhere) or a map entry's key/value arrow (folded
-//! into the item's `MAP_ENTRY` node). Both lower tag-for-tag — to
+//! accepts either a call-shaped function definition (`DEFINE_FUNCTION`) or a
+//! map entry's key/value arrow (folded into the item's `MAP_ENTRY` node). Both
+//! lower tag-for-tag — to
 //! [`CstKind::DefineFunction`] and [`CstKind::MapEntry`] — and their trivia
 //! routes exactly as the old `->` binary did.
 //!
@@ -81,12 +81,12 @@ pub enum CstKind<'s> {
     Map(Vec<Cst<'s>>),
     Paren(Box<Cst<'s>>),
     Empty,
-    /// `signature -> body` — a function definition: any `->` outside the top
-    /// level of a map item, as decided by the parser. The signature is
-    /// *semantically* a call `name(params)`; the AST lowering rejects any
-    /// other shape, so no def-vs-entry judgment happens after the parse.
+    /// `name(args) -> body` — a function definition. The parser only creates
+    /// this node for a call-shaped signature; a map item's top-level arrow is
+    /// represented by [`CstKind::MapEntry`] instead.
     DefineFunction {
-        signature: Box<Cst<'s>>,
+        name: &'s str,
+        args: Vec<Cst<'s>>,
         body: Box<Cst<'s>>,
     },
     /// One item of a map literal (`{…}` / `m(…)`): a bare `key`, or the
@@ -152,8 +152,9 @@ pub fn strip_trivia<'s>(cst: &Cst<'s>) -> Cst<'s> {
         CstKind::List(items) => CstKind::List(items.iter().map(strip_trivia).collect()),
         CstKind::Map(items) => CstKind::Map(items.iter().map(strip_trivia).collect()),
         CstKind::Paren(inner) => CstKind::Paren(Box::new(strip_trivia(inner))),
-        CstKind::DefineFunction { signature, body } => CstKind::DefineFunction {
-            signature: Box::new(strip_trivia(signature)),
+        CstKind::DefineFunction { name, args, body } => CstKind::DefineFunction {
+            name,
+            args: args.iter().map(strip_trivia).collect(),
             body: Box::new(strip_trivia(body)),
         },
         CstKind::MapEntry { key, value } => CstKind::MapEntry {
@@ -347,16 +348,55 @@ impl<'s> Conv<'s> {
         })
     }
 
-    /// A function definition (a dedicated `DEFINE_FUNCTION`, always a single
-    /// operator — right-associativity puts any further `->` inside the body
-    /// node). Trivia routes via [`Self::infix_operands`], exactly as the old
-    /// `->` binary did.
+    /// A function definition. Unlike a call, its `NAME_REF` and `ARG_LIST` are
+    /// direct children. Trivia around `->` follows the same route as other
+    /// infix operators; trivia between the name and `(` remains CST-invisible.
     fn define_function(&self, node: &SyntaxNode) -> Cst<'s> {
-        let (signature, _, body) = self
-            .infix_operands(node)
+        let elems: Vec<SyntaxElement> = node.children_with_tokens().collect();
+        let name_at = elems
+            .iter()
+            .position(|element| {
+                element
+                    .as_node()
+                    .is_some_and(|node| node.kind() == SyntaxKind::NAME_REF)
+            })
+            .expect("a definition has a name");
+        let args_at = elems
+            .iter()
+            .position(|element| {
+                element
+                    .as_node()
+                    .is_some_and(|node| node.kind() == SyntaxKind::ARG_LIST)
+            })
+            .expect("a definition has an argument list");
+        let body_at = elems
+            .iter()
+            .rposition(|element| {
+                element
+                    .as_node()
+                    .is_some_and(|node| node.kind() != SyntaxKind::ARG_LIST)
+            })
+            .expect("a definition has a body");
+        let arrow_at = elems[args_at + 1..body_at]
+            .iter()
+            .position(|element| {
+                element
+                    .as_token()
+                    .is_some_and(|token| token.kind() == SyntaxKind::ARROW)
+            })
+            .map(|index| index + args_at + 1)
             .expect("a definition has its `->`");
+
+        let name_node = elems[name_at].as_node().unwrap();
+        let name_token = name_node.first_token().expect("a name wraps its token");
+        let arg_list = elems[args_at].as_node().unwrap();
+        let mut body = self.expr(elems[body_at].as_node().unwrap());
+        prepend_deep(&mut body, self.band(&elems[arrow_at + 1..body_at]));
+        body = body.with_leading(self.band(&elems[args_at + 1..arrow_at]));
+
         Cst::bare(CstKind::DefineFunction {
-            signature: Box::new(signature),
+            name: self.text(&name_token),
+            args: self.args(arg_list),
             body: Box::new(body),
         })
     }

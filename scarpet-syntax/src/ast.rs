@@ -11,7 +11,7 @@
 //!
 //! - `,` → [`Args`]`(Vec<Code>)` — argument / element lists, paren bodies, root
 //! - `;` → [`Code`]`(Vec<Expr>)` — a statement sequence
-//! - `->` → [`Expr`] — the parser already tagged every `->` at this level a
+//! - `->` → [`Expr`] — the parser tags every accepted `->` at this level a
 //!   function definition ([`CstKind::DefineFunction`] → [`Expr::Def`]); a map
 //!   item's key/value arrow never reaches this level (it lowers with the map,
 //!   as a [`MapEntry`])
@@ -30,11 +30,9 @@
 //!
 //! - A function's parameters lower to [`Params`] — a flat list of plain binders,
 //!   `outer(x)`-style [`Capture`]s (each a [`ParamWord`] reserved word), and at
-//!   most one `...rest`. The parser already decided, from context alone, that
-//!   every `->` outside a map item's top level is a definition, so a signature
-//!   that is not a call — or whose "parameters" are not all valid (a literal,
-//!   an index, a nested pattern) — is a [`LowerError::InvalidSignature`]; there
-//!   is nothing to fall back to.
+//!   most one `...rest`. The parser only accepts the call-shaped signature
+//!   `name(args) -> body`; lowering validates that every argument is a valid
+//!   parameter (not a literal, index, or nested pattern).
 //! - An assignment target (the left of `=`/`+=`/`<>`) lowers to [`LValue`] — a
 //!   single [`Place`] (`x`, `var(e)`, `a:b:c`), a [`Destructure`](LValue::Destructure)
 //!   list that may nest and carry at most one `...rest` per
@@ -414,9 +412,9 @@ pub enum MapEntry<'s> {
 /// rather than *where*. Beyond an internal shape no well-formed parse produces,
 /// lowering enforces the executable shape of assignment targets, so a
 /// non-assignable target or a second `...` at one destructuring level is rejected
-/// here rather than at evaluation. Likewise a function definition (any `->`
-/// outside a map item's top level, as the parser tagged it) must carry a valid
-/// signature — a malformed one is an [`InvalidSignature`](Self::InvalidSignature).
+/// here rather than at evaluation. Likewise, every argument in a function
+/// signature must be a valid parameter; a malformed one is an
+/// [`InvalidSignature`](Self::InvalidSignature).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LowerError {
     /// A node shape no well-formed parse produces reached a position that only
@@ -430,9 +428,8 @@ pub enum LowerError {
     /// operator expression, `~` match, or other non-place shape (`1 = 2`,
     /// `a + b = c`, `a ~ b = c`, `[a, 1] = …`).
     NotAssignable,
-    /// The left of a `->` (a function definition) is not a valid signature —
-    /// the shape is not a call, its callee is not a plain name, or a parameter
-    /// is not a variable, an `outer(x)` capture, or the single `...rest`.
+    /// A function parameter is not a variable, an `outer(x)` capture, or the
+    /// single `...rest`.
     InvalidSignature,
 }
 
@@ -449,10 +446,7 @@ impl std::fmt::Display for LowerError {
                 write!(f, "left-hand side is not a valid assignment target")
             }
             LowerError::InvalidSignature => {
-                write!(
-                    f,
-                    "left-hand side of `->` is not a valid function signature"
-                )
+                write!(f, "function definition has invalid parameters")
             }
         }
     }
@@ -546,25 +540,20 @@ fn collect_semi<'s>(cst: &Cst<'s>, out: &mut Vec<Expr<'s>>) -> Result<(), LowerE
     Ok(())
 }
 
-/// `arrow_chain`: the parser tagged every `->` at this level a function
+/// `arrow_chain`: the parser tagged every accepted `->` at this level a function
 /// definition ([`CstKind::DefineFunction`]) — a map item's key/value arrow
-/// lowers with the map instead (see [`MapEntry`]). The signature must be a
-/// call with a valid parameter list; anything else is a
-/// [`LowerError::InvalidSignature`]. A non-`->` node falls through to the
-/// assignment level.
+/// lowers with the map instead (see [`MapEntry`]). The parser has already
+/// guaranteed the `name(args)` shape; lowering only validates the parameters.
+/// A non-`->` node falls through to the assignment level.
 impl<'a, 's> TryFrom<&'a Cst<'s>> for Expr<'s> {
     type Error = LowerError;
     fn try_from(cst: &'a Cst<'s>) -> Result<Self, LowerError> {
         match &cst.kind {
-            CstKind::DefineFunction { signature, body } => {
-                let (name, params) =
-                    signature_params(signature).ok_or(LowerError::InvalidSignature)?;
-                Ok(Expr::Def {
-                    name,
-                    params,
-                    body: Box::new(Expr::try_from(body.as_ref())?),
-                })
-            }
+            CstKind::DefineFunction { name, args, body } => Ok(Expr::Def {
+                name,
+                params: lower_params(args).ok_or(LowerError::InvalidSignature)?,
+                body: Box::new(Expr::try_from(body.as_ref())?),
+            }),
             _ => Ok(Expr::Assign(Assign::try_from(cst)?)),
         }
     }
@@ -680,28 +669,12 @@ fn lower_lpatterns<'s>(items: &[Cst<'s>]) -> Result<LPatterns<'s>, LowerError> {
     Ok(LPatterns { before, rest })
 }
 
-/// Read a definition's signature — a call `name(params)` whose callee is an
-/// identifier and whose arguments form a valid [`Params`] — returning its
-/// `(name, params)`, or `None` for any other shape (`str('x', _) -> …`,
-/// `f(a:0) -> …`, `'k' -> …`), which the `Expr` lowering reports as a
-/// [`LowerError::InvalidSignature`].
-fn signature_params<'s>(sig: &Cst<'s>) -> Option<(&'s str, Params<'s>)> {
-    let CstKind::Call { callee, args } = &sig.kind else {
-        return None;
-    };
-    let CstKind::Ident(name) = &callee.kind else {
-        return None;
-    };
-    Some((name, lower_params(args)?))
-}
-
 /// Try to lower the `,`-separated arguments of a definition's call LHS as a
 /// function signature ([`Params`]), dropping phantom `Empty` slots. Each
 /// parameter must be a plain binder, an `outer(x)`-style [`Capture`] (a
 /// [`ParamWord`]), or the single `...rest`. Returns `None` if any of them is
 /// not — a literal, an index, a nested pattern, an unknown reserved word, or a
-/// second `...` — in which case the signature is invalid (see
-/// [`signature_params`]).
+/// second `...` — in which case the signature is invalid.
 fn lower_params<'s>(items: &[Cst<'s>]) -> Option<Params<'s>> {
     let mut fixed = Vec::new();
     let mut captures = Vec::new();
@@ -1329,11 +1302,9 @@ mod tests {
     }
 
     #[test]
-    fn non_signature_call_arrow_is_an_error() {
-        // The parser tagged these `->`s definitions (they are not map items),
-        // so a call LHS whose "parameters" are not a valid signature is a hard
-        // error. Scarpet allows only variables / `outer` / `...rest` in a
-        // signature, so a literal arg (`str('add', _)`), an index arg
+    fn invalid_function_parameters_are_an_error() {
+        // Scarpet allows only variables / `outer` / `...rest` in a signature,
+        // so a literal arg (`str('add', _)`), an index arg
         // (`f(a:0)`), or an unknown reserved word (`f(inner(x))`) all fail.
         for src in ["str('add', _) -> x", "f(a:0) -> x", "f(inner(x)) -> x"] {
             assert_eq!(lower_err(src), LowerError::InvalidSignature, "{src}");
@@ -1356,14 +1327,6 @@ mod tests {
             }]
         );
         assert!(params.rest.is_none());
-    }
-
-    #[test]
-    fn arrow_with_non_call_lhs_is_an_error() {
-        // Outside a map item's top level every `->` is a definition, so a
-        // non-call LHS is an invalid signature — there is no generic-arrow
-        // fallback.
-        assert_eq!(lower_err("'k' -> v"), LowerError::InvalidSignature);
     }
 
     // --- assignments ---------------------------------------------------------
@@ -1643,8 +1606,9 @@ mod tests {
         assert_eq!(exprs.len(), 2);
         assert!(matches!(exprs[0], Expr::Def { .. }));
 
-        // The same shape with a non-signature arrow is an invalid definition.
-        assert_eq!(lower_err("{'k' -> v; w}"), LowerError::InvalidSignature);
+        // A non-call arrow in this position is rejected by the parser rather
+        // than reaching AST lowering.
+        assert!(parse_source("{'k' -> v; w}").is_err());
     }
 
     // --- trivia / empties ----------------------------------------------------
@@ -1687,22 +1651,12 @@ mod corpus {
     use crate::parser::parse_source;
     use std::path::{Path, PathBuf};
 
-    /// Files whose Scarpet source doesn't parse (upstream typos), so there is no
+    /// Files whose Scarpet source is not accepted by the parser, so there is no
     /// CST to lower. Mirrors the list in `scarpet-fmt`.
     const KNOWN_BAD: &[&str] = &[
         "gnembon/scarpet/programs/survival/portalorient.sc",
         "gnembon/scarpet/programs/survival/rifts/rifts.sc",
         "Ghoulboy78/Scarpet-edit/se.sc",
-    ];
-
-    /// Files that parse but use `->` in ways the *static* map-entry rule cannot
-    /// lower: a key→value pair inside a call's lazily-evaluated arguments
-    /// (`if(nbt, 'tag' -> nbt, ...{})` — fabric-carpet propagates its `MAPDEF`
-    /// context into the branch at runtime) or a bare-name lambda
-    /// (`map(l, _ -> …)`). Both parse as a `DefineFunction` whose signature is
-    /// not a call, an [`LowerError::InvalidSignature`]. They still parse and
-    /// format fine; only the AST lowering rejects them.
-    const KNOWN_UNLOWERABLE: &[&str] = &[
         "51mayday/ScarpetScripts/geo_v0.2.1_dev.sc",
         "CommandLeo/scarpet/programs/getallitems.sc",
         "CommandLeo/scarpet/programs/randomizer.sc",
@@ -1750,7 +1704,7 @@ mod corpus {
                 .unwrap_or(f)
                 .to_string_lossy()
                 .replace('\\', "/");
-            if KNOWN_BAD.contains(&rel.as_str()) || KNOWN_UNLOWERABLE.contains(&rel.as_str()) {
+            if KNOWN_BAD.contains(&rel.as_str()) {
                 continue;
             }
             let Ok(src) = std::fs::read_to_string(f) else {

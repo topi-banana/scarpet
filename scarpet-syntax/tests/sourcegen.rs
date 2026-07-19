@@ -97,7 +97,7 @@ fn generate(grammar: &Grammar) -> String {
             let mut fields = Vec::new();
             lower_rule(grammar, &data.rule, None, &mut fields);
             dedup_identical_fields(&mut fields);
-            dedup_node_fields(&mut fields);
+            disambiguate_node_fields(grammar, &mut fields);
             generate_struct(&mut out, &data.name, &fields);
         }
     }
@@ -331,9 +331,11 @@ fn dedup_identical_fields(fields: &mut Vec<Field>) {
     });
 }
 
-/// When one node type fills several single-child fields (`lhs`/`rhs`), switch
-/// them to positional `nth_child` lookups.
-fn dedup_node_fields(fields: &mut [Field]) {
+/// Disambiguate single-child accessors that can cast the same direct child.
+/// Besides exact repeats (`lhs:Expr rhs:Expr`), a concrete node can precede a
+/// sum type that contains it (`name:NameRef body:Expr`), so the latter must skip
+/// the concrete child.
+fn disambiguate_node_fields(grammar: &Grammar, fields: &mut [Field]) {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for field in fields.iter() {
         if let Field::Node {
@@ -357,6 +359,61 @@ fn dedup_node_fields(fields: &mut [Field]) {
             *index = Some(*next);
             *next += 1;
         }
+    }
+
+    for current in 0..fields.len() {
+        let Field::Node {
+            ty,
+            many: false,
+            index,
+            ..
+        } = &fields[current]
+        else {
+            continue;
+        };
+        if index.is_some() {
+            continue;
+        }
+        let target_kinds = cast_kinds(grammar, ty);
+        let preceding = fields[..current]
+            .iter()
+            .filter(|field| {
+                let Field::Node {
+                    ty, many: false, ..
+                } = field
+                else {
+                    return false;
+                };
+                cast_kinds(grammar, ty)
+                    .iter()
+                    .all(|kind| target_kinds.contains(kind))
+            })
+            .count();
+        if preceding > 0
+            && let Field::Node { index, .. } = &mut fields[current]
+        {
+            *index = Some(preceding);
+        }
+    }
+}
+
+/// Concrete node names accepted by the generated `AstNode::cast` for `ty`.
+fn cast_kinds(grammar: &Grammar, ty: &str) -> Vec<String> {
+    let node = grammar
+        .iter()
+        .find(|node| grammar[*node].name == ty)
+        .expect("field type belongs to the grammar");
+    match &grammar[node].rule {
+        Rule::Alt(variants) if variants.iter().all(|rule| matches!(rule, Rule::Node(_))) => {
+            variants
+                .iter()
+                .map(|rule| match rule {
+                    Rule::Node(node) => grammar[*node].name.clone(),
+                    _ => unreachable!("guard restricts variants to nodes"),
+                })
+                .collect()
+        }
+        _ => vec![ty.to_string()],
     }
 }
 

@@ -62,11 +62,9 @@ ParenExpr = '(' Expr ')'
 PrefixExpr = op:('-' | '+' | '!' | '...') Expr
 
 // Any `->` outside the top level of a map item — always a function
-// definition. The `->` operator lives in its own node rather than `BinExpr`'s
-// operator list, so it never flows through the binary-operator machinery.
-// The signature is semantically a call `name(params)`; the AST lowering
-// (`src/ast.rs`) rejects any other shape.
-DefineFunction = signature:Expr '->' body:Expr
+// definition. The signature has the same children as a call, but is encoded
+// directly so a non-call left-hand side is rejected by the parser.
+DefineFunction = name:NameRef args:ArgList '->' body:Expr
 
 BinExpr =
   lhs:Expr
