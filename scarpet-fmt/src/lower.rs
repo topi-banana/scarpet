@@ -197,9 +197,14 @@ impl Lowerer<'_> {
         let last = parts.len() - 1;
         let docs = parts.into_iter().enumerate().map(|(i, p)| {
             if i == last {
-                self.arrow_body(p)
-            } else {
-                self.expr(p)
+                let ArrowPart::Expr(body) = p else {
+                    unreachable!("an arrow chain ends in its body")
+                };
+                return self.arrow_body(body);
+            }
+            match p {
+                ArrowPart::Expr(expr) => self.expr(expr),
+                ArrowPart::Signature { name, args } => self.named_call(name, args),
             }
         });
         join(docs, text(" -> "))
@@ -224,6 +229,15 @@ impl Lowerer<'_> {
     /// A call `callee(args)`. The argument list hugs the callee, so under
     /// [`BraceStyle::NextLine`] its `(` moves onto its own line.
     fn call(&self, callee: &Cst, args: &[Cst]) -> Doc {
+        self.call_with_head(self.expr(callee), args)
+    }
+
+    /// Render the call-shaped signature stored directly on a function node.
+    fn named_call(&self, name: &str, args: &[Cst]) -> Doc {
+        self.call_with_head(text(name.to_string()), args)
+    }
+
+    fn call_with_head(&self, head: Doc, args: &[Cst]) -> Doc {
         // With `overflow_delimited_expr`, a call whose last argument is a
         // block-like delimited expression keeps its leading args on the opening
         // line and lets that block hug the closing `)` (see `call_hug_last`). A
@@ -234,9 +248,9 @@ impl Lowerer<'_> {
             && is_huggable_last(last)
             && !args.iter().any(has_leading_comment)
         {
-            return self.call_hug_last(callee, leading, last);
+            return self.call_hug_last(head, leading, last);
         }
-        concat([self.expr(callee), self.collection("(", args, ")", true)])
+        concat([head, self.collection("(", args, ")", true)])
     }
 
     /// Lower a call whose last argument is a block-like delimited expression
@@ -245,11 +259,11 @@ impl Lowerer<'_> {
     /// `Paren` arg keeps its own `(`…`)` (`foo(x, ( … ))`); a bare `;`-chain
     /// reuses the call's own `(`…`)` as the block delimiters (`loop(count, … )`).
     /// Gated by [`is_huggable_last`].
-    fn call_hug_last(&self, callee: &Cst, leading: &[Cst], last: &Cst) -> Doc {
+    fn call_hug_last(&self, head: Doc, leading: &[Cst], last: &Cst) -> Doc {
         // The leading args plus their separating comma, kept flat in their own
         // group so a wide block does not explode them; they break one-per-line
         // only if they themselves overflow.
-        let head = if leading.is_empty() {
+        let args_head = if leading.is_empty() {
             nil()
         } else {
             concat([
@@ -261,9 +275,9 @@ impl Lowerer<'_> {
         };
         match &last.kind {
             CstKind::Paren(inner) => concat([
-                self.expr(callee),
-                text("("),
                 head,
+                text("("),
+                args_head,
                 // A space before the hugging `(` only when leading args precede it.
                 if leading.is_empty() { nil() } else { space() },
                 self.paren(inner, false),
@@ -274,10 +288,10 @@ impl Lowerer<'_> {
             } => {
                 let stmts = flatten_left(BinOp::Semi, last);
                 concat([
-                    self.expr(callee),
+                    head,
                     group(concat([
                         text("("),
-                        head,
+                        args_head,
                         nest(concat([hardline(), self.statement_seq(&stmts)])),
                         hardline(),
                         text(")"),
@@ -469,30 +483,35 @@ fn flatten_left<'a, 's>(op: BinOp, cst: &'a Cst<'s>) -> Vec<&'a Cst<'s>> {
     out
 }
 
-/// Collect the operands of a right-nested `->` chain (`a -> b -> c` →
-/// `[a, b, c]`), treating both [`CstKind::DefineFunction`] (a definition) and a
-/// pair-[`CstKind::MapEntry`] (a map item's `key -> value`) as links — the two
-/// format identically, so a mixed chain (`{'k' -> f() -> x}`) flattens
-/// uniformly.
-fn flatten_arrow<'a, 's>(cst: &'a Cst<'s>) -> Vec<&'a Cst<'s>> {
+enum ArrowPart<'a, 's> {
+    Expr(&'a Cst<'s>),
+    Signature { name: &'s str, args: &'a [Cst<'s>] },
+}
+
+/// Collect the operands of a right-nested `->` chain, treating both function
+/// definitions and pair map entries as links. A definition's direct `name` and
+/// `args` fields are retained as a synthetic call-shaped formatting part.
+fn flatten_arrow<'a, 's>(cst: &'a Cst<'s>) -> Vec<ArrowPart<'a, 's>> {
     let mut out = Vec::new();
     let mut cur = cst;
     loop {
-        // A `DefineFunction` splits into signature/body, a pair entry into
-        // key/value; both render as `head -> tail`, so a mixed chain flattens
-        // the same way.
-        let (head, tail) = match &cur.kind {
-            CstKind::DefineFunction { signature, body } => (signature, body),
+        let tail = match &cur.kind {
+            CstKind::DefineFunction { name, args, body } => {
+                out.push(ArrowPart::Signature { name, args });
+                body
+            }
             CstKind::MapEntry {
                 key,
                 value: Some(value),
-            } => (key, value),
+            } => {
+                out.push(ArrowPart::Expr(key));
+                value
+            }
             _ => {
-                out.push(cur);
+                out.push(ArrowPart::Expr(cur));
                 break;
             }
         };
-        out.push(head.as_ref());
         cur = tail.as_ref();
     }
     out
@@ -686,8 +705,8 @@ mod tests {
 
     #[test]
     fn arrow_is_spaced() {
-        assert_eq!(fmt("a->b"), "a -> b\n");
-        assert_eq!(fmt("a->b->c"), "a -> b -> c\n");
+        assert_eq!(fmt("f()->b"), "f() -> b\n");
+        assert_eq!(fmt("f()->g()->c"), "f() -> g() -> c\n");
     }
 
     #[test]
@@ -728,8 +747,8 @@ mod tests {
     fn map_entry_with_statement_chain_is_stable() {
         // A `;`-chain item is a bare key; its statement layout reaches a
         // fixpoint in one pass.
-        let once = fmt("{k -> v; w}");
-        assert_eq!(once, "{\n    k -> v;\n    w;,\n}\n");
+        let once = fmt("{f() -> v; w}");
+        assert_eq!(once, "{\n    f() -> v;\n    w;,\n}\n");
         assert_eq!(fmt(&once), once);
     }
 

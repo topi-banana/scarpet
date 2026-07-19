@@ -127,4 +127,24 @@ mod tests {
         };
         assert_eq!(mul.op_token().expect("op").text(), "*");
     }
+
+    #[test]
+    fn function_definition_owns_its_signature_parts() {
+        let tree = parse("foo(a, b) -> a + b").expect("parse definition");
+        let root = Root::cast(tree).expect("root casts");
+        let Some(Expr::DefineFunction(definition)) = root.expr() else {
+            panic!("expected a function definition");
+        };
+        assert_eq!(
+            definition
+                .name()
+                .expect("name")
+                .ident_token()
+                .expect("identifier")
+                .text(),
+            "foo"
+        );
+        assert_eq!(definition.args().expect("argument list").args().count(), 2);
+        assert!(matches!(definition.body(), Some(Expr::BinExpr(_))));
+    }
 }

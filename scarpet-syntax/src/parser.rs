@@ -279,7 +279,8 @@ fn delim_label(k: SyntaxKind) -> &'static str {
 //   top         = comma_chain
 //   comma_chain = seq_chain   (`,` seq_chain)*
 //   seq_chain   = arrow_chain (`;` arrow_chain)*
-//   arrow_chain = assign (`->` arrow_chain)?
+//   arrow_chain = function_definition | assign
+//   function_definition = ident `(` arg_list `)` `->` arrow_chain
 //   assign      = lor    (`=` | `+=` | `<>` assign)?
 //   lor         = land   (`||` land)*
 //   land        = equality (`&&` equality)*
@@ -531,15 +532,22 @@ impl<'s> Parser<'s> {
     /// trivia rules expect them.
     fn parse_map_item(&mut self) -> PResult {
         let cp = self.checkpoint();
-        self.parse_assign()?;
-        if self.at(SyntaxKind::ARROW) {
-            self.bump();
-            // The value is a full arrow chain; nested `->`s are definitions.
+        let continues = self.item_has_continuing_semi();
+        if continues && self.at_function_signature() {
+            // `f(args) -> body; next` starts with a definition, so the whole
+            // map item is a bare `;`-chain rather than a key/value pair.
             self.parse_arrow()?;
-            if self.at_continuing_semi() {
-                // `k -> v; w` — the arrow heads a statement of the entry's
-                // `;`-chain, so it is a definition, not the entry's `->`.
-                self.wrap(cp, SyntaxKind::DEFINE_FUNCTION);
+        } else {
+            self.parse_assign()?;
+            if self.at(SyntaxKind::ARROW) {
+                if continues {
+                    // The arrow would be a definition because `;` continues
+                    // the item, but its left side was not `name(args)`.
+                    return Err(self.err_here(vec!["function signature".to_string()]));
+                }
+                self.bump();
+                // The value is a full arrow chain; nested `->`s are definitions.
+                self.parse_arrow()?;
             }
         }
         self.parse_semi_links(cp)?;
@@ -549,6 +557,42 @@ impl<'s> Parser<'s> {
             self.bump();
         }
         Ok(())
+    }
+
+    /// Whether this map item contains a top-level `;` followed by another
+    /// statement. Separators inside nested delimiters do not continue the map
+    /// item, and a run immediately before `,` or the closer is only trailing.
+    fn item_has_continuing_semi(&self) -> bool {
+        let mut tokens = self.tokens[self.pos..]
+            .iter()
+            .filter(|token| !token.kind.is_trivia())
+            .peekable();
+        let mut depth = 0;
+        while let Some(token) = tokens.next() {
+            match token.kind {
+                kind if kind.is_opener() => depth += 1,
+                kind if kind.is_closer() => {
+                    if depth == 0 {
+                        return false;
+                    }
+                    depth -= 1;
+                }
+                SyntaxKind::COMMA if depth == 0 => return false,
+                SyntaxKind::SEMICOLON if depth == 0 => {
+                    while tokens
+                        .peek()
+                        .is_some_and(|token| token.kind == SyntaxKind::SEMICOLON)
+                    {
+                        tokens.next();
+                    }
+                    return tokens.peek().is_some_and(|token| {
+                        token.kind != SyntaxKind::COMMA && !token.kind.is_closer()
+                    });
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     /// The `;`-chain links after a statement parsed at `cp`: each continuing
@@ -585,19 +629,58 @@ impl<'s> Parser<'s> {
                 .is_some_and(|t| t.kind != SyntaxKind::COMMA && !t.kind.is_closer())
     }
 
-    /// `arrow_chain` (`->`; right-associative). Unlike the other binary levels
-    /// this wraps a dedicated [`SyntaxKind::DEFINE_FUNCTION`] node rather than
-    /// a generic `BIN_EXPR`: `->` is the function-definition operator, so it
-    /// never flows through the binary-operator machinery. The one context
-    /// where `->` is *not* a definition — the top level of a map item — is
-    /// handled by [`Self::parse_map_item`], which folds it into the item's
-    /// `MAP_ENTRY` node instead.
+    /// `arrow_chain` (`->`; right-associative). A definition starts with the
+    /// call-shaped signature `name(args)`; its [`SyntaxKind::DEFINE_FUNCTION`]
+    /// node owns the `NAME_REF` and `ARG_LIST` directly. The one context where
+    /// `->` is *not* a definition — the top level of a map item — is handled by
+    /// [`Self::parse_map_item`], which folds it into the item's `MAP_ENTRY` node.
     fn parse_arrow(&mut self) -> PResult {
-        self.parse_right_assoc(
-            &[SyntaxKind::ARROW],
-            SyntaxKind::DEFINE_FUNCTION,
-            Self::parse_assign,
-        )
+        if self.at_function_signature() {
+            self.start_node(SyntaxKind::DEFINE_FUNCTION);
+            self.parse_name_ref();
+            self.parse_delimited(SyntaxKind::ARG_LIST, SyntaxKind::R_PAREN, ItemMode::Expr)?;
+            self.bump();
+            self.parse_arrow()?;
+            self.finish_node();
+            return Ok(());
+        }
+
+        self.parse_assign()?;
+        if self.at(SyntaxKind::ARROW) {
+            return Err(self.err_here(vec!["function signature".to_string()]));
+        }
+        Ok(())
+    }
+
+    /// Whether the next semantic tokens are `name(...) ->`. Delimiters have
+    /// already been validated, so balancing the signature's `(` is sufficient
+    /// to find the token immediately after its argument list.
+    fn at_function_signature(&self) -> bool {
+        let mut tokens = self.tokens[self.pos..]
+            .iter()
+            .filter(|token| !token.kind.is_trivia());
+        let Some(name) = tokens.next() else {
+            return false;
+        };
+        if name.kind != SyntaxKind::IDENT
+            || LiteralConstructor::from_name(name.text).is_some()
+            || tokens.next().map(|token| token.kind) != Some(SyntaxKind::L_PAREN)
+        {
+            return false;
+        }
+
+        let mut depth = 1;
+        for token in tokens.by_ref() {
+            if token.kind.is_opener() {
+                depth += 1;
+            } else if token.kind.is_closer() {
+                depth -= 1;
+                if depth == 0 {
+                    return tokens.next().map(|token| token.kind) == Some(SyntaxKind::ARROW);
+                }
+            }
+        }
+        false
     }
 
     /// `assign` (`=`, `+=`, `<>`; right-associative).
@@ -723,9 +806,7 @@ impl<'s> Parser<'s> {
                     return Ok(());
                 }
                 let cp = self.checkpoint();
-                self.start_node(SyntaxKind::NAME_REF);
-                self.bump();
-                self.finish_node();
+                self.parse_name_ref();
                 if self.at(SyntaxKind::L_PAREN) {
                     self.builder.start_node_at(cp, SyntaxKind::CALL_EXPR.into());
                     self.parse_delimited(
@@ -758,6 +839,12 @@ impl<'s> Parser<'s> {
             ),
             _ => Err(self.err_here(vec!["expression".to_string()])),
         }
+    }
+
+    fn parse_name_ref(&mut self) {
+        self.start_node(SyntaxKind::NAME_REF);
+        self.bump();
+        self.finish_node();
     }
 
     /// A bracketed argument list: a call's `( … )`, a list's `[ … ]`, a map's
@@ -863,9 +950,10 @@ mod tests {
             rhs: Box::new(rhs),
         })
     }
-    fn fndef<'s>(signature: Cst<'s>, body: Cst<'s>) -> Cst<'s> {
+    fn fndef<'s>(name: &'s str, args: Vec<Cst<'s>>, body: Cst<'s>) -> Cst<'s> {
         Cst::bare(CstKind::DefineFunction {
-            signature: Box::new(signature),
+            name,
+            args,
             body: Box::new(body),
         })
     }
@@ -933,17 +1021,21 @@ mod tests {
 
     #[test]
     fn function_definition() {
-        // Any `->` outside a map item's top level is a `DefineFunction`.
         assert_eq!(
             parse("foo(a, b) -> a + b"),
             fndef(
-                call("foo", vec![id("a"), id("b")]),
+                "foo",
+                vec![id("a"), id("b")],
                 bin(BinOp::Add, id("a"), id("b")),
             )
         );
-        // Even with a non-signature LHS — validity is the AST lowering's
-        // concern, not the parser's.
-        assert_eq!(parse("'k' -> v"), fndef(str_("'k'"), id("v")));
+    }
+
+    #[test]
+    fn function_definition_requires_a_call_shaped_signature() {
+        for src in ["'k' -> v", "name -> v", "(f()) -> v", "f() + x -> v"] {
+            assert!(parse_source(src).is_err(), "accepted {src:?}");
+        }
     }
 
     #[test]
@@ -992,9 +1084,10 @@ mod tests {
         // Only the top level of a map item is entry context: an arrow nested
         // in a call's arguments — even inside a map — is a definition…
         assert_eq!(
-            parse("{f(k->v)}"),
-            map(vec![key_only(call("f", vec![fndef(id("k"), id("v"))]))])
+            parse("{f(g()->v)}"),
+            map(vec![key_only(call("f", vec![fndef("g", vec![], id("v"))]))])
         );
+        assert!(parse_source("{f(k->v)}").is_err());
         // …while an entry's value containing a map re-enters entry context.
         assert_eq!(
             parse("{k -> {a -> b}}"),
@@ -1008,13 +1101,14 @@ mod tests {
         // entry is a bare key (a `;`-chain) and the arrow inside it is an
         // ordinary definition.
         assert_eq!(
-            parse("{k -> v; w}"),
+            parse("{f() -> v; w}"),
             map(vec![key_only(bin(
                 BinOp::Semi,
-                fndef(id("k"), id("v")),
+                fndef("f", vec![], id("v")),
                 id("w"),
             ))])
         );
+        assert!(parse_source("{k -> v; w}").is_err());
         // A *trailing* `;` run does not continue the item: the pair stays.
         assert_eq!(parse("{k -> v;}"), map(vec![pair(id("k"), id("v"))]));
     }
@@ -1022,14 +1116,14 @@ mod tests {
     #[test]
     fn semi_binds_looser_than_arrow_in_map() {
         // `;` (seq_chain) sits outside `->` (arrow_chain), so a map entry
-        // `{1+2 ; 'a'->3*4}` groups as `{(1+2) ; ('a'->(3*4))}`. This mirrors
+        // `{1+2; f()->3*4}` groups as `{(1+2); (f()->(3*4))}`. This mirrors
         // Scarpet, where `->` (precedence 2) binds tighter than `;` (1).
         assert_eq!(
-            parse("{1+2;'a'->3*4}"),
+            parse("{1+2;f()->3*4}"),
             map(vec![key_only(bin(
                 BinOp::Semi,
                 bin(BinOp::Add, num("1"), num("2")),
-                fndef(str_("'a'"), bin(BinOp::Mul, num("3"), num("4"))),
+                fndef("f", vec![], bin(BinOp::Mul, num("3"), num("4"))),
             ))])
         );
     }
@@ -1038,22 +1132,19 @@ mod tests {
     fn arrow_right_assoc() {
         // `->` is right-associative, so `{f()->g()->h()}` groups as
         // `{f() -> (g() -> h())}`. The item-level arrow is the entry's own
-        // pair; the nested one is a definition of `g` (the *key* `f()` is an
-        // ordinary call — context, not signature-validity, decides).
+        // pair; the nested one is a definition of `g` (the key `f()` remains
+        // an ordinary call in map-entry context).
         assert_eq!(
             parse("{f()->g()->h()}"),
             map(vec![pair(
                 call("f", vec![]),
-                fndef(call("g", vec![]), call("h", vec![])),
+                fndef("g", vec![], call("h", vec![])),
             )])
         );
         // Outside a map the same chain is nested definitions.
         assert_eq!(
             parse("f()->g()->h()"),
-            fndef(
-                call("f", vec![]),
-                fndef(call("g", vec![]), call("h", vec![])),
-            )
+            fndef("f", vec![], fndef("g", vec![], call("h", vec![])),)
         );
     }
 
@@ -1109,7 +1200,7 @@ mod tests {
                 "map",
                 vec![
                     list(vec![num("1"), num("2"), num("3")]),
-                    fndef(call("_", vec![id("x")]), bin(BinOp::Mul, id("x"), id("x")),),
+                    fndef("_", vec![id("x")], bin(BinOp::Mul, id("x"), id("x"))),
                 ],
             )
         );
@@ -1119,7 +1210,8 @@ mod tests {
     fn full_source_from_compdisplay() {
         let src = "toggle() -> (\n    print(player(), 'hi');\n);";
         let expected = fndef(
-            call("toggle", vec![]),
+            "toggle",
+            vec![],
             paren(call("print", vec![call("player", vec![]), str_("'hi'")])),
         );
         // Trivia is preserved, so equality after stripping leading lets us

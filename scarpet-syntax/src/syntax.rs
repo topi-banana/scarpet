@@ -121,7 +121,7 @@ define_syntax_kinds! {
     PAREN_EXPR,
     /// A prefix operator application (`-x`, `+x`, `!x`, `...x`).
     PREFIX_EXPR,
-    /// `signature -> body` — any `->` outside the top level of a map item.
+    /// `name(args) -> body` — a function definition.
     DEFINE_FUNCTION,
     /// One item of a map literal: a bare `key`, or the pair `key -> value`.
     MAP_ENTRY,
