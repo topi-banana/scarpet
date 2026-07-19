@@ -105,7 +105,8 @@ jobs:
         run: |
           start=$SECONDS
           # Parse-rate metric (replaces the former corpus binary): format every
-          # example/*.sc, capture the diagnostic of any that fails to parse, and
+          # Scarpet app and library source under example/, capture diagnostics
+          # for parse failures, and
           # render a Markdown report — parse rate plus a <details> list of the
           # failures with their error excerpts — for the job summary and PR
           # comment. A metric, not a gate: it always succeeds, and a few
@@ -125,7 +126,7 @@ jobs:
                 printf '```text\n%s\n```\n\n' "$err"
               } >> fails.md
             fi
-          done < <(find example -name '*.sc' -print0)
+          done < <(find example \( -name '*.sc' -o -name '*.scl' \) -print0)
           parsed=$((total - failed))
           if [ "$total" -gt 0 ]; then
             rate=$(awk "BEGIN { printf \"%.1f\", $parsed / $total * 100 }")

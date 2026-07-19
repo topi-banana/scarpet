@@ -1669,15 +1669,18 @@ mod corpus {
             .join("example")
     }
 
-    fn walk_sc(dir: &Path, out: &mut Vec<PathBuf>) {
+    fn walk_scripts(dir: &Path, out: &mut Vec<PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
         for entry in entries.flatten() {
             let p = entry.path();
             if p.is_dir() {
-                walk_sc(&p, out);
-            } else if p.extension().and_then(|e| e.to_str()) == Some("sc") {
+                walk_scripts(&p, out);
+            } else if matches!(
+                p.extension().and_then(|extension| extension.to_str()),
+                Some("sc" | "scl")
+            ) {
                 out.push(p);
             }
         }
@@ -1694,7 +1697,7 @@ mod corpus {
             return;
         }
         let mut files = Vec::new();
-        walk_sc(&root, &mut files);
+        walk_scripts(&root, &mut files);
         files.sort();
 
         let mut failures = Vec::new();

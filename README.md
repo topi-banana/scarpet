@@ -4,9 +4,9 @@
 
 *English | [日本語](README_jp.md)*
 
-Rust tooling for [Scarpet](https://github.com/gnembon/fabric-carpet/blob/master/docs/scarpet/Documentation.md), the scripting language embedded in the [Carpet](https://github.com/gnembon/fabric-carpet) mod for Minecraft. Scarpet scripts (`.sc` files) drive in-game apps and server extensions; this repository provides a lexer, a trivia-preserving parser, a code formatter, and an experimental evaluator for them.
+Rust tooling for [Scarpet](https://github.com/gnembon/fabric-carpet/blob/master/docs/scarpet/Documentation.md), the scripting language embedded in the [Carpet](https://github.com/gnembon/fabric-carpet) mod for Minecraft. Scarpet source is distributed as apps (`.sc` files) and libraries (`.scl` files) that drive in-game behavior and server extensions; this repository provides a lexer, a trivia-preserving parser, a code formatter, and an experimental evaluator for them.
 
-> **Status:** early. The parser covers the full expression grammar and parses 98.6% of a 220-file real-world corpus; the formatter round-trips that corpus non-destructively. A tree-walking evaluator (`scarpet-vm`) is an early prototype, driven through the CLI's `repl`. APIs are unstable.
+> **Status:** early. The parser covers the full expression grammar and parses nearly all of a real-world corpus; the formatter round-trips that corpus non-destructively. A tree-walking evaluator (`scarpet-vm`) is an early prototype, driven through the CLI's `repl`. APIs are unstable.
 
 ## Workspace layout
 
@@ -153,7 +153,7 @@ The evaluator is an early prototype: it covers arithmetic, comparison and equali
 
 ## The corpus
 
-[`example/`](example) vendors nine community Scarpet repositories as git submodules — 220 `.sc` files in total. They are used two ways:
+[`example/`](example) vendors nine community Scarpet repositories as git submodules. Their `.sc` apps and `.scl` libraries form a corpus used in two ways:
 
 - **Parse rate.** CI's `format parse` step formats every file and reports how many parse. It is a progress metric, not a gate (it always succeeds; a few known upstream syntax errors are expected).
 
