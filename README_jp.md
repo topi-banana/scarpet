@@ -4,9 +4,9 @@
 
 *[English](README.md) | 日本語*
 
-Minecraft の [Carpet](https://github.com/gnembon/fabric-carpet) Mod に組み込まれているスクリプト言語 [Scarpet](https://github.com/gnembon/fabric-carpet/blob/master/docs/scarpet/Documentation.md) のための Rust 製ツール群です。Scarpet スクリプト（`.sc` ファイル）はゲーム内アプリやサーバー拡張を記述するために使われます。本リポジトリはそれらを対象とした字句解析器、トリビア（コメント・改行）を保持する構文解析器、コードフォーマッタ、そして実験的な評価器を提供します。
+Minecraft の [Carpet](https://github.com/gnembon/fabric-carpet) Mod に組み込まれているスクリプト言語 [Scarpet](https://github.com/gnembon/fabric-carpet/blob/master/docs/scarpet/Documentation.md) のための Rust 製ツール群です。Scarpet のソースは、ゲーム内の動作やサーバー拡張を記述するアプリ（`.sc` ファイル）とライブラリ（`.scl` ファイル）として配布されます。本リポジトリはそれらを対象とした字句解析器、トリビア（コメント・改行）を保持する構文解析器、コードフォーマッタ、そして実験的な評価器を提供します。
 
-> **ステータス:** 初期段階。構文解析器は式の文法全体をカバーし、実在する 220 ファイルのコーパスの 98.6% を解析できます。フォーマッタはそのコーパスを非破壊的に往復処理できます。ツリーウォーキング評価器（`scarpet-vm`）は初期プロトタイプで、CLI の `repl` から利用できます。API は未安定です。
+> **ステータス:** 初期段階。構文解析器は式の文法全体をカバーし、実在するコーパスのほぼすべてを解析できます。フォーマッタはそのコーパスを非破壊的に往復処理できます。ツリーウォーキング評価器（`scarpet-vm`）は初期プロトタイプで、CLI の `repl` から利用できます。API は未安定です。
 
 ## ワークスペース構成
 
@@ -153,7 +153,7 @@ Single(Int(16))
 
 ## コーパス
 
-[`example/`](example) はコミュニティ製の Scarpet リポジトリ 9 つを git サブモジュールとして取り込んでおり、合計 220 個の `.sc` ファイルがあります。これらは 2 つの用途で使われます。
+[`example/`](example) はコミュニティ製の Scarpet リポジトリ 9 つを git サブモジュールとして取り込んでいます。その `.sc` アプリと `.scl` ライブラリは、次の 2 つの用途で使うコーパスを構成します。
 
 - **解析率（parse rate）。** CI の `format parse` ステップが全ファイルを整形し、解析できた数を報告します。これはゲートではなく進捗の指標です（常に成功します。既知の上流側の構文エラーが数件あります）。
 
