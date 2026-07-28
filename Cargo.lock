@@ -1117,6 +1117,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "scarpet-hir"
+version = "0.1.0"
+dependencies = [
+ "rowan",
+ "scarpet-syntax",
+]
+
+[[package]]
 name = "scarpet-lsp"
 version = "0.1.0"
 dependencies = [
@@ -1132,6 +1140,7 @@ name = "scarpet-playground"
 version = "0.1.0"
 dependencies = [
  "scarpet-fmt",
+ "scarpet-hir",
  "scarpet-syntax",
  "scarpet-vm",
  "web-sys",
