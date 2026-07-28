@@ -3,11 +3,13 @@
 //! only through callbacks; the tool logic lives in the parent [`editor`](super)
 //! module.
 
+use scarpet_hir::ExprId;
 use web_sys::HtmlTextAreaElement;
 use yew::prelude::*;
 
 use super::Mode;
-use crate::shared::{BTN_BASE, BTN_BORDERED, BTN_INK, BTN_LINK, EDITOR, LABEL};
+use crate::hir::{HirPanel, HirTree};
+use crate::shared::{BTN_BASE, BTN_BORDERED, BTN_INK, BTN_LINK, Diag, EDITOR, LABEL};
 
 #[derive(Properties, PartialEq)]
 pub struct EditorActionsProps {
@@ -15,7 +17,7 @@ pub struct EditorActionsProps {
     pub on_run: Callback<Mode>,
 }
 
-/// The editor's header buttons (Syntax tree / AST / Format / Run).
+/// The editor's header buttons (Syntax tree / AST / Types / Format / Run).
 pub struct EditorActions;
 
 impl Component for EditorActions {
@@ -35,6 +37,7 @@ impl Component for EditorActions {
         html! {
             <button onclick={run(Mode::Syntax)} class={classes!(BTN_BASE, BTN_BORDERED)}>{ "Syntax tree" }</button>
             <button onclick={run(Mode::Ast)} class={classes!(BTN_BASE, BTN_BORDERED)}>{ "AST" }</button>
+            <button onclick={run(Mode::Types)} class={classes!(BTN_BASE, BTN_BORDERED)}>{ "Types" }</button>
             <button onclick={run(Mode::Format)} class={classes!(BTN_BASE, BTN_INK)}>{ "Format" }</button>
             <button onclick={run(Mode::Run)} class={classes!(BTN_BASE, BTN_LINK)}>{ "Run" }</button>
         }
@@ -45,11 +48,18 @@ impl Component for EditorActions {
 pub struct EditorViewProps {
     pub input: AttrValue,
     pub output: AttrValue,
-    pub diagnostics: Vec<String>,
+    pub diagnostics: Vec<Diag>,
     pub diagnostics_title: AttrValue,
     pub mode: Option<Mode>,
+    /// The type tree, present only while [`Mode::Types`] is showing and the
+    /// source parsed.
+    pub hir: Option<HirPanel>,
     /// Fired with the textarea's new value on every edit.
     pub on_input: Callback<String>,
+    /// Fired with the tree node to fold or unfold.
+    pub on_hir_toggle: Callback<ExprId>,
+    /// Fired with the tree node to describe in the detail bar.
+    pub on_hir_select: Callback<ExprId>,
 }
 
 /// The two-pane body: input textarea on the left, output (and any diagnostics)
@@ -79,11 +89,25 @@ impl Component for EditorView {
             html! {}
         } else {
             html! {
-                <div class="max-h-40 shrink-0 overflow-auto border-t border-hairline bg-canvas px-4 py-2 font-mono text-xs text-error">
-                    <div class="pb-1 font-medium">{ props.diagnostics_title.clone() }</div>
-                    { for props.diagnostics.iter().map(|d| html! { <div class="py-0.5">{ d }</div> }) }
+                <div class="max-h-40 shrink-0 overflow-auto border-t border-hairline bg-canvas px-4 py-2 font-mono text-xs">
+                    <div class="pb-1 font-medium text-ink">{ props.diagnostics_title.clone() }</div>
+                    { for props.diagnostics.iter().map(|d| html! {
+                        <div class={classes!("py-0.5", d.class())}>{ &d.text }</div>
+                    }) }
                 </div>
             }
+        };
+
+        // Every other tool renders text; the type view renders a widget.
+        let body = match (props.mode, &props.hir) {
+            (Some(Mode::Types), Some(panel)) => html! {
+                <HirTree
+                    panel={panel.clone()}
+                    on_toggle={props.on_hir_toggle.clone()}
+                    on_select={props.on_hir_select.clone()}
+                />
+            },
+            _ => html! { <pre class={EDITOR}>{ props.output.clone() }</pre> },
         };
 
         html! {
@@ -100,7 +124,7 @@ impl Component for EditorView {
                 </section>
                 <section class="flex min-h-0 flex-col">
                     <div class={LABEL}>{ output_title }</div>
-                    <pre class={EDITOR}>{ props.output.clone() }</pre>
+                    { body }
                     { diagnostics }
                 </section>
             </main>

@@ -13,6 +13,7 @@
 mod app;
 mod components;
 mod editor;
+mod hir;
 mod notebook;
 mod shared;
 

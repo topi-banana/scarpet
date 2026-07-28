@@ -5,19 +5,25 @@
 //! Both views share one [`Config`]; the notebook also owns a persistent
 //! [`Session`].
 
+use std::collections::HashSet;
+use std::rc::Rc;
+
 use scarpet_fmt::{BraceStyle, Config, LineEnding};
+use scarpet_hir::ExprId;
 use yew::prelude::*;
 
 use crate::components::header::Header;
 use crate::components::options::OptionsBar;
 use crate::editor::{EditorActions, EditorView, Mode, SAMPLE};
+use crate::hir::{Analyzed, HirRow};
 use crate::notebook::session::{CellOutput, Session};
 use crate::notebook::{Notebook, NotebookActions, NotebookView};
+use crate::shared::Diag;
 
 /// Which screen is showing.
 #[derive(Clone, Copy, PartialEq)]
 pub enum View {
-    /// The original two-pane editor (Format / Syntax tree / AST / Run).
+    /// The original two-pane editor (Format / Syntax tree / AST / Types / Run).
     Editor,
     /// The notebook: a column of cells over a persistent kernel.
     Notebook,
@@ -28,12 +34,26 @@ pub struct App {
     pub(crate) input: String,
     pub(crate) output: String,
     /// Human-readable editor diagnostics: a parse error's headline plus an
-    /// optional `help:` line, or a lowering error's message.
-    pub(crate) diagnostics: Vec<String>,
+    /// optional `help:` line, a lowering or runtime error's message, or the
+    /// findings of a `scarpet-hir` analysis.
+    pub(crate) diagnostics: Vec<Diag>,
     /// Heading shown above [`diagnostics`](Self::diagnostics).
     pub(crate) diagnostics_title: &'static str,
     /// The tool that produced the editor `output`, once one has run.
     pub(crate) mode: Option<Mode>,
+    /// The last `scarpet-hir` result and the text it was run on, kept only
+    /// while [`Mode::Types`] is showing. Behind an `Rc` so a render never deep
+    /// clones it.
+    pub(crate) analysis: Option<Rc<Analyzed>>,
+    /// The flattened tree, rebuilt when the analysis or the folded set changes
+    /// rather than on every render.
+    pub(crate) hir_rows: Rc<Vec<HirRow>>,
+    /// How many rows the row cap dropped.
+    pub(crate) hir_truncated: usize,
+    /// Tree nodes whose children are hidden. Empty means fully expanded.
+    pub(crate) hir_collapsed: HashSet<ExprId>,
+    /// The tree node the detail bar describes.
+    pub(crate) hir_selected: Option<ExprId>,
     /// The formatting style, edited from the options bar and shared by both
     /// views' Format.
     pub(crate) config: Config,
@@ -58,6 +78,10 @@ pub enum Msg {
     SetBraceStyle(BraceStyle),
     /// Switch between the editor and the notebook.
     SwitchView(View),
+    /// Show or hide a type-tree node's children.
+    HirToggle(ExprId),
+    /// Describe a type-tree node in the detail bar.
+    HirSelect(ExprId),
     /// A cell's textarea changed (tracked without re-rendering).
     NbEditCell {
         id: u64,
@@ -128,6 +152,11 @@ impl Component for App {
             diagnostics: Vec::new(),
             diagnostics_title: "Parse error",
             mode: None,
+            analysis: None,
+            hir_rows: Rc::new(Vec::new()),
+            hir_truncated: 0,
+            hir_collapsed: HashSet::new(),
+            hir_selected: None,
             config: Config::default(),
             notebook: Notebook::empty(),
             session: Session::new(),
@@ -171,6 +200,17 @@ impl Component for App {
             Msg::SetBraceStyle(bs) => {
                 self.config.brace_style = bs;
                 self.reformat_if_showing();
+                true
+            }
+            Msg::HirToggle(id) => {
+                if !self.hir_collapsed.insert(id) {
+                    self.hir_collapsed.remove(&id);
+                }
+                self.rebuild_hir_rows();
+                true
+            }
+            Msg::HirSelect(id) => {
+                self.hir_selected = Some(id);
                 true
             }
             Msg::SwitchView(view) => {
@@ -243,7 +283,10 @@ impl Component for App {
                     diagnostics={self.diagnostics.clone()}
                     diagnostics_title={self.diagnostics_title}
                     mode={self.mode}
+                    hir={self.hir_panel()}
                     on_input={link.callback(Msg::Input)}
+                    on_hir_toggle={link.callback(Msg::HirToggle)}
+                    on_hir_select={link.callback(Msg::HirSelect)}
                 />
             },
             View::Notebook => html! {

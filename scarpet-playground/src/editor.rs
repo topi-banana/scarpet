@@ -1,5 +1,5 @@
 //! The two-pane editor: type Scarpet on the left, then run the formatter, dump
-//! the CST, lower to the AST, or evaluate it once on the right.
+//! the CST, lower to the AST, type-analyse it, or evaluate it once on the right.
 //!
 //! The view is split into two presentational components — [`EditorActions`] (the
 //! header buttons) and [`EditorView`] (the panes), in [`view`] — while the tool
@@ -14,7 +14,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::app::App;
-use crate::shared::{SharedBuffer, diagnostics_for};
+use crate::shared::{Diag, SharedBuffer, diagnostics_for};
 
 pub use view::{EditorActions, EditorView};
 
@@ -27,6 +27,10 @@ pub enum Mode {
     Syntax,
     /// `scarpet-syntax` typed AST dump — the CST lowered via `Code::try_from`.
     Ast,
+    /// `scarpet-hir` static analysis — the HIR as a collapsible tree with the
+    /// inferred type of every expression, plus its diagnostics. The only mode
+    /// that renders a widget rather than text.
+    Types,
     /// `scarpet-vm` evaluation — lower to the AST, run it once, and show what the
     /// program printed (captured from the VM's stdout).
     Run,
@@ -34,18 +38,19 @@ pub enum Mode {
 
 impl Mode {
     /// Label shown above the output pane.
-    fn output_title(self) -> &'static str {
+    pub(crate) fn output_title(self) -> &'static str {
         match self {
             Mode::Format => "Formatted",
             Mode::Syntax => "Syntax tree",
             Mode::Ast => "AST",
+            Mode::Types => "Types",
             Mode::Run => "Output",
         }
     }
 }
 
 /// A small sample so the playground does something on first load.
-pub const SAMPLE: &str = "// Scarpet sample — hit Run, Format, Syntax tree, or AST.
+pub const SAMPLE: &str = "// Scarpet sample — hit Run, Format, Syntax tree, AST, or Types.
 fib(n) -> if(n < 2, n, fib(n-1)+fib(n-2));
 print('fib(10) = '+fib(10));
 print('fib(20) = '+fib(20));
@@ -85,13 +90,20 @@ impl App {
                     }
                     Err(err) => {
                         self.output = String::new();
-                        self.diagnostics = vec![err.to_string()];
+                        self.diagnostics = vec![Diag::error(err.to_string())];
                         self.diagnostics_title = "Lowering error";
                     }
                 },
                 Err(err) => self.report_parse(&err),
             },
+            // `scarpet-hir` folds a parse error into its own diagnostics, so
+            // this arm has only one path rather than the two above.
+            Mode::Types => self.run_hir(),
             Mode::Run => self.run_vm(),
+        }
+        if mode != Mode::Types {
+            self.analysis = None;
+            self.rebuild_hir_rows();
         }
         self.mode = Some(mode);
     }
@@ -109,7 +121,7 @@ impl App {
             Ok(code) => code,
             Err(err) => {
                 self.output = String::new();
-                self.diagnostics = vec![err.to_string()];
+                self.diagnostics = vec![Diag::error(err.to_string())];
                 self.diagnostics_title = "Lowering error";
                 return;
             }
@@ -126,7 +138,7 @@ impl App {
             }
             Err(err) => {
                 self.output = printed;
-                self.diagnostics = vec![err.to_string()];
+                self.diagnostics = vec![Diag::error(err.to_string())];
                 self.diagnostics_title = "Runtime error";
             }
         }
