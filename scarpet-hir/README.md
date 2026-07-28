@@ -121,8 +121,8 @@ flagging it would bury the signal. What it reports is arithmetic where **neither
 side is a string and the result is one anyway: `1 + [1, 2]` is `"1[1, 2]"`,
 `count + null` is `"5null"`.
 
-Over the 220-file `example/` corpus (about 108 000 HIR nodes) the whole set produces
-roughly 130 findings — under one per file.
+Over the whole `example/` corpus (about 108 000 HIR nodes) the set produces roughly
+130 findings — under one per file.
 
 ## Known imprecision
 

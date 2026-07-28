@@ -480,7 +480,10 @@ mod corpus {
             let path = entry.path();
             if path.is_dir() {
                 walk_sc(&path, out);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("sc") {
+            } else if matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("sc" | "scl")
+            ) {
                 out.push(path);
             }
         }
