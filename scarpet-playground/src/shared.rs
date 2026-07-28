@@ -1,10 +1,11 @@
 //! Bits shared by the editor and notebook views: the `print`-capture sink, the
-//! parse-error formatter, and the Tailwind class strings reused across buttons
+//! diagnostic formatter, and the Tailwind class strings reused across buttons
 //! and panes.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use scarpet_hir::{Diagnostic, Severity};
 use scarpet_syntax::parser::ParseError;
 
 /// Shared base classes for a toolbar button.
@@ -42,17 +43,63 @@ impl std::io::Write for SharedBuffer {
     }
 }
 
-/// Render a parse error as a `start..end  message` headline plus an optional
-/// `help:` line — the form both views show in their diagnostics strip.
-pub fn diagnostics_for(err: &ParseError) -> Vec<String> {
-    let mut out = vec![format!(
-        "{}..{}  {}",
-        err.span.start,
-        err.span.end,
-        err.message()
-    )];
-    if let Some(help) = &err.help {
-        out.push(format!("help: {help}"));
+/// One line of the diagnostics strip, coloured by how much it matters.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Diag {
+    pub severity: Severity,
+    pub text: String,
+}
+
+impl Diag {
+    /// A finding with no location — a lowering or run-time error, neither of
+    /// which carries a span.
+    pub fn error(text: impl Into<String>) -> Diag {
+        Diag {
+            severity: Severity::Error,
+            text: text.into(),
+        }
+    }
+
+    /// The Tailwind text colour for this line's severity.
+    pub fn class(&self) -> &'static str {
+        match self.severity {
+            Severity::Error => "text-error",
+            Severity::Warning => "text-warning",
+            Severity::Info => "text-mute",
+        }
+    }
+}
+
+/// Render a `scarpet-hir` diagnostic as a `start..end  message` headline plus
+/// an optional `help:` line and any related locations.
+pub fn render(diagnostic: &Diagnostic) -> Vec<Diag> {
+    let mut out = vec![Diag {
+        severity: diagnostic.severity,
+        text: format!(
+            "{}..{}  {}",
+            diagnostic.span.start, diagnostic.span.end, diagnostic.message
+        ),
+    }];
+    if let Some(help) = &diagnostic.help {
+        out.push(Diag {
+            severity: Severity::Info,
+            text: format!("help: {help}"),
+        });
+    }
+    for related in &diagnostic.related {
+        out.push(Diag {
+            severity: Severity::Info,
+            text: format!(
+                "{}..{}  {}",
+                related.span.start, related.span.end, related.message
+            ),
+        });
     }
     out
+}
+
+/// Render a parse error, by way of the same [`Diagnostic`] every other finding
+/// goes through — so the editor has one rendering path rather than two.
+pub fn diagnostics_for(err: &ParseError) -> Vec<Diag> {
+    render(&Diagnostic::from_parse_error(err))
 }

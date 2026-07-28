@@ -9,5 +9,13 @@
     --color-mute: #888888;
     --color-hairline: #ebebeb;
     --color-link: #0070f3;
+    --color-link-soft: #d3e5ff;
     --color-error: #ee0000;
+    --color-error-soft: #f7d4d6;
+    /* The deep variants of warning and violet, so small type stays legible on
+       the soft backgrounds the type badges use. */
+    --color-warning: #ab570a;
+    --color-warning-soft: #ffefcf;
+    --color-violet: #4c2889;
+    --color-violet-soft: #d8ccf1;
 }

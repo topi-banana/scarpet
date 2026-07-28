@@ -4,23 +4,26 @@
 
 *English | [日本語](README_jp.md)*
 
-Rust tooling for [Scarpet](https://github.com/gnembon/fabric-carpet/blob/master/docs/scarpet/Documentation.md), the scripting language embedded in the [Carpet](https://github.com/gnembon/fabric-carpet) mod for Minecraft. Scarpet source is distributed as apps (`.sc` files) and libraries (`.scl` files) that drive in-game behavior and server extensions; this repository provides a lexer, a trivia-preserving parser, a code formatter, and an experimental evaluator for them.
+Rust tooling for [Scarpet](https://github.com/gnembon/fabric-carpet/blob/master/docs/scarpet/Documentation.md), the scripting language embedded in the [Carpet](https://github.com/gnembon/fabric-carpet) mod for Minecraft. Scarpet source is distributed as apps (`.sc` files) and libraries (`.scl` files) that drive in-game behavior and server extensions; this repository provides a lexer, a trivia-preserving parser, a code formatter, a type analysis, and an experimental evaluator for them.
 
-> **Status:** early. The parser covers the full expression grammar and parses nearly all of a real-world corpus; the formatter round-trips that corpus non-destructively. A tree-walking evaluator (`scarpet-vm`) is an early prototype, driven through the CLI's `repl`. APIs are unstable.
+> **Status:** early. The parser covers the full expression grammar and parses nearly all of a real-world corpus; the formatter round-trips that corpus non-destructively. A tree-walking evaluator (`scarpet-vm`) and a type analysis (`scarpet-hir`) are early prototypes, driven through the CLI's `repl` and the playground's Types view. APIs are unstable.
 
 ## Workspace layout
 
-This is a Cargo workspace of four crates plus a test corpus:
+This is a Cargo workspace of seven crates plus a test corpus:
 
 | Crate | What it is |
 | --- | --- |
 | [`scarpet-syntax`](scarpet-syntax) | Hand-written lexer and recursive-descent parser producing a lossless [`rowan`](https://crates.io/crates/rowan) syntax tree (its structure specified in [`scarpet.ungram`](scarpet-syntax/scarpet.ungram) via [`ungrammar`](https://crates.io/crates/ungrammar)), plus a compact CST view that preserves comments and line breaks. Also builds for `wasm32`. |
 | [`scarpet-fmt`](scarpet-fmt) | Code formatter. Lowers the CST to a Wadler/Lindig pretty-printing IR and renders it at a configurable style. |
+| [`scarpet-hir`](scarpet-hir) | Static analysis. Lowers the syntax tree to a span-carrying arena IR, infers a type for every expression, and reports diagnostics. `wasm`-clean and file-I/O-free, so the playground, a language server, and a future compiler can share it. |
 | [`scarpet-vm`](scarpet-vm) | Tree-walking evaluator — an early prototype. Lowers the CST to an AST and evaluates it: values, operators, assignment and destructuring, user-defined functions, and a few builtins (`type`, `str`, `print`, `call`, `if`, `range`). |
-| [`scarpet-cli`](scarpet-cli) | Command-line front end (`scarpet`), built on `clap`. Exposes `format` and an interactive `repl`. |
+| [`scarpet-cli`](scarpet-cli) | Command-line front end (`scarpet`), built on `clap`. Exposes `format`, an interactive `repl`, and `lsp`. |
+| [`scarpet-lsp`](scarpet-lsp) | Language server over stdio (`async-lsp`): document formatting and parse diagnostics. |
+| [`scarpet-playground`](scarpet-playground) | Browser playground (Yew + Trunk, `wasm32`): a two-pane editor over the formatter, syntax tree, type analysis, and evaluator, plus a notebook with a persistent kernel. |
 | [`example/`](example) | Git submodules of community Scarpet scripts, used as a parse/format corpus. |
 
-Two pipelines share the syntax front end. Formatting is one-directional and non-destructive:
+Three pipelines share the syntax front end. Formatting is one-directional and non-destructive:
 
 ```
 source (.sc) → lexer → parser → rowan tree → CST (with trivia) → fmt lower → Doc IR → formatted text
@@ -32,6 +35,14 @@ Evaluation (experimental) lowers the same CST to an AST and walks it:
 ```
 source (.sc) → lexer → parser → rowan tree → CST → AST lower → evaluate → value
                                   └──── scarpet-syntax ────┘ └── scarpet-vm ──┘
+```
+
+Type analysis starts from the rowan tree instead — the CST and AST both drop source
+spans, and a located diagnostic needs them:
+
+```
+source (.sc) → lexer → parser → rowan tree → HIR lower → infer → types + diagnostics
+                                  └─ scarpet-syntax ─┘ └────── scarpet-hir ────────┘
 ```
 
 ## Getting started

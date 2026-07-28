@@ -259,7 +259,9 @@ fn cell_output_view(output: &CellOutput) -> Html {
             rows.push(html! {
                 <div class="bg-canvas px-3 py-2 font-mono text-xs text-error">
                     <div class="pb-1 font-medium">{ *title }</div>
-                    { for lines.iter().map(|d| html! { <div class="py-0.5">{ d }</div> }) }
+                    { for lines.iter().map(|d| html! {
+                        <div class={classes!("py-0.5", d.class())}>{ &d.text }</div>
+                    }) }
                 </div>
             });
             html! {

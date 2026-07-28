@@ -7,7 +7,7 @@ use std::rc::Rc;
 use scarpet_syntax::ast::Code;
 use scarpet_vm::{Evaluate, GlobalState, ScarpetVm};
 
-use crate::shared::{SharedBuffer, diagnostics_for};
+use crate::shared::{Diag, SharedBuffer, diagnostics_for};
 
 /// The outcome of running one cell, as rendered beneath it. `Clone`/`PartialEq`
 /// let it ride in a [`CellView`](crate::notebook::view::CellView)'s props and
@@ -27,7 +27,7 @@ pub enum CellOutput {
     Error {
         title: &'static str,
         printed: String,
-        lines: Vec<String>,
+        lines: Vec<Diag>,
     },
 }
 
@@ -99,7 +99,7 @@ impl Session {
                 return CellOutput::Error {
                     title: "Lowering error",
                     printed: String::new(),
-                    lines: vec![err.to_string()],
+                    lines: vec![Diag::error(err.to_string())],
                 };
             }
         };
@@ -116,14 +116,14 @@ impl Session {
                 Err(err) => CellOutput::Error {
                     title: "Runtime error",
                     printed,
-                    lines: vec![err.to_string()],
+                    lines: vec![Diag::error(err.to_string())],
                 },
             },
             // Keep whatever printed before the error, as the editor's Run does.
             Err(err) => CellOutput::Error {
                 title: "Runtime error",
                 printed,
-                lines: vec![err.to_string()],
+                lines: vec![Diag::error(err.to_string())],
             },
         }
     }

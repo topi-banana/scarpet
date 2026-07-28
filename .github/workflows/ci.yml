@@ -213,7 +213,7 @@ jobs:
             args: --workspace --all-targets
           - name: wasm
             target: wasm32-unknown-unknown
-            args: -p scarpet-syntax --lib
+            args: -p scarpet-syntax -p scarpet-hir --lib
     steps:
       - uses: actions/checkout@v7
 

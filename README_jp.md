@@ -4,23 +4,26 @@
 
 *[English](README.md) | 日本語*
 
-Minecraft の [Carpet](https://github.com/gnembon/fabric-carpet) Mod に組み込まれているスクリプト言語 [Scarpet](https://github.com/gnembon/fabric-carpet/blob/master/docs/scarpet/Documentation.md) のための Rust 製ツール群です。Scarpet のソースは、ゲーム内の動作やサーバー拡張を記述するアプリ（`.sc` ファイル）とライブラリ（`.scl` ファイル）として配布されます。本リポジトリはそれらを対象とした字句解析器、トリビア（コメント・改行）を保持する構文解析器、コードフォーマッタ、そして実験的な評価器を提供します。
+Minecraft の [Carpet](https://github.com/gnembon/fabric-carpet) Mod に組み込まれているスクリプト言語 [Scarpet](https://github.com/gnembon/fabric-carpet/blob/master/docs/scarpet/Documentation.md) のための Rust 製ツール群です。Scarpet のソースは、ゲーム内の動作やサーバー拡張を記述するアプリ（`.sc` ファイル）とライブラリ（`.scl` ファイル）として配布されます。本リポジトリはそれらを対象とした字句解析器、トリビア（コメント・改行）を保持する構文解析器、コードフォーマッタ、型解析、そして実験的な評価器を提供します。
 
-> **ステータス:** 初期段階。構文解析器は式の文法全体をカバーし、実在するコーパスのほぼすべてを解析できます。フォーマッタはそのコーパスを非破壊的に往復処理できます。ツリーウォーキング評価器（`scarpet-vm`）は初期プロトタイプで、CLI の `repl` から利用できます。API は未安定です。
+> **ステータス:** 初期段階。構文解析器は式の文法全体をカバーし、実在するコーパスのほぼすべてを解析できます。フォーマッタはそのコーパスを非破壊的に往復処理できます。ツリーウォーキング評価器（`scarpet-vm`）と型解析（`scarpet-hir`）は初期プロトタイプで、それぞれ CLI の `repl` と playground の Types ビューから利用できます。API は未安定です。
 
 ## ワークスペース構成
 
-4 つのクレートとテストコーパスからなる Cargo ワークスペースです。
+7 つのクレートとテストコーパスからなる Cargo ワークスペースです。
 
 | クレート | 内容 |
 | --- | --- |
 | [`scarpet-syntax`](scarpet-syntax) | 手書きの字句解析器と再帰下降構文解析器。ロスレスな [`rowan`](https://crates.io/crates/rowan) 構文木（構造は [`ungrammar`](https://crates.io/crates/ungrammar) 形式の [`scarpet.ungram`](scarpet-syntax/scarpet.ungram) で規定）と、コメントと改行を保持したコンパクトな CST ビューを生成します。`wasm32` 向けにもビルドできます。 |
 | [`scarpet-fmt`](scarpet-fmt) | コードフォーマッタ。CST を Wadler/Lindig 流のプリティプリント用 IR に変換し、設定可能なスタイルで描画します。 |
+| [`scarpet-hir`](scarpet-hir) | 静的解析。構文木をソース範囲付きのアリーナ IR に変換し、各式の型を推論して診断を報告します。`wasm` クリーンかつファイル I/O を持たないため、playground・言語サーバ・将来のコンパイラで共有できます。 |
 | [`scarpet-vm`](scarpet-vm) | ツリーウォーキング評価器。初期プロトタイプです。CST を AST に変換して評価します。値・演算子・代入と分割代入・ユーザー定義関数、およびいくつかの組み込み関数（`type`・`str`・`print`・`call`・`if`・`range`）に対応します。 |
-| [`scarpet-cli`](scarpet-cli) | `clap` ベースのコマンドラインフロントエンド（`scarpet`）。`format` と対話的な `repl` を提供します。 |
+| [`scarpet-cli`](scarpet-cli) | `clap` ベースのコマンドラインフロントエンド（`scarpet`）。`format`・対話的な `repl`・`lsp` を提供します。 |
+| [`scarpet-lsp`](scarpet-lsp) | 標準入出力で動作する言語サーバ（`async-lsp`）。ドキュメント整形と構文エラー診断に対応します。 |
+| [`scarpet-playground`](scarpet-playground) | ブラウザ向け playground（Yew + Trunk、`wasm32`）。フォーマッタ・構文木・型解析・評価器を並べた 2 ペインのエディタと、永続カーネルを持つノートブックを備えます。 |
 | [`example/`](example) | コミュニティ製 Scarpet スクリプトの git サブモジュール群。解析・整形のコーパスとして使用します。 |
 
-構文フロントエンドを 2 つのパイプラインが共有します。整形は一方向かつ非破壊的です。
+構文フロントエンドを 3 つのパイプラインが共有します。整形は一方向かつ非破壊的です。
 
 ```
 ソース (.sc) → 字句解析 → 構文解析 → rowan 構文木 → CST（トリビア付き）→ fmt lower → Doc IR → 整形済みテキスト
@@ -32,6 +35,14 @@ Minecraft の [Carpet](https://github.com/gnembon/fabric-carpet) Mod に組み�
 ```
 ソース (.sc) → 字句解析 → 構文解析 → rowan 構文木 → CST → AST lower → 評価 → 値
                                        └────── scarpet-syntax ─────┘ └─ scarpet-vm ─┘
+```
+
+型解析は CST ではなく rowan 構文木から始まります。CST と AST はどちらもソース範囲を落とすため、
+位置付きの診断を作れないからです。
+
+```
+ソース (.sc) → 字句解析 → 構文解析 → rowan 構文木 → HIR lower → 推論 → 型と診断
+                                       └── scarpet-syntax ──┘ └───── scarpet-hir ─────┘
 ```
 
 ## はじめに

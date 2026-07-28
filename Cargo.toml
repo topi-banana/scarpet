@@ -3,6 +3,7 @@ resolver = "3"
 members = [
   "scarpet-cli",
   "scarpet-fmt",
+  "scarpet-hir",
   "scarpet-lsp",
   "scarpet-playground",
   "scarpet-syntax",
@@ -17,6 +18,7 @@ rowan = { version = "0.16" }
 rustyline = { version = "18" }
 similar = { version = "3" }
 scarpet-fmt = { path = "./scarpet-fmt" }
+scarpet-hir = { path = "./scarpet-hir" }
 scarpet-syntax = { path = "./scarpet-syntax" }
 scarpet-vm = { path = "./scarpet-vm" }
 serde = { version = "1", features = ["derive"] }
