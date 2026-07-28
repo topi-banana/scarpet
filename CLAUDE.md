@@ -4,14 +4,17 @@ Guidance for Claude Code when working in this repository.
 
 ## What this is
 
-Rust tooling for **Scarpet**, the scripting language of Minecraft's Carpet mod (`.sc` apps and `.scl` libraries). A Cargo workspace (edition 2024) of four crates:
+Rust tooling for **Scarpet**, the scripting language of Minecraft's Carpet mod (`.sc` apps and `.scl` libraries). A Cargo workspace (edition 2024) of seven crates:
 
 - `scarpet-syntax` — hand-written lexer + recursive-descent parser → a lossless `rowan` syntax tree (every byte of the source, including whitespace), lowered on demand to a compact CST that preserves comments and line breaks as **leading trivia** on each node (`cst.rs`). The tree's node shapes are specified in `scarpet.ungram`; the typed accessor layer (`nodes.rs`) is generated from it by the sourcegen test. Builds for `wasm32`.
 - `scarpet-fmt` — formatter: lowers the CST to a Wadler/Lindig pretty-printing `Doc` IR, then renders it at a style set by a `Config` (indent width, max width).
+- `scarpet-hir` — static analysis: lowers the **typed rowan layer** (not the CST — it has no spans) to a span-carrying arena HIR, then infers a type for every expression and reports diagnostics. `wasm`-clean, file-I/O-free, and public: the playground consumes it today, an LSP and a compiler are meant to. See `scarpet-hir/README.md`.
 - `scarpet-vm` — tree-walking evaluator (early prototype): lowers the CST to an AST (`scarpet-syntax`'s `ast.rs`) and evaluates it — values, operators, assignment/destructuring, user-defined functions, and a few builtins. Driven by `scarpet repl`.
-- `scarpet-cli` — `clap` CLI (`scarpet format`, `scarpet repl`). Built binary is `scarpet-cli`.
+- `scarpet-cli` — `clap` CLI (`scarpet format`, `scarpet repl`, `scarpet lsp`). Built binary is `scarpet-cli`.
+- `scarpet-lsp` — language server over stdio (`async-lsp`, not `tower-lsp`): formatting plus parse diagnostics.
+- `scarpet-playground` — browser playground (Yew, **struct components**, Trunk + Tailwind 4). Two screens: a two-pane editor (Format / Syntax tree / AST / Types / Run) and a notebook over a persistent VM kernel.
 
-Data flow (formatting): `source → lexer → parser → rowan tree → CST (trivia) → lower → Doc → string` — one-directional and non-destructive. A second, experimental path evaluates rather than formats: `scarpet-vm` lowers the same CST to an AST and walks it (`scarpet repl`). The evaluator is an early prototype; the formatter remains the mature path.
+Three paths share the syntax front end. Formatting is one-directional and non-destructive: `source → lexer → parser → rowan tree → CST (trivia) → lower → Doc → string`. Evaluation lowers the same CST to an AST and walks it (`scarpet repl`) — an early prototype. Analysis takes the *rowan tree* instead, because the CST and AST both drop spans: `source → parser → rowan tree → HIR → types + diagnostics`. The formatter remains the mature path.
 
 ## Commands
 
@@ -34,7 +37,7 @@ cargo run -p scarpet-cli -- format <file>         # format to stdout (also: --in
 git submodule update --init --recursive           # fetch example/ corpus (needed for corpus tests)
 ```
 
-CI also builds `wasm32-unknown-unknown` (only `scarpet-syntax --lib`); keep that crate `wasm`-clean (no `std::fs`, threads, etc. in library code).
+CI also builds `wasm32-unknown-unknown` (`scarpet-syntax` and `scarpet-hir`, `--lib` only); keep both crates `wasm`-clean (no `std::fs`, threads, etc. in library code).
 
 ## Invariants — do not break these
 
@@ -42,6 +45,10 @@ CI also builds `wasm32-unknown-unknown` (only `scarpet-syntax --lib`); keep that
 - **Trivia must never be silently dropped.** The rowan tree is lossless by construction (a test asserts `tree.text() == source`). The CST view attaches comments and breaks as `leading` trivia, and `cst.rs` goes to some length to anchor otherwise-orphaned trivia (trailing comments, comments in empty arg lists, around trailing commas) onto a node — often a phantom `CstKind::Empty`. Preserve this when touching `cst.rs` or `parser.rs`; the trivia-preservation tests in `parser.rs` are the spec, and the module comment in `cst.rs` documents the attachment rules (including a few deliberately preserved drop-quirks of the original parser that byte-identical formatting depends on).
 - **The precedence ladder lives in `scarpet-syntax/src/parser.rs`** (documented as a comment above the `Parser` impl). It mirrors Scarpet's operator precedence. Changing it changes parse results — update the ladder comment and the precedence tests together.
 - **`scarpet.ungram` and `src/nodes/generated.rs` move together.** The sourcegen test (`scarpet-syntax/tests/sourcegen.rs`) regenerates the typed node layer from the grammar and fails while it is stale — edit the grammar (and `SyntaxKind` in `syntax.rs` if node kinds change), run `cargo test -p scarpet-syntax`, commit the regenerated file.
+- **`scarpet-hir` must never panic.** `analyze` is total — a parse error becomes a `Diagnostic`, and everything else degrades to `Ty::Unknown` rather than guessing. The corpus test in `scarpet-hir/src/lib.rs` runs every corpus file through it and checks span and id validity. Lowering, `dump`, and the playground's row flattening are iterative because `;`, `,` and `+` all left-nest; the inference walk is recursive but depth-capped.
+- **`scarpet-hir` must stay `wasm`-clean.** The playground depends on it, and the `playground` CI job (`trunk build --release`) has no `continue-on-error`, so it is a hard gate regardless of the build matrix. No `std::fs`, threads, time, or env in library code — the corpus test's `std::fs` is `#[cfg(test)]`, as in `scarpet-fmt`.
+- **`scarpet-hir` must not depend on `scarpet-vm`** — that would make a compiler depend on an interpreter. `scarpet-hir/src/infer/ops.rs` is a deliberate port of the VM's `value/*.rs` and each rule cites its source file; when the VM's operator semantics change, both move together.
+- **The type lattice must stay finite.** `Ty` is recursive, so `Ty::list`/`Ty::map` truncate past `MAX_DEPTH` and `Ty::union` widens past `MAX_UNION`. That bound is not cosmetic: it is what makes `Drop` safe *and* what guarantees the inference fixpoint converges. Never construct `Ty::List`/`Ty::Map`/`Ty::Union` outside `ty.rs`.
 
 ## Conventions
 
@@ -56,4 +63,6 @@ CI also builds `wasm32-unknown-unknown` (only `scarpet-syntax --lib`); keep that
 
 - `example/` is git submodules. Tests that need it skip quietly when it is absent, so a passing `cargo test` locally may simply have skipped the corpus — confirm submodules are checked out when validating formatter changes.
 - In the lexer, `$` lexes as a `Break` (Scarpet uses `$` as a newline stand-in in one-liners), and `//` runs to end of line.
+- `scarpet-hir/src/builtins/names.rs` is **generated and committed**: `scarpet-hir/tests/sourcegen.rs` mines it from `example/gnembon/fabric-carpet/docs/scarpet/Full.md`. It is a test rather than a build script because the `build` and `playground` CI jobs check out without submodules. The test skips when `example/` is absent, so a green `cargo test` locally may mean it never ran.
+- Two traps when walking `scarpet_syntax::nodes`: `Expr::can_cast(NAME_REF)` is `true`, so a hand-rolled `children().find_map(Expr::cast)` on a `DEFINE_FUNCTION` returns the *name* rather than the body (use the generated accessors); and `f(a, b)` does **not** produce a comma `BinExpr` — arguments are sibling children of `ARG_LIST`, so comma chains appear only under `ROOT` and inside `PAREN_EXPR`.
 - `scarpet-fmt`'s `doc.rs` carries `#![allow(dead_code)]` because the `Doc` builder set is intentionally fuller than current usage; don't "clean up" unused builders.
