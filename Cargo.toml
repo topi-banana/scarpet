@@ -14,7 +14,7 @@ members = [
 ariadne = { version = "0.6", features = ["auto-color"] }
 clap = { version = "4.6.1", features = ["derive"] }
 regex = { version = "1" }
-rowan = { version = "0.16" }
+rowan = { version = "0.17" }
 rustyline = { version = "18" }
 similar = { version = "3" }
 scarpet-fmt = { path = "./scarpet-fmt" }
