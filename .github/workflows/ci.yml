@@ -31,7 +31,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - uses: cargo-bins/cargo-binstall@v1.24.0
+      - uses: cargo-bins/cargo-binstall@v1.25.1
 
       - name: Install cargo-machete, taplo-cli, typos-cli
         run: cargo binstall --no-confirm cargo-machete taplo-cli typos-cli
